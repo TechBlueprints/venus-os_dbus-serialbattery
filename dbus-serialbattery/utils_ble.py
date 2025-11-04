@@ -1,10 +1,17 @@
 import threading
+import time as _time
 import asyncio
 import subprocess
 import sys
+from collections import deque
 from bleak import BleakClient
 from time import sleep
-from utils import logger, BLUETOOTH_FORCE_RESET_BLE_STACK
+from utils import (
+    logger,
+    BLUETOOTH_FORCE_RESET_BLE_STACK,
+    BLUETOOTH_DIRECT_CONNECT,
+    BLUETOOTH_PREFERRED_ADAPTER,
+)
 
 
 # Class that enables synchronous writing and reading to a bluetooh device
@@ -34,6 +41,7 @@ class Syncron_Ble:
         self.write_characteristic = write_characteristic
         self.read_characteristic = read_characteristic
         self.address = address
+        self._notification_queue = deque()
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
@@ -46,8 +54,13 @@ class Syncron_Ble:
             logger.error("bluetooh LE thread took to long to start")
         if not connected_ok:
             logger.error(f"bluetooh LE connection to address: {self.address} took to long to inititate")
+            self.connected = False
         else:
-            self.connected = True
+            # Mark connected only if client exists and is connected
+            try:
+                self.connected = bool(self.client and self.client.is_connected)
+            except Exception:
+                self.connected = False
 
     def initiate_ble_thread_main(self):
         asyncio.run(self.async_main(self.address))
@@ -57,34 +70,117 @@ class Syncron_Ble:
         self.ble_async_thread_ready.set()
 
         # try to connect over and over if the connection fails
+        consecutive_failures = 0
         while self.main_thread.is_alive():
-            await self.connect_to_bms(self.address)
-            await asyncio.sleep(1)  # sleep one second before trying to reconnecting
+            result = await self.connect_to_bms(self.address)
+            if result is False:
+                consecutive_failures += 1
+                # exponential backoff: 0.5s, 1s, 2s, 4s, 8s (cap at 8s)
+                delay = min(0.5 * (2 ** (consecutive_failures - 1)), 8.0)
+                try:
+                    await asyncio.sleep(delay)
+                except Exception:
+                    pass
+                if consecutive_failures >= 5:
+                    # cooldown after 5 consecutive failures, then retry
+                    try:
+                        await asyncio.sleep(600)
+                    except Exception:
+                        pass
+                    consecutive_failures = 0
+                    continue
+            else:
+                # reset failure counter after any successful session (even if later disconnected)
+                consecutive_failures = 0
+                # yield control
+                await asyncio.sleep(0)
 
     def client_disconnected(self, client):
         logger.error(f"bluetooh device with address: {self.address} disconnected")
 
     async def connect_to_bms(self, address):
-        self.client = BleakClient(address, disconnected_callback=self.client_disconnected)
-        try:
-            logger.info("initiating BLE connection to: " + address)
-            await self.client.connect()
-            logger.info("connected to bluetooh device" + address)
-            await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
+        def _list_adapters():
+            names = []
+            try:
+                import os
+                base = "/sys/class/bluetooth"
+                if os.path.isdir(base):
+                    for name in os.listdir(base):
+                        if name.startswith("hci"):
+                            names.append(name)
+            except Exception:
+                pass
+            if not names:
+                try:
+                    result = subprocess.run(["hciconfig"], capture_output=True, text=True)
+                    for line in (result.stdout or "").splitlines():
+                        line = line.strip()
+                        if line.startswith("hci") and ":" in line:
+                            names.append(line.split(":", 1)[0])
+                except Exception:
+                    pass
+            # de-dup and sort
+            return sorted(list(dict.fromkeys(names)))
 
-        except Exception as e:
-            logger.error("Failed when trying to connect", e)
-            return False
-        finally:
+        if BLUETOOTH_DIRECT_CONNECT:
+            if BLUETOOTH_PREFERRED_ADAPTER and BLUETOOTH_PREFERRED_ADAPTER.lower() not in ("auto", "default", ""):
+                adapters_to_try = [BLUETOOTH_PREFERRED_ADAPTER.lower()]
+            else:
+                adapters_to_try = _list_adapters() or []
+            # allow a final fallback to default adapter selection
+            adapters_to_try.append(None)
+        else:
+            # rely on BlueZ default unless configured otherwise
+            adapters_to_try = [None]
+
+        for adapter in adapters_to_try:
+            self.client = BleakClient(address, disconnected_callback=self.client_disconnected, adapter=adapter) if adapter else BleakClient(address, disconnected_callback=self.client_disconnected)
+            try:
+                await self.client.connect()
+                await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
+                await asyncio.sleep(0.2)
+                break
+            except Exception as e:
+                logger.error(f"Failed when trying to connect: {repr(e)}")
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(0.3)
+                continue
+        else:
+            # all attempts failed
             self.ble_connection_ready.set()
+            self.connected = False
+            return False
+
+        try:
+            self.ble_connection_ready.set()
+            self.connected = True
             while self.client.is_connected and self.main_thread.is_alive():
                 await asyncio.sleep(0.1)
-            await self.client.disconnect()
+        finally:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            self.connected = False
 
     # saves response and tells the command sender that the response has arived
     def notify_read_callback(self, sender, data: bytearray):
+        # Append to queue to avoid races and packet drops
+        try:
+            self._notification_queue.append(bytes(data))
+        except Exception:
+            pass
         self.response_data = data
-        self.response_event.set()
+        try:
+            # Only signal if an Event was set up for a waiter
+            if self.response_event and hasattr(self.response_event, "set"):
+                self.response_event.set()
+        except Exception:
+            # Ignore if no waiter is present
+            pass
 
     async def ble_thread_send_com(self, command):
         self.response_event = asyncio.Event()

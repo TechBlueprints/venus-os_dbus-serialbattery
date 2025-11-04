@@ -256,6 +256,8 @@ CURRENT_CORRECTION: bool = CURRENT_REPORTED_BY_BMS != CURRENT_MEASURED_BY_USER
 # --------- Bluetooth BMS ---------
 BLUETOOTH_USE_POLLING = get_bool_from_config("DEFAULT", "BLUETOOTH_USE_POLLING")
 BLUETOOTH_FORCE_RESET_BLE_STACK = get_bool_from_config("DEFAULT", "BLUETOOTH_FORCE_RESET_BLE_STACK")
+BLUETOOTH_DIRECT_CONNECT = get_bool_from_config("DEFAULT", "BLUETOOTH_DIRECT_CONNECT")
+BLUETOOTH_PREFERRED_ADAPTER: str = config["DEFAULT"].get("BLUETOOTH_PREFERRED_ADAPTER", "auto")
 
 # --------- Daisy Chain Configuration (Multiple BMS on one cable) ---------
 BATTERY_ADDRESSES: list = get_list_from_config("DEFAULT", "BATTERY_ADDRESSES", str)
@@ -510,7 +512,7 @@ Poll interval in milliseconds
 """
 PUBLISH_CONFIG_VALUES: bool = get_bool_from_config("DEFAULT", "PUBLISH_CONFIG_VALUES")
 PUBLISH_BATTERY_DATA_AS_JSON: bool = get_bool_from_config("DEFAULT", "PUBLISH_BATTERY_DATA_AS_JSON")
-BATTERY_CELL_DATA_FORMAT: int = get_int_from_config("DEFAULT", "BATTERY_CELL_DATA_FORMAT")
+BATTERY_CELL_DATA_FORMAT: int = get_int_from_config("DEFAULT", "BATTERY_CELL_DATA_FORMAT", 3)
 MIDPOINT_ENABLE: bool = get_bool_from_config("DEFAULT", "MIDPOINT_ENABLE")
 TEMPERATURE_SOURCE_BATTERY: List[int] = get_list_from_config("DEFAULT", "TEMPERATURE_SOURCE_BATTERY", int)
 TEMPERATURE_1_NAME: str = config["DEFAULT"]["TEMPERATURE_1_NAME"]
@@ -525,6 +527,14 @@ TEMPERATURE_NAMES: dict = {
 }
 GUI_PARAMETERS_SHOW_ADDITIONAL_INFO: bool = get_bool_from_config("DEFAULT", "GUI_PARAMETERS_SHOW_ADDITIONAL_INFO")
 TELEMETRY: bool = get_bool_from_config("DEFAULT", "TELEMETRY")
+LOG_DBUS_UPDATES: bool = get_bool_from_config("DEFAULT", "LOG_DBUS_UPDATES")
+
+# --------- Optional JBD BLE Handshake (app parity) ---------
+JBD_BLE_HANDSHAKE_ENABLE: bool = get_bool_from_config("DEFAULT", "JBD_BLE_HANDSHAKE_ENABLE")
+JBD_BLE_HANDSHAKE_CLEAN_PSW: bool = get_bool_from_config("DEFAULT", "JBD_BLE_HANDSHAKE_CLEAN_PSW")
+JBD_BLE_HANDSHAKE_ENABLE_FFAA: bool = get_bool_from_config("DEFAULT", "JBD_BLE_HANDSHAKE_ENABLE_FFAA")
+# ASCII password used by some stacks (e.g., "123456"). Only used when JBD_BLE_HANDSHAKE_ENABLE_FFAA is True
+JBD_BLE_HANDSHAKE_PASSWORD: str = config["DEFAULT"].get("JBD_BLE_HANDSHAKE_PASSWORD", "123456")
 
 
 # --------- Voltage drop ---------
