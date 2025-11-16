@@ -306,30 +306,15 @@ def main():
     logger.info("dbus-serialbattery v" + str(DRIVER_VERSION))
 
     port = get_port()
-    try:
-        logger.info(f"Main args: {sys.argv}")
-        logger.info(f"Selected port: {port}")
-    except Exception:
-        pass
-    try:
-        with open('/tmp/fastble-main.log','a') as f:
-            f.write(f"ARGS {sys.argv}\nPORT {port}\n")
-    except Exception:
-        pass
     battery = {}
 
     # BLUETOOTH
-    # Accept any driver whose name ends with "Ble" (e.g., Jkbms_Ble, NordicNus_Ble, LltJbd_Ble, LltJbd_FastBle)
+    # Accept any driver whose name ends with "Ble" (e.g., Jkbms_Ble, NordicNus_Ble, LltJbd_Ble, Grenergy_Ble)
     if port.endswith("Ble"):
         """
         Import BLE classes only if it's a BLE port; otherwise, the driver won't start due to missing Python modules.
         This prevents issues when using the driver exclusively with a serial connection.
         """
-        try:
-            with open('/tmp/fastble-main.log','a') as f:
-                f.write("ENTER BLE BRANCH\n")
-        except Exception:
-            pass
 
         if len(sys.argv) <= 2:
             logger.error(">>> Bluetooth address is missing in the command line arguments")
@@ -347,15 +332,6 @@ def main():
                     discovery_helper.register_mac_addresses([ble_address])
             except Exception as e:
                 logger.debug(f"BLE discovery helper not available: {e}")
-            try:
-                logger.info(f"BLE branch for {port} with address {ble_address}")
-            except Exception:
-                pass
-            try:
-                with open('/tmp/fastble-main.log','a') as f:
-                    f.write(f"BLE {port} ADDR {ble_address}\n")
-            except Exception:
-                pass
 
             if port == "Jkbms_Ble":
                 # noqa: F401 --> ignore flake "imported but unused" error
@@ -373,9 +349,9 @@ def main():
                 # noqa: F401 --> ignore flake "imported but unused" error
                 from bms.lltjbd_ble import LltJbd_Ble  # noqa: F401
 
-            elif port == "LltJbd_FastBle":
+            elif port == "Grenergy_Ble":
                 # noqa: F401 --> ignore flake "imported but unused" error
-                from bms.lltjbd_fastble import LltJbd_FastBle  # noqa: F401
+                from bms.grenergy_ble import Grenergy_Ble  # noqa: F401
 
             elif port == "NordicNus_Ble":
                 # noqa: F401 --> ignore flake "imported but unused" error
@@ -384,36 +360,18 @@ def main():
             else:
                 logger.error(">>> Unknown Bluetooth BMS type: " + port)
                 logger.error(
-                    "Supported Bluetooth BMS types (CASE SENSITIVE!): Jkbms_Ble, Kilovault_Ble, LiTime_Ble, LltJbd_Ble, LltJbd_FastBle, NordicNus_Ble"
+                    "Supported Bluetooth BMS types (CASE SENSITIVE!): Jkbms_Ble, Kilovault_Ble, LiTime_Ble, LltJbd_Ble, Grenergy_Ble, NordicNus_Ble"
                 )
                 sleep(60)
                 exit_driver(None, None, 1)
 
             class_ = eval(port)
-            try:
-                logger.info(f"Instantiating {port}")
-            except Exception:
-                pass
-            try:
-                with open('/tmp/fastble-main.log','a') as f:
-                    f.write(f"INSTANTIATE {port}\n")
-            except Exception:
-                pass
 
             # do not remove ble_ prefix, since the dbus service cannot be only numbers
             testbms = class_("ble_" + ble_address.replace(":", "").lower(), 9600, ble_address)
-            try:
-                logger.info(f"Constructed {port} instance")
-            except Exception:
-                pass
-            try:
-                with open('/tmp/fastble-main.log','a') as f:
-                    f.write(f"CONSTRUCTED {port}\n")
-            except Exception:
-                pass
 
-            # For LLT/JBD BLE variants, allow async/adopt connect without blocking here
-            if port in ("LltJbd_Ble", "LltJbd_FastBle"):
+            # For LLT/JBD BLE variants (including Grenergy), allow async/adopt connect without blocking here
+            if port in ("LltJbd_Ble", "Grenergy_Ble"):
                 try:
                     ok = True
                     try:
@@ -423,11 +381,6 @@ def main():
                     except Exception as e:
                         logger.info(f"test_connection raised: {repr(e)}; continuing async")
                         ok = True
-                    try:
-                        with open('/tmp/fastble-main.log','a') as f:
-                            f.write(f"ASYNC {port} OK {ok}\n")
-                    except Exception:
-                        pass
                     battery[0] = testbms
                     logger.info("-- Proceeding with async BLE connect for " + port)
                 except Exception as e:
