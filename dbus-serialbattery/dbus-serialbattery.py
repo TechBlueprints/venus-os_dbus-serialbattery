@@ -337,6 +337,16 @@ def main():
             exit_driver(None, None, 1)
         else:
             ble_address = sys.argv[2]
+            
+            # Initialize BLE discovery helper for faster device discovery
+            try:
+                from utils_ble_discovery import get_discovery_helper
+                discovery_helper = get_discovery_helper()
+                if discovery_helper.is_available():
+                    # Register this MAC address for discovery assistance
+                    discovery_helper.register_mac_addresses([ble_address])
+            except Exception as e:
+                logger.debug(f"BLE discovery helper not available: {e}")
             try:
                 logger.info(f"BLE branch for {port} with address {ble_address}")
             except Exception:
