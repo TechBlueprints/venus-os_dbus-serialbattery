@@ -17,11 +17,11 @@ import utils
 from bms.lltjbd import LltJbdProtection, LltJbd, checksum
 
 
-class LltJbd_FastBle(LltJbd):
-    BATTERYTYPE = "LLT/JBD BLE (fast)"
+class Grenergy_Ble(LltJbd):
+    BATTERYTYPE = "Grenergy BLE"
 
     def __init__(self, port: Optional[str], baud: Optional[int], address: str):
-        super(LltJbd_FastBle, self).__init__(port, -1, address)
+        super(Grenergy_Ble, self).__init__(port, -1, address)
 
         self.address = address
         self.protection = LltJbdProtection()
@@ -31,7 +31,7 @@ class LltJbd_FastBle(LltJbd):
         # Provide sane defaults so setup_vedbus can initialize paths immediately
         self.cell_count = 4
         try:
-            logger.info("Init of LltJbd_FastBle at " + address)
+            logger.info("Init of Grenergy_Ble at " + address)
         except Exception:
             pass
 
@@ -39,7 +39,7 @@ class LltJbd_FastBle(LltJbd):
         self._dbg_path = "/tmp/fastble.log"
 
         # runtime state
-        self.bt_thread = threading.Thread(name="LltJbd_FastBle_Loop", target=self.background_loop, daemon=True)
+        self.bt_thread = threading.Thread(name="Grenergy_Ble_Loop", target=self.background_loop, daemon=True)
         self.bt_loop: Optional[asyncio.AbstractEventLoop] = None
         self.response_queue: Optional[asyncio.Queue] = None
         self.ready_event: Optional[asyncio.Event] = None
@@ -628,7 +628,7 @@ class LltJbd_FastBle(LltJbd):
         now = time.time()
         if now - self._last_successful_data_time > 60.0:
             try:
-                logger.warning(f"LltJbd_FastBle: No data for 60s, attempting reconnection...")
+                logger.warning(f"Grenergy_Ble: No data for 60s, attempting reconnection...")
                 self._attempt_reconnection()
             except Exception as e:
                 try:
@@ -1603,7 +1603,7 @@ class LltJbd_FastBle(LltJbd):
         # (unless we just handled an InProgress error, which means scan is already happening)
         try:
             import subprocess
-            logger.info("LltJbd_FastBle: Running brief scan to refresh device cache...")
+            logger.info("Grenergy_Ble: Running brief scan to refresh device cache...")
             # Start scan in background, wait 3 seconds, then stop it
             scan_proc = subprocess.Popen(['bluetoothctl', 'scan', 'on'], 
                                         stdout=subprocess.DEVNULL, 
@@ -1615,7 +1615,7 @@ class LltJbd_FastBle(LltJbd):
             except Exception:
                 scan_proc.kill()
         except Exception as e:
-            logger.debug(f"LltJbd_FastBle: Scan attempt: {e}")
+            logger.debug(f"Grenergy_Ble: Scan attempt: {e}")
         
         # Clear previous state
         self._notif_started = False
@@ -2224,7 +2224,7 @@ class LltJbd_FastBle(LltJbd):
 
 
 if __name__ == "__main__":
-    bat = LltJbd_FastBle("Foo", -1, sys.argv[1])
+    bat = Grenergy_Ble("Foo", -1, sys.argv[1])
     if not bat.test_connection():
         logger.error(">>> ERROR: Unable to connect (fast)")
     else:

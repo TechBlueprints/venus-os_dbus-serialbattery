@@ -11,7 +11,7 @@ EXT_DIR = os.path.join(BASE_DIR, "ext")
 if EXT_DIR not in sys.path:
     sys.path.insert(1, EXT_DIR)
 
-from bms.lltjbd_fastble import LltJbd_FastBle
+from bms.grenergy_ble import Grenergy_Ble
 
 
 def main(addr: str, seconds: int = 90) -> int:
@@ -20,7 +20,7 @@ def main(addr: str, seconds: int = 90) -> int:
     port = "ble_" + addr.replace(":", "").lower()
     logging.info(f"Starting JBD fast BLE probe for {addr} (port={port}) for ~{seconds}s")
 
-    bat = LltJbd_FastBle(port=port, baud=9600, address=addr)
+    bat = Grenergy_Ble(port=port, baud=9600, address=addr)
 
     if not bat.test_connection():
         logging.error("test_connection() returned False")

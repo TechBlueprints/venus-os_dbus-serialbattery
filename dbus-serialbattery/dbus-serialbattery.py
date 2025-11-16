@@ -319,7 +319,7 @@ def main():
     battery = {}
 
     # BLUETOOTH
-    # Accept any driver whose name ends with "Ble" (e.g., Jkbms_Ble, NordicNus_Ble, LltJbd_Ble, LltJbd_FastBle)
+    # Accept any driver whose name ends with "Ble" (e.g., Jkbms_Ble, NordicNus_Ble, LltJbd_Ble, Grenergy_Ble)
     if port.endswith("Ble"):
         """
         Import BLE classes only if it's a BLE port; otherwise, the driver won't start due to missing Python modules.
@@ -363,9 +363,9 @@ def main():
                 # noqa: F401 --> ignore flake "imported but unused" error
                 from bms.lltjbd_ble import LltJbd_Ble  # noqa: F401
 
-            elif port == "LltJbd_FastBle":
+            elif port == "Grenergy_Ble":
                 # noqa: F401 --> ignore flake "imported but unused" error
-                from bms.lltjbd_fastble import LltJbd_FastBle  # noqa: F401
+                from bms.grenergy_ble import Grenergy_Ble  # noqa: F401
 
             elif port == "NordicNus_Ble":
                 # noqa: F401 --> ignore flake "imported but unused" error
@@ -374,7 +374,7 @@ def main():
             else:
                 logger.error(">>> Unknown Bluetooth BMS type: " + port)
                 logger.error(
-                    "Supported Bluetooth BMS types (CASE SENSITIVE!): Jkbms_Ble, Kilovault_Ble, LiTime_Ble, LltJbd_Ble, LltJbd_FastBle, NordicNus_Ble"
+                    "Supported Bluetooth BMS types (CASE SENSITIVE!): Jkbms_Ble, Kilovault_Ble, LiTime_Ble, LltJbd_Ble, Grenergy_Ble, NordicNus_Ble"
                 )
                 sleep(60)
                 exit_driver(None, None, 1)
@@ -403,7 +403,7 @@ def main():
                 pass
 
             # For LLT/JBD BLE variants, allow async/adopt connect without blocking here
-            if port in ("LltJbd_Ble", "LltJbd_FastBle"):
+            if port in ("LltJbd_Ble", "Grenergy_Ble"):
                 try:
                     ok = True
                     try:
