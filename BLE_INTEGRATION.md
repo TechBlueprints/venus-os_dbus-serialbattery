@@ -18,6 +18,7 @@ When `dbus-ble-advertisements` is installed and running, `dbus-serialbattery` wi
 - **Faster device detection** - the router already knows which devices are in range
 - **Reduced BLE stack load** - centralized scanning instead of per-service scanning
 - **Seamless fallback** - if the router isn't available, standard Bleak scanning is used
+- **Simplified configuration** - no need for `BLUETOOTH_DIRECT_CONNECT` or `BLUETOOTH_PREFERRED_ADAPTER` settings
 
 ## How It Works
 
@@ -62,6 +63,19 @@ This branch works perfectly fine without `dbus-ble-advertisements`. It will auto
   - Calls discovery helper when BLE BMS is started
   - Registers MAC address with router if available
   - Graceful fallback if router is not present
+
+- **`config.default.ini`**: Removed obsolete BLE configuration
+  - Removed `BLUETOOTH_DIRECT_CONNECT` (no longer needed with router)
+  - Removed `BLUETOOTH_PREFERRED_ADAPTER` (no longer needed with router)
+
+- **`utils.py`**: Removed obsolete configuration imports
+  - Removed `BLUETOOTH_DIRECT_CONNECT`
+  - Removed `BLUETOOTH_PREFERRED_ADAPTER`
+
+- **`utils_ble.py`**: Simplified connection logic
+  - Removed adapter selection code
+  - Now uses BlueZ default adapter (handled by router)
+  - Cleaner, more reliable connection process
 
 ### D-Bus Interface
 

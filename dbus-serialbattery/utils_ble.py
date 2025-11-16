@@ -9,8 +9,6 @@ from time import sleep
 from utils import (
     logger,
     BLUETOOTH_FORCE_RESET_BLE_STACK,
-    BLUETOOTH_DIRECT_CONNECT,
-    BLUETOOTH_PREFERRED_ADAPTER,
 )
 
 
@@ -99,57 +97,20 @@ class Syncron_Ble:
         logger.error(f"bluetooh device with address: {self.address} disconnected")
 
     async def connect_to_bms(self, address):
-        def _list_adapters():
-            names = []
+        # Use BlueZ default adapter selection
+        self.client = BleakClient(address, disconnected_callback=self.client_disconnected)
+        try:
+            await self.client.connect()
+            await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            logger.error(f"Failed when trying to connect: {repr(e)}")
             try:
-                import os
-                base = "/sys/class/bluetooth"
-                if os.path.isdir(base):
-                    for name in os.listdir(base):
-                        if name.startswith("hci"):
-                            names.append(name)
+                await self.client.disconnect()
             except Exception:
                 pass
-            if not names:
-                try:
-                    result = subprocess.run(["hciconfig"], capture_output=True, text=True)
-                    for line in (result.stdout or "").splitlines():
-                        line = line.strip()
-                        if line.startswith("hci") and ":" in line:
-                            names.append(line.split(":", 1)[0])
-                except Exception:
-                    pass
-            # de-dup and sort
-            return sorted(list(dict.fromkeys(names)))
-
-        if BLUETOOTH_DIRECT_CONNECT:
-            if BLUETOOTH_PREFERRED_ADAPTER and BLUETOOTH_PREFERRED_ADAPTER.lower() not in ("auto", "default", ""):
-                adapters_to_try = [BLUETOOTH_PREFERRED_ADAPTER.lower()]
-            else:
-                adapters_to_try = _list_adapters() or []
-            # allow a final fallback to default adapter selection
-            adapters_to_try.append(None)
-        else:
-            # rely on BlueZ default unless configured otherwise
-            adapters_to_try = [None]
-
-        for adapter in adapters_to_try:
-            self.client = BleakClient(address, disconnected_callback=self.client_disconnected, adapter=adapter) if adapter else BleakClient(address, disconnected_callback=self.client_disconnected)
-            try:
-                await self.client.connect()
-                await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
-                await asyncio.sleep(0.2)
-                break
-            except Exception as e:
-                logger.error(f"Failed when trying to connect: {repr(e)}")
-                try:
-                    await self.client.disconnect()
-                except Exception:
-                    pass
-                await asyncio.sleep(0.3)
-                continue
-        else:
-            # all attempts failed
+            await asyncio.sleep(0.3)
+            # connection failed
             self.ble_connection_ready.set()
             self.connected = False
             return False
