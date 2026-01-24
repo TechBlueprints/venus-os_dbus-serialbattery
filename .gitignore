@@ -19,3 +19,6 @@ venv.bak/
 dbus-serialbattery/config.ini
 venus-data.tar.gz
 *.bak
+
+# Development / sample drivers
+sample-driver/
