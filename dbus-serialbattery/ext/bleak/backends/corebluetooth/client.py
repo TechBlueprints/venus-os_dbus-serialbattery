@@ -3,6 +3,7 @@
 BLE Client for CoreBluetooth on macOS
 """
 
+import functools
 import sys
 from typing import TYPE_CHECKING
 
@@ -14,12 +15,6 @@ import asyncio
 import logging
 from typing import Any, Optional, Union
 
-if sys.version_info < (3, 12):
-    from typing_extensions import Buffer, override
-else:
-    from collections.abc import Buffer
-    from typing import override
-
 from CoreBluetooth import (
     CBUUID,
     CBCharacteristicWriteWithoutResponse,
@@ -30,6 +25,8 @@ from CoreBluetooth import (
 from Foundation import NSArray, NSData
 
 from bleak import BleakScanner
+from bleak._compat import override
+from bleak.args import SizedBuffer
 from bleak.args.corebluetooth import CBStartNotifyArgs
 from bleak.assigned_numbers import gatt_char_props_to_strs
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -52,10 +49,6 @@ class BleakClientCoreBluetooth(BaseBleakClient):
     Args:
         address_or_ble_device (`BLEDevice` or str): The Bluetooth address of the BLE peripheral to connect to or the `BLEDevice` object representing it.
         services: Optional set of service UUIDs that will be used.
-
-    Keyword Args:
-        timeout (float): Timeout for required ``BleakScanner.find_device_by_address`` call. Defaults to 10.0.
-
     """
 
     def __init__(
@@ -64,7 +57,7 @@ class BleakClientCoreBluetooth(BaseBleakClient):
         services: Optional[set[str]] = None,
         **kwargs: Any,
     ):
-        super(BleakClientCoreBluetooth, self).__init__(address_or_ble_device, **kwargs)
+        super().__init__(address_or_ble_device, **kwargs)
 
         self._peripheral: Optional[CBPeripheral] = None
         self._delegate: Optional[PeripheralDelegate] = None
@@ -85,14 +78,14 @@ class BleakClientCoreBluetooth(BaseBleakClient):
         )
 
     def __str__(self) -> str:
-        return "BleakClientCoreBluetooth ({})".format(self.address)
+        return f"BleakClientCoreBluetooth ({self.address})"
 
     @override
     async def connect(self, pair: bool, **kwargs: Any) -> None:
         """Connect to a specified Peripheral
 
         Keyword Args:
-            timeout (float): Timeout for required ``BleakScanner.find_device_by_address`` call. Defaults to 10.0.
+            timeout (float): Timeout for required ``BleakScanner.find_device_by_address`` call.
         """
         if pair:
             logger.debug("Explicit pairing is not available in CoreBluetooth.")
@@ -111,14 +104,15 @@ class BleakClientCoreBluetooth(BaseBleakClient):
                 )
 
         if self._delegate is None:
-            self._delegate = PeripheralDelegate.alloc().initWithPeripheral_(
-                self._peripheral
-            )
+            assert self._peripheral is not None
+            self._delegate = PeripheralDelegate(self._peripheral)
 
         def disconnect_callback() -> None:
             # Ensure that `get_services` retrieves services again, rather
             # than using the cached object
             self.services = None
+
+            assert self._delegate is not None
 
             # If there are any pending futures waiting for delegate callbacks, we
             # need to raise an exception since the callback will no longer be
@@ -134,8 +128,10 @@ class BleakClientCoreBluetooth(BaseBleakClient):
                 self._disconnected_callback()
 
         manager = self._central_manager_delegate
-        logger.debug("CentralManagerDelegate  at {}".format(manager))
-        logger.debug("Connecting to BLE device @ {}".format(self.address))
+        assert manager is not None
+        logger.debug("CentralManagerDelegate at %r", manager)
+        logger.debug("Connecting to BLE device @ %s", self.address)
+        assert self._peripheral is not None
         await manager.connect(self._peripheral, disconnect_callback, timeout=timeout)
 
         # Now get services
@@ -230,6 +226,7 @@ class BleakClientCoreBluetooth(BaseBleakClient):
 
         logger.debug("Retrieving services...")
         assert self._delegate
+        assert self._peripheral
         cb_services = await self._delegate.discover_services(self._requested_services)
 
         for service in cb_services:
@@ -239,24 +236,21 @@ class BleakClientCoreBluetooth(BaseBleakClient):
             services.add_service(serv)
 
             serviceUUID = service.UUID().UUIDString()
-            logger.debug(
-                "Retrieving characteristics for service {}".format(serviceUUID)
-            )
+            logger.debug("Retrieving characteristics for service %s", serviceUUID)
             characteristics = await self._delegate.discover_characteristics(service)
 
             for characteristic in characteristics:
                 cUUID = characteristic.UUID().UUIDString()
-                logger.debug(
-                    "Retrieving descriptors for characteristic {}".format(cUUID)
-                )
+                logger.debug("Retrieving descriptors for characteristic %s", cUUID)
 
                 char = BleakGATTCharacteristic(
                     characteristic,
                     characteristic.handle(),
                     cb_uuid_to_str(characteristic.UUID()),
                     list(gatt_char_props_to_strs(characteristic.properties())),
-                    lambda: self._peripheral.maximumWriteValueLengthForType_(
-                        CBCharacteristicWriteWithoutResponse
+                    functools.partial(
+                        self._peripheral.maximumWriteValueLengthForType_,
+                        CBCharacteristicWriteWithoutResponse,
                     ),
                     serv,
                 )
@@ -294,7 +288,7 @@ class BleakClientCoreBluetooth(BaseBleakClient):
             characteristic.obj, use_cached=kwargs.get("use_cached", False)
         )
         value = bytearray(output)
-        logger.debug("Read Characteristic {0} : {1}".format(characteristic.uuid, value))
+        logger.debug("Read Characteristic %s: %r", characteristic.uuid, value)
         return value
 
     @override
@@ -326,9 +320,10 @@ class BleakClientCoreBluetooth(BaseBleakClient):
 
     @override
     async def write_gatt_char(
-        self, characteristic: BleakGATTCharacteristic, data: Buffer, response: bool
+        self, characteristic: BleakGATTCharacteristic, data: SizedBuffer, response: bool
     ) -> None:
         value = NSData.alloc().initWithBytes_length_(data, len(data))
+        assert self._delegate
         await self._delegate.write_characteristic(
             characteristic.obj,
             value,
@@ -342,7 +337,7 @@ class BleakClientCoreBluetooth(BaseBleakClient):
 
     @override
     async def write_gatt_descriptor(
-        self, descriptor: BleakGATTDescriptor, data: Buffer
+        self, descriptor: BleakGATTDescriptor, data: SizedBuffer
     ) -> None:
         """Perform a write operation on the specified GATT descriptor.
 
@@ -361,14 +356,14 @@ class BleakClientCoreBluetooth(BaseBleakClient):
         self,
         characteristic: BleakGATTCharacteristic,
         callback: NotifyCallback,
-        *,
-        cb: CBStartNotifyArgs,
         **kwargs: Any,
     ) -> None:
         """
         Activate notifications/indications on a characteristic.
         """
         assert self._delegate is not None
+
+        cb: CBStartNotifyArgs = kwargs["cb"]
 
         await self._delegate.start_notifications(
             characteristic.obj,

@@ -3,6 +3,7 @@ import time as _time
 import asyncio
 import subprocess
 import sys
+import fcntl
 from collections import deque
 from bleak import BleakClient
 from time import sleep
@@ -12,6 +13,11 @@ from utils import (
     BLUETOOTH_DIRECT_CONNECT,
     BLUETOOTH_PREFERRED_ADAPTER,
 )
+
+# Cross-process lock file for serializing BLE scan/connect across service instances.
+# BleakClient(address) triggers an implicit BleakScanner.discover() during connect(),
+# and BlueZ returns "InProgress" if two processes scan simultaneously.
+_BLE_CONNECT_LOCK_PATH = "/tmp/dbus-serialbattery-ble-connect.lock"
 
 
 # Class that enables synchronous writing and reading to a bluetooh device
@@ -133,26 +139,48 @@ class Syncron_Ble:
             # rely on BlueZ default unless configured otherwise
             adapters_to_try = [None]
 
-        for adapter in adapters_to_try:
-            self.client = BleakClient(address, disconnected_callback=self.client_disconnected, adapter=adapter) if adapter else BleakClient(address, disconnected_callback=self.client_disconnected)
-            try:
-                await self.client.connect()
-                await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
-                await asyncio.sleep(0.2)
-                break
-            except Exception as e:
-                logger.error(f"Failed when trying to connect: {repr(e)}")
+        # Acquire a cross-process file lock to serialize BLE scanning/connecting.
+        # This prevents BlueZ "InProgress" errors when multiple battery services
+        # attempt to scan simultaneously via bleak's implicit discover().
+        lock_fd = None
+        try:
+            lock_fd = open(_BLE_CONNECT_LOCK_PATH, "w")
+            logger.info(f"BLE connect lock: waiting to acquire for {address}")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            logger.info(f"BLE connect lock: acquired for {address}")
+        except Exception as e:
+            logger.warning(f"BLE connect lock: could not acquire ({repr(e)}), proceeding without lock")
+
+        try:
+            for adapter in adapters_to_try:
+                self.client = BleakClient(address, disconnected_callback=self.client_disconnected, adapter=adapter) if adapter else BleakClient(address, disconnected_callback=self.client_disconnected)
                 try:
-                    await self.client.disconnect()
+                    await self.client.connect()
+                    await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
+                    await asyncio.sleep(0.2)
+                    break
+                except Exception as e:
+                    logger.error(f"Failed when trying to connect: {repr(e)}")
+                    try:
+                        await self.client.disconnect()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.3)
+                    continue
+            else:
+                # all attempts failed
+                self.ble_connection_ready.set()
+                self.connected = False
+                return False
+        finally:
+            # Release the lock so the next service instance can connect
+            if lock_fd:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    lock_fd.close()
+                    logger.info(f"BLE connect lock: released for {address}")
                 except Exception:
                     pass
-                await asyncio.sleep(0.3)
-                continue
-        else:
-            # all attempts failed
-            self.ble_connection_ready.set()
-            self.connected = False
-            return False
 
         try:
             self.ble_connection_ready.set()

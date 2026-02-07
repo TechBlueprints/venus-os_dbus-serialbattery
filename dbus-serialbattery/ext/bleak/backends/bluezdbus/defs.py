@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 from typing import Literal, TypedDict
 
 from bleak.assigned_numbers import CharacteristicPropertyName
@@ -123,6 +121,8 @@ class GattCharacteristic1(TypedDict):
     NotifyAcquired: bool
     Notifying: bool
     Flags: list[CharacteristicPropertyName]
+    # "MTU" property was added in BlueZ 5.62.
+    # It may missing when operating with an older stack.
     MTU: int
     # Handle is server-only and not available in Bleak
 

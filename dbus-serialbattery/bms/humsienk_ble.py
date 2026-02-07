@@ -225,6 +225,8 @@ class HumsiENK_Ble(Battery):
             if ok:
                 # Mark connection start time for planned reconnections
                 self._connection_start_time = time.time()
+                # Initialize frame time so the 9-minute emergency reconnect doesn't fire immediately
+                self._last_frame_time = time.time()
                 try:
                     # Send initial trigger to start notifications
                     self._send_trigger()
@@ -782,30 +784,22 @@ class HumsiENK_Ble(Battery):
                 return b if b < 128 else b - 256
             
             if idx < len(data):
-                t = float(_signed_byte(data[idx]))
-                self.temperature_1 = t
-                self.temps[1] = t
+                self.temperature_1 = float(_signed_byte(data[idx]))
                 idx += 1
             if idx < len(data):
-                t = float(_signed_byte(data[idx]))
-                self.temperature_2 = t
-                self.temps[2] = t
+                self.temperature_2 = float(_signed_byte(data[idx]))
                 idx += 1
             if idx < len(data):
-                t = float(_signed_byte(data[idx]))
-                self.temperature_3 = t
-                self.temps[3] = t
+                self.temperature_3 = float(_signed_byte(data[idx]))
                 idx += 1
             if idx < len(data):
-                t = float(_signed_byte(data[idx]))
-                self.temperature_4 = t
-                self.temps[4] = t
+                self.temperature_4 = float(_signed_byte(data[idx]))
                 idx += 1
             if idx < len(data):
                 self.temperature_mos = float(_signed_byte(data[idx]))
                 idx += 1
             if idx < len(data):
-                self.temps[0] = float(_signed_byte(data[idx]))  # Environment temp as sensor 0
+                # Environment temp - store as temp sensor 5 if available
                 idx += 1
             
             logger.debug(f"HumsiENK: Battery info: {self.voltage:.2f}V, {self.current:.2f}A, {self.soc}%, "

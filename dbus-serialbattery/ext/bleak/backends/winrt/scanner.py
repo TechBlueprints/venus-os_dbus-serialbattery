@@ -10,11 +10,7 @@ import logging
 from typing import Literal, NamedTuple, Optional
 from uuid import UUID
 
-if sys.version_info < (3, 12):
-    from typing_extensions import override
-else:
-    from typing import override
-
+from winrt.windows.devices.bluetooth import BluetoothAdapter
 from winrt.windows.devices.bluetooth.advertisement import (
     BluetoothLEAdvertisementReceivedEventArgs,
     BluetoothLEAdvertisementType,
@@ -23,8 +19,10 @@ from winrt.windows.devices.bluetooth.advertisement import (
     BluetoothLEAdvertisementWatcherStoppedEventArgs,
     BluetoothLEScanningMode,
 )
+from winrt.windows.devices.radios import RadioState
 from winrt.windows.foundation import EventRegistrationToken
 
+from bleak._compat import override
 from bleak.assigned_numbers import AdvertisementDataType
 from bleak.backends.scanner import (
     AdvertisementData,
@@ -32,7 +30,11 @@ from bleak.backends.scanner import (
     BaseBleakScanner,
 )
 from bleak.backends.winrt.util import assert_mta
-from bleak.exc import BleakError
+from bleak.exc import (
+    BleakBluetoothNotAvailableError,
+    BleakBluetoothNotAvailableReason,
+    BleakError,
+)
 from bleak.uuids import normalize_uuid_str
 
 logger = logging.getLogger(__name__)
@@ -54,7 +56,7 @@ class RawAdvData(NamedTuple):
     Platform-specific advertisement data.
 
     Windows does not combine advertising data with type SCAN_RSP with other
-    advertising data like other platforms, so se have to do it ourselves.
+    advertising data like other platforms, so we have to do it ourselves.
     """
 
     adv: Optional[BluetoothLEAdvertisementReceivedEventArgs]
@@ -91,7 +93,7 @@ class BleakScannerWinRT(BaseBleakScanner):
         scanning_mode: Literal["active", "passive"],
         **kwargs: Any,
     ):
-        super(BleakScannerWinRT, self).__init__(detection_callback, service_uuids)
+        super().__init__(detection_callback, service_uuids)
 
         self.watcher: Optional[BluetoothLEAdvertisementWatcher] = None
         self._advertisement_pairs: dict[str, RawAdvData] = {}
@@ -238,6 +240,27 @@ class BleakScannerWinRT(BaseBleakScanner):
         # Callbacks for WinRT async methods will never happen in STA mode if
         # there is nothing pumping a Windows message loop.
         await assert_mta()
+
+        # TODO: need to fix return type of get_default_async() in PyWinRT
+        adapter = await BluetoothAdapter.get_default_async()
+        if adapter is None:  # pyright: ignore[reportUnnecessaryComparison]
+            raise BleakBluetoothNotAvailableError(
+                "No Bluetooth adapter found",
+                BleakBluetoothNotAvailableReason.NO_BLUETOOTH,
+            )
+
+        if not adapter.is_central_role_supported:
+            raise BleakBluetoothNotAvailableError(
+                "BLE 'central' role not supported on this adapter",
+                BleakBluetoothNotAvailableReason.NO_BLE_CENTRAL_ROLE,
+            )
+
+        radio = await adapter.get_radio_async()
+        if radio.state != RadioState.ON:
+            raise BleakBluetoothNotAvailableError(
+                "Bluetooth radio is not powered on. Turn on Bluetooth and try again.",
+                BleakBluetoothNotAvailableReason.POWERED_OFF,
+            )
 
         # start with fresh list of discovered devices
         self.seen_devices = {}

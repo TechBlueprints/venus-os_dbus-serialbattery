@@ -1,8 +1,8 @@
-# -*- coding: utf-8 -*-
-
 """Top-level package for bleak."""
 
 from __future__ import annotations
+
+from bleak.args import SizedBuffer
 
 __author__ = """Henrik Blidh"""
 __email__ = "henrik.blidh@gmail.com"
@@ -18,21 +18,12 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from types import TracebackType
 from typing import Any, Literal, Optional, TypedDict, Union, cast, overload
 
-if sys.version_info < (3, 12):
-    from typing_extensions import Buffer
-else:
-    from collections.abc import Buffer
-
-if sys.version_info < (3, 11):
-    from async_timeout import timeout as async_timeout
-    from typing_extensions import Never, Self, Unpack, assert_never
-else:
-    from asyncio import timeout as async_timeout
-    from typing import Never, Self, Unpack, assert_never
-
-from bleak.args.bluez import BlueZScannerArgs
+from bleak._compat import Never, Self, Unpack, assert_never
+from bleak._compat import timeout as async_timeout
+from bleak.args.bluez import BlueZNotifyArgs, BlueZScannerArgs
 from bleak.args.corebluetooth import CBScannerArgs, CBStartNotifyArgs
 from bleak.args.winrt import WinRTClientArgs
+from bleak.backends import BleakBackend
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.client import BaseBleakClient, get_platform_client_backend_type
 from bleak.backends.descriptor import BleakGATTDescriptor
@@ -60,7 +51,7 @@ if bool(os.environ.get("BLEAK_LOGGING", False)):
 
 
 # prevent tasks from being garbage collected
-_background_tasks = set[asyncio.Task[None]]()
+_background_tasks: set[asyncio.Task[None]] = set()
 
 
 class BleakScanner:
@@ -123,8 +114,10 @@ class BleakScanner:
         backend: Optional[type[BaseBleakScanner]] = None,
         **kwargs: Any,
     ) -> None:
-        PlatformBleakScanner = (
-            get_platform_scanner_backend_type() if backend is None else backend
+        PlatformBleakScanner, backend_id = (
+            get_platform_scanner_backend_type()
+            if backend is None
+            else (backend, backend.__name__)
         )
 
         self._backend = PlatformBleakScanner(
@@ -135,9 +128,22 @@ class BleakScanner:
             cb=cb,
             **kwargs,
         )  # type: ignore
+        self._backend_id = backend_id
+
+    @property
+    def backend_id(self) -> BleakBackend | str:
+        """
+        Gets the identifier of the backend in use.
+
+        The value is one of the :class:`BleakBackend` enum values in case of
+        built-in backends, or a string identifying a custom backend.
+
+        .. versionadded:: 2.0
+        """
+        return self._backend_id
 
     async def __aenter__(self) -> Self:
-        await self._backend.start()
+        await self.start()
         return self
 
     async def __aexit__(
@@ -146,10 +152,20 @@ class BleakScanner:
         exc_val: BaseException,
         exc_tb: TracebackType,
     ) -> None:
-        await self._backend.stop()
+        await self.stop()
 
     async def start(self) -> None:
-        """Start scanning for devices"""
+        """
+        Start scanning for devices.
+
+        Raises:
+            BleakBluetoothNotAvailableError:
+                if Bluetooth is not currently available
+
+        .. versionchanged:: 2.0
+            Now raises :class:`BleakBluetoothNotAvailableError` instead of :class:`BleakError`
+            when Bluetooth is not currently available.
+        """
         await self._backend.start()
 
     async def stop(self) -> None:
@@ -170,7 +186,7 @@ class BleakScanner:
 
         .. versionadded:: 0.21
         """
-        devices = asyncio.Queue[tuple[BLEDevice, AdvertisementData]]()
+        devices: asyncio.Queue[tuple[BLEDevice, AdvertisementData]] = asyncio.Queue()
 
         unregister_callback = self._backend.register_detection_callback(
             lambda bd, ad: devices.put_nowait((bd, ad))
@@ -211,6 +227,10 @@ class BleakScanner:
         """
         Used to override the automatically selected backend (i.e. for a
             custom backend).
+        """
+        adapter: str | None
+        """
+        Name of adapter to use (BlueZ specific), e.g. hci0.
         """
 
     @overload
@@ -434,7 +454,7 @@ class BleakClient:
             These can be 16-bit or 128-bit UUIDs.
         timeout:
             Timeout in seconds passed to the implicit ``discover`` call when
-            ``address_or_ble_device`` is not a :class:`BLEDevice`. Defaults to 10.0.
+            ``address_or_ble_device`` is not a :class:`BLEDevice`. Defaults to 30.
         pair:
             Attempt to pair with the the device before connecting, if it is not
             already paired. This has no effect on macOS since pairing is initiated
@@ -476,6 +496,9 @@ class BleakClient:
 
     .. versionchanged:: 1.0
         Added ``pair`` parameter.
+
+    .. versionchanged:: 2.1.1
+        Changed default connect timeout from 10 to 30 seconds.
     """
 
     def __init__(
@@ -484,14 +507,16 @@ class BleakClient:
         disconnected_callback: Optional[Callable[[BleakClient], None]] = None,
         services: Optional[Iterable[str]] = None,
         *,
-        timeout: float = 10.0,
+        timeout: float = 30,
         pair: bool = False,
         winrt: WinRTClientArgs = {},
         backend: Optional[type[BaseBleakClient]] = None,
         **kwargs: Any,
     ) -> None:
-        PlatformBleakClient = (
-            get_platform_client_backend_type() if backend is None else backend
+        PlatformBleakClient, backend_id = (
+            get_platform_client_backend_type()
+            if backend is None
+            else (backend, backend.__name__)
         )
 
         self._backend = PlatformBleakClient(
@@ -509,6 +534,19 @@ class BleakClient:
             **kwargs,
         )
         self._pair_before_connect = pair
+        self._backend_id = backend_id
+
+    @property
+    def backend_id(self) -> BleakBackend | str:
+        """
+        Gets the identifier of the backend in use.
+
+        The value is one of the :class:`BleakBackend` enum values in case of
+        built-in backends, or a string identifying a custom backend.
+
+        .. versionadded:: 2.0
+        """
+        return self._backend_id
 
     # device info
 
@@ -523,6 +561,8 @@ class BleakClient:
         a Bluetooth address separated with dashes (``-``) instead of colons
         (``:``) (or a UUID on Apple devices). It may also be possible to override
         the device name using the OS's Bluetooth settings.
+
+        .. versionadded:: 1.1
         """
         return self._backend.name
 
@@ -663,7 +703,7 @@ class BleakClient:
             The read data.
 
         Raises:
-            BleakGattCharacteristicNotFoundError: if a characteristic with the
+            BleakCharacteristicNotFoundError: if a characteristic with the
                 handle or UUID specified by ``char_specifier`` could not be found.
             backend-specific exceptions: if the read operation failed.
         """
@@ -673,7 +713,7 @@ class BleakClient:
     async def write_gatt_char(
         self,
         char_specifier: Union[BleakGATTCharacteristic, int, str, uuid.UUID],
-        data: Buffer,
+        data: SizedBuffer,
         response: Optional[bool] = None,
     ) -> None:
         r"""
@@ -712,7 +752,7 @@ class BleakClient:
                 property, which is why an explicit argument is encouraged.
 
         Raises:
-            BleakGattCharacteristicNotFoundError: if a characteristic with the
+            BleakCharacteristicNotFoundError: if a characteristic with the
                 handle or UUID specified by ``char_specifier`` could not be found.
             backend-specific exceptions: if the write operation failed.
 
@@ -743,6 +783,7 @@ class BleakClient:
             [BleakGATTCharacteristic, bytearray], Union[None, Awaitable[None]]
         ],
         *,
+        bluez: BlueZNotifyArgs = {},
         cb: CBStartNotifyArgs = {},
         **kwargs: Any,
     ) -> None:
@@ -767,19 +808,25 @@ class BleakClient:
             callback:
                 The function to be called on notification. Can be regular
                 function or async function.
+            bluez:
+                BlueZ backend-specific arguments.
             cb:
-                CoreBluetooth specific arguments.
+                CoreBluetooth backend-specific arguments.
 
         Raises:
-            BleakGattCharacteristicNotFoundError: if a characteristic with the
+            BleakCharacteristicNotFoundError: if a characteristic with the
                 handle or UUID specified by ``char_specifier`` could not be found.
             backend-specific exceptions: if the start notification operation failed.
 
         .. versionchanged:: 0.18
             The first argument of the callback is now a :class:`BleakGATTCharacteristic`
             instead of an ``int``.
+
         .. versionchanged:: 1.0
             Added the ``cb`` parameter.
+
+        .. versionchanged:: 2.1
+            Added the ``bluez`` parameter.
         """
         if not self.is_connected:
             raise BleakError("Not connected")
@@ -794,10 +841,10 @@ class BleakClient:
                 task.add_done_callback(_background_tasks.discard)
 
         else:
-            wrapped_callback = functools.partial(callback, characteristic)
+            wrapped_callback = functools.partial(callback, characteristic)  # type: ignore
 
         await self._backend.start_notify(
-            characteristic, wrapped_callback, cb=cb, **kwargs
+            characteristic, wrapped_callback, bluez=bluez, cb=cb, **kwargs
         )
 
     async def stop_notify(
@@ -813,7 +860,7 @@ class BleakClient:
                 BleakGATTCharacteristic object representing it.
 
         Raises:
-            BleakGattCharacteristicNotFoundError: if a characteristic with the
+            BleakCharacteristicNotFoundError: if a characteristic with the
                 handle or UUID specified by ``char_specifier`` could not be found.
             backend-specific exceptions: if the stop notification operation failed.
 
@@ -851,7 +898,7 @@ class BleakClient:
     async def write_gatt_descriptor(
         self,
         desc_specifier: Union[BleakGATTDescriptor, int],
-        data: Buffer,
+        data: SizedBuffer,
     ) -> None:
         """
         Perform a write operation on the specified GATT descriptor.
@@ -870,26 +917,3 @@ class BleakClient:
         """
         descriptor = _resolve_descriptor(desc_specifier, self.services)
         await self._backend.write_gatt_descriptor(descriptor, data)
-
-
-def cli() -> None:
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Perform Bluetooth Low Energy device scan"
-    )
-    parser.add_argument("-i", dest="adapter", default=None, help="HCI device")
-    parser.add_argument(
-        "-t", dest="timeout", type=int, default=5, help="Duration to scan for"
-    )
-    args = parser.parse_args()
-
-    out = asyncio.run(
-        BleakScanner.discover(adapter=args.adapter, timeout=float(args.timeout))
-    )
-    for o in out:
-        print(str(o))
-
-
-if __name__ == "__main__":
-    cli()

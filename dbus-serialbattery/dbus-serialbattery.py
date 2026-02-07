@@ -378,7 +378,7 @@ def main():
             else:
                 logger.error(">>> Unknown Bluetooth BMS type: " + port)
                 logger.error(
-                    "Supported Bluetooth BMS types (CASE SENSITIVE!): HumsiENK_Ble, Jkbms_Ble, Kilovault_Ble, LiTime_Ble, LltJbd_Ble, LltJbd_FastBle, NordicNus_Ble"
+                    "Supported Bluetooth BMS types (CASE SENSITIVE!): HumsiENK_Ble, HumsiENK_FastBle, Jkbms_Ble, Kilovault_Ble, LiTime_Ble, LltJbd_Ble, LltJbd_FastBle, NordicNus_Ble"
                 )
                 sleep(60)
                 exit_driver(None, None, 1)
