@@ -371,10 +371,14 @@ def main():
                 # noqa: F401 --> ignore flake "imported but unused" error
                 from bms.nordicnus_ble import NordicNus_Ble  # noqa: F401
 
+            elif port == "HumsiENK_Ble":
+                # noqa: F401 --> ignore flake "imported but unused" error
+                from bms.humsienk_ble import HumsiENK_Ble  # noqa: F401
+
             else:
                 logger.error(">>> Unknown Bluetooth BMS type: " + port)
                 logger.error(
-                    "Supported Bluetooth BMS types (CASE SENSITIVE!): Jkbms_Ble, Kilovault_Ble, LiTime_Ble, LltJbd_Ble, LltJbd_FastBle, NordicNus_Ble"
+                    "Supported Bluetooth BMS types (CASE SENSITIVE!): HumsiENK_Ble, Jkbms_Ble, Kilovault_Ble, LiTime_Ble, LltJbd_Ble, LltJbd_FastBle, NordicNus_Ble"
                 )
                 sleep(60)
                 exit_driver(None, None, 1)
