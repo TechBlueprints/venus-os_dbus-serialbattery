@@ -22,3 +22,6 @@ venus-data.tar.gz
 
 # Development / sample drivers
 sample-driver/
+
+# IDE / workspace
+*.code-workspace
