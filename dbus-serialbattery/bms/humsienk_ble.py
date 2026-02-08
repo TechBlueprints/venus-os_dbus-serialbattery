@@ -50,9 +50,7 @@ class HumsiENK_Ble(Battery):
         # Wake-up trigger backoff tracking
         self._wake_trigger_attempt = 0  # Track which wake-up attempt we're on
         self._wake_trigger_next_time = 0.0  # When to send the next wake-up trigger
-        # Periodic reconnection to prevent nRF52 buffer buildup and deadlock
         self._connection_start_time = 0.0  # Track when current connection started
-        self._planned_reconnect_interval = 300.0  # Reconnect every 5 minutes (300s)
         # Safe defaults until parsed from BMS (avoid div-by-zero in D-Bus publishing)
         # Start with 4 cells for this pack; we'll auto-detect real count from frames
         self.cell_count = 4
@@ -415,53 +413,8 @@ class HumsiENK_Ble(Battery):
                 logger.debug("HumsiENK refresh tick")
                 self._last_heartbeat_log = now_tick
             
-            # Planned reconnection every 5 minutes to prevent nRF52 buffer buildup
-            # The nRF52 BLE chip can deadlock if buffers fill or connection stays open too long
-            # This is a clean, controlled disconnect/reconnect cycle (not an error recovery)
-            if self.ble_handle and self._connection_start_time > 0:
-                time_connected = now_tick - self._connection_start_time
-                if time_connected >= self._planned_reconnect_interval:
-                    try:
-                        logger.info(f"HumsiENK: Planned reconnection after {int(time_connected)}s to prevent buffer buildup...")
-                        # Clean disconnect
-                        try:
-                            if hasattr(self.ble_handle, 'disconnect'):
-                                self.ble_handle.disconnect()
-                        except Exception:
-                            pass
-                        self.ble_handle = None
-                        
-                        # Wait a few seconds to let nRF52 flush buffers
-                        time.sleep(5.0)
-                        
-                        # Reconnect
-                        from utils_ble import Syncron_Ble
-                        try:
-                            self.ble_handle = Syncron_Ble(self.address, read_characteristic=self.BLE_RX_UUID, write_characteristic=self.BLE_TX_UUID)
-                            if self.ble_handle and self.ble_handle.connected:
-                                logger.info(f"HumsiENK: Planned reconnection successful!")
-                                self._connection_start_time = time.time()  # Reset connection timer
-                                self._last_frame_time = time.time()
-                                self._last_trigger_time = time.time()
-                                self._last_battery_info_time = time.time()
-                                self._last_cell_voltages_time = time.time()
-                                # Send initial trigger after reconnection
-                                try:
-                                    self._send_trigger()
-                                except Exception:
-                                    pass
-                            else:
-                                logger.warning(f"HumsiENK: Planned reconnection failed, will retry in 5 minutes")
-                                self._connection_start_time = time.time()  # Reset timer even on failure
-                        except Exception as conn_err:
-                            logger.warning(f"HumsiENK: Planned reconnection exception: {conn_err}")
-                            self._connection_start_time = time.time()  # Reset timer even on failure
-                    except Exception as e:
-                        logger.warning(f"HumsiENK: Planned reconnection outer exception: {e}")
-                        self._connection_start_time = time.time()  # Reset timer even on failure
-            
             # Emergency reconnection only if we truly haven't received ANY data for 9 minutes
-            # This is different from the planned reconnection above - this is error recovery
+            # This is error recovery, not a routine maintenance cycle
             # Mirror the app's behavior: NEVER disconnect under normal circumstances
             # The app does NOT have reconnection logic - it just sends triggers indefinitely
             # However, if we truly haven't received ANY data for 9 minutes (540s),
