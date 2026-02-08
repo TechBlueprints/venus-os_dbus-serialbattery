@@ -58,3 +58,7 @@ For more details on the Victron dbus interface see [the official victron dbus do
 ## Join the community on Discord
 
 https://discord.gg/YXzFB8rSgx
+
+## Help translating to your language
+
+Are you using this driver and you would like to have it in your language? Now you can help to translate it on [POEditor](https://poeditor.com/join/project/sA2DhyEpYh).

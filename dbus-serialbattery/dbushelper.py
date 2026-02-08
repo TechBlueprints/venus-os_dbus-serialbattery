@@ -5,7 +5,7 @@ import platform
 import dbus
 import traceback
 from time import sleep, time
-from utils import get_venus_os_version, get_venus_os_device_type, logger, publish_config_variables
+from utils import logger
 import utils
 from xml.etree import ElementTree
 import requests
@@ -42,23 +42,30 @@ class DbusHelper:
 
     def __init__(self, battery, bms_address=None):
         self.battery = battery
-        self.instance = 1
+        self.instance: int = 1
         self.settings = None
-        self.error = {"count": 0, "timestamp_first": None, "timestamp_last": None}
-        self.cell_voltages_good = None
-        self._dbusname = (
+        self.error: dict = {"cleared": True, "count": 0, "timestamp_first": None, "timestamp_last": None}
+        self.cell_voltages_good: bool = None
+        self.disconnect_threshold: int = None
+        self.bms_cable_alarm: int = 0
+        self._dbusname: str = (
             "com.victronenergy.battery."
             + self.battery.port[self.battery.port.rfind("/") + 1 :]
             + ("__" + str(bms_address) if bms_address is not None and bms_address != 0 else "")
         )
-        self._dbusservice = VeDbusService(self._dbusname, get_bus(), register=False)
-        self.bms_id = "".join(
-            # remove all non alphanumeric characters except underscore from the identifier
-            c if c.isalnum() else "_"
-            for c in self.battery.unique_identifier()
+        self._dbusservice: VeDbusService = VeDbusService(self._dbusname, get_bus(), register=False)
+        self.bms_id: str = (
+            "".join(
+                # remove all non alphanumeric characters except underscore from the identifier
+                c if c.isalnum() else "_"
+                for c in self.battery.unique_identifier()
+            )
+            if not utils.USE_PORT_AS_UNIQUE_ID
+            else utils.generate_unique_identifier(self.battery.port, self.battery.address)
         )
-        self.path_battery = None
-        self.save_charge_details_last = {
+
+        self.path_battery: str = None
+        self.save_charge_details_last: dict = {
             "allow_max_voltage": self.battery.allow_max_voltage,
             "max_voltage_start_time": self.battery.max_voltage_start_time,
             "soc_calc": (self.battery.soc_calc if self.battery.soc_calc is not None else ""),
@@ -98,12 +105,10 @@ class DbusHelper:
 
         # fail, if the file is already locked
         except OSError:
-            logger.error(
-                "** DRIVER STOPPED! Another battery with the same serial number/unique identifier " + f'"{self.battery.unique_identifier()}" found! **'
-            )
+            logger.error("** DRIVER STOPPED! Another battery with the same serial number/unique identifier " + f'"{self.bms_id}" found! **')
             logger.error("Please check that the batteries have unique identifiers.")
 
-            if "Ah" in self.battery.unique_identifier():
+            if "Ah" in self.bms_id:
                 logger.error("Change the battery capacities to be unique.")
                 logger.error("Example for batteries with 280 Ah:")
                 logger.error("- Battery 1: 279 Ah")
@@ -166,7 +171,7 @@ class DbusHelper:
         device_instance = "1"
         device_instances_used = []
         found_bms = False
-        self.path_battery = "/Settings/Devices/serialbattery" + "_" + str(self.bms_id)
+        self.path_battery = "/Settings/Devices/serialbattery" + "_" + str(self.bms_id).upper()
 
         # prepare settings class
         self.settings = SettingsDevice(get_bus(), self.EMPTY_DICT, self.handle_changed_setting)
@@ -392,6 +397,7 @@ class DbusHelper:
                 (self.battery.soc_calc if self.battery.soc_calc is not None else ""),
                 0,
                 0,
+                1,  # set setting as silent, this prevents logging ing localsettings service
             ],
             "SocResetLastReached": [
                 self.path_battery + "/SocResetLastReached",
@@ -404,6 +410,7 @@ class DbusHelper:
                 "",
                 0,
                 0,
+                1,  # set setting as silent, this prevents logging ing localsettings service
             ],
             "UniqueIdentifier": [
                 self.path_battery + "/UniqueIdentifier",
@@ -661,27 +668,15 @@ class DbusHelper:
         self._dbusservice.add_path("/History/CanBeCleared", 1, writeable=True)
 
         self._dbusservice.add_path("/Balancing", None, writeable=True)
+        self._dbusservice.add_path("/Heating", None, writeable=True)
+        self._dbusservice.add_path("/Info/HeatingCurrent", None, writeable=True)
+        self._dbusservice.add_path("/Info/HeatingPower", None, writeable=True)
+        self._dbusservice.add_path("/Info/HeatingTemperatureStart", None, writeable=True)
+        self._dbusservice.add_path("/Info/HeatingTemperatureStop", None, writeable=True)
         self._dbusservice.add_path("/Io/AllowToCharge", 0, writeable=True)
         self._dbusservice.add_path("/Io/AllowToDischarge", 0, writeable=True)
         self._dbusservice.add_path("/Io/AllowToBalance", 0, writeable=True)
-        self._dbusservice.add_path(
-            "/Io/ForceChargingOff",
-            (0 if "force_charging_off_callback" in self.battery.available_callbacks else None),
-            writeable=True,
-            onchangecallback=self.battery.force_charging_off_callback,
-        )
-        self._dbusservice.add_path(
-            "/Io/ForceDischargingOff",
-            (0 if "force_discharging_off_callback" in self.battery.available_callbacks else None),
-            writeable=True,
-            onchangecallback=self.battery.force_discharging_off_callback,
-        )
-        self._dbusservice.add_path(
-            "/Io/TurnBalancingOff",
-            (0 if "turn_balancing_off_callback" in self.battery.available_callbacks else None),
-            writeable=True,
-            onchangecallback=self.battery.turn_balancing_off_callback,
-        )
+        self._dbusservice.add_path("/Io/AllowToHeat", 0, writeable=True)
         # self._dbusservice.add_path('/SystemSwitch', 1, writeable=True)
 
         # Create the alarms
@@ -744,18 +739,47 @@ class DbusHelper:
 
         logger.debug(f"Publish config values: {utils.PUBLISH_CONFIG_VALUES}")
         if utils.PUBLISH_CONFIG_VALUES:
-            publish_config_variables(self._dbusservice)
+            utils.publish_config_variables(self._dbusservice)
 
         self._dbusservice.add_path("/Settings/HasTemperature", 1, writeable=True)
 
         if self.battery.has_settings:
             self._dbusservice.add_path("/Settings/HasSettings", 1, writeable=False)
-            self._dbusservice.add_path(
-                "/Settings/ResetSoc",
-                0,
-                writeable=True,
-                onchangecallback=self.battery.reset_soc_callback,
-            )
+            if "callback_charging_force_off" in self.battery.callbacks_available:
+                self._dbusservice.add_path(
+                    "/Settings/ForceChargingOff",
+                    0,
+                    writeable=True,
+                    onchangecallback=self.battery.callback_charging_force_off,
+                )
+            if "callback_discharging_force_off" in self.battery.callbacks_available:
+                self._dbusservice.add_path(
+                    "/Settings/ForceDischargingOff",
+                    0,
+                    writeable=True,
+                    onchangecallback=self.battery.callback_discharging_force_off,
+                )
+            if "callback_balancing_turn_off" in self.battery.callbacks_available:
+                self._dbusservice.add_path(
+                    "/Settings/TurnBalancingOff",
+                    0,
+                    writeable=True,
+                    onchangecallback=self.battery.callback_balancing_turn_off,
+                )
+            if "callback_heating_turn_off" in self.battery.callbacks_available:
+                self._dbusservice.add_path(
+                    "/Settings/TurnHeatingOff",
+                    0,
+                    writeable=True,
+                    onchangecallback=self.battery.callback_heating_turn_off,
+                )
+            if "callback_soc_reset_to" in self.battery.callbacks_available:
+                self._dbusservice.add_path(
+                    "/Settings/ResetSocTo",
+                    0,
+                    writeable=True,
+                    onchangecallback=self.battery.callback_soc_reset_to,
+                )
 
         self._dbusservice.add_path("/JsonData", None, writeable=False)
 
@@ -770,11 +794,13 @@ class DbusHelper:
         """
         Publishes the battery data to dbus.
         This is called every battery.poll_interval milli second as set up per battery type to read and update the data
+        or as callback when data is received for some battery types.
 
         :param loop: The main loop of the driver.
         """
         RETRY_CYCLE_SHORT_COUNT = 10
         RETRY_CYCLE_LONG_COUNT = 60
+        recovery_failed = False
 
         try:
             # Call the battery's refresh_data function
@@ -795,20 +821,27 @@ class DbusHelper:
                     self.battery.setup_external_sensor()
 
             if result:
-                # check if battery has been reconnected
-                if self.battery.online is False and self.error["count"] >= RETRY_CYCLE_SHORT_COUNT:
-                    logger.info(">>> Battery reconnected <<<")
-
                 # reset error count, if last error was more than 60 seconds ago
                 if self.error["count"] > 0 and self.error["timestamp_last"] < int(time()) - 60:
+                    self.error["cleared"] = True
                     self.error["count"] = 0
+                    self.error["timestamp_first"] = None
+                    self.error["timestamp_last"] = None
+
+                    # reset BMS cable alarm
+                    self.bms_cable_alarm = 0
+
+                    # show info that battery is reconnected and stable again
+                    logger.info(">>> Battery reconnected <<<")
 
                 self.battery.online = True
-                self.battery.connection_info = "Connected"
-
-                # unblock charge/discharge, if it was blocked when battery went offline
-                if utils.BLOCK_ON_DISCONNECT:
-                    self.battery.block_because_disconnect = False
+                if self.error["count"] > 0:
+                    seconds_since_first_error = int(time()) - self.error["timestamp_first"]
+                    self.battery.connection_info = (
+                        f"Connected ({self.error['count']} errors in the last {self.battery.get_seconds_to_string(seconds_since_first_error, 3)})"
+                    )
+                else:
+                    self.battery.connection_info = "Connected"
 
                 # reset cell voltages good
                 if self.cell_voltages_good is not None:
@@ -856,24 +889,35 @@ class DbusHelper:
                 if self.error["count"] > 1:
                     time_since_first_error = self.error["timestamp_last"] - self.error["timestamp_first"]
 
+                    # check if the cell voltages are good to go for some minutes
+                    if self.cell_voltages_good is None:
+                        self.cell_voltages_good = (
+                            True
+                            if self.battery.get_min_cell_voltage() > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN
+                            and self.battery.get_max_cell_voltage() < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX
+                            else False
+                        )
+
+                    # set disconnect threshold time
+                    if self.disconnect_threshold is None:
+                        self.disconnect_threshold = RETRY_CYCLE_LONG_COUNT if utils.BLOCK_ON_DISCONNECT else utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES * 60
+
                     # if the battery did not update in 10 second, it's assumed to be offline
                     if time_since_first_error >= RETRY_CYCLE_SHORT_COUNT:
 
-                        if self.battery.online:
+                        if self.battery.online and self.error["cleared"]:
                             # set battery offline
                             self.battery.online = False
+                            self.error["cleared"] = False
 
                             # reset the battery values
                             logger.error(">>> ERROR: Battery does not respond, init/reset values <<<")
+                            logger.error(
+                                f"    BLOCK_ON_DISCONNECT is {'enabled' if utils.BLOCK_ON_DISCONNECT else 'disabled'}. "
+                                + f"Exit in {self.disconnect_threshold} seconds if recovery does not occur."
+                            )
 
-                            # check if the cell voltages are good to go for some minutes
-                            if self.cell_voltages_good is None:
-                                self.cell_voltages_good = (
-                                    True
-                                    if self.battery.get_min_cell_voltage() > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN
-                                    and self.battery.get_max_cell_voltage() < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX
-                                    else False
-                                )
+                            if not utils.BLOCK_ON_DISCONNECT:
                                 logger.error(
                                     "    |- Cell voltages are"
                                     + ("" if self.cell_voltages_good else " NOT")
@@ -891,39 +935,48 @@ class DbusHelper:
                                     + f"Max threshold: {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX:.3f} --> "
                                     + ("OK" if self.battery.get_max_cell_voltage() < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX else "NOT OK")
                                 )
-                                logger.error(
-                                    "    |- Trying further for "
-                                    + f"{(60 * utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES if self.cell_voltages_good else 60):.0f} s, then restart the driver"
-                                )
 
                             self.battery.init_values()
 
-                            # block charge/discharge
-                            if utils.BLOCK_ON_DISCONNECT:
-                                self.battery.block_because_disconnect = True
-
                     # set connection info
+                    remaining = self.disconnect_threshold - time_since_first_error
                     self.battery.connection_info = (
-                        f"Connection lost since {time_since_first_error} s, "
-                        + "disconnect at "
-                        + f"{(60 * utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES if self.cell_voltages_good else 60):.0f} s"
+                        f"Lost for: {self.battery.get_seconds_to_string(time_since_first_error, 3)} | "
+                        + f"Disconnect in: {self.battery.get_seconds_to_string(remaining, 3)} | "
+                        + f"Threshold: {self.battery.get_seconds_to_string(self.disconnect_threshold, 3)}"
                     )
 
-                    # if the battery did not update in 60 second, it's assumed to be completely failed
-                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good):
-                        logger.error(f">>> Battery did not recover in {time_since_first_error} s. Restarting driver...")
-                        loop.quit()
+                    # set BMS cable alarm to warning
+                    self.bms_cable_alarm = (
+                        1
+                        if self.error["timestamp_last"] is not None
+                        and self.error["timestamp_first"] is not None
+                        and 60 < self.error["timestamp_last"] - self.error["timestamp_first"]
+                        else 0
+                    )
 
-                    # if the cells are between 3.2 and 3.3 volt we can continue for some time
-                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT * utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES and not utils.BLOCK_ON_DISCONNECT:
-                        logger.error(f">>> Battery did not recover in {time_since_first_error} s. Restarting driver...")
-                        loop.quit()
+                    # Exit if recovery time exceeded and
+                    # if BLOCK_ON_DISCONNECT is enabled or cell voltages are unsafe
+                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good):
+                        recovery_failed = True
+                    # Exit if extended recovery time exceeded
+                    # This is only possible if cell voltages are good and BLOCK_ON_DISCONNECT is disabled else it would have exited earlier
+                    elif time_since_first_error >= self.disconnect_threshold:
+                        recovery_failed = True
 
             # publish all the data from the battery object to dbus
             self.publish_dbus()
 
             # upload telemetry data
             self.telemetry_upload()
+
+            # check if recovery failed and exit the loop to restart the driver
+            # do this after publishing to dbus to set the alert from warning to error state
+            if recovery_failed:
+                # set BMS cable alarm to error before exiting
+                self._dbusservice["/Alarms/BmsCable"] = 2
+                logger.error(f">>> Battery did not recover in {time_since_first_error} s. Exit driver...")
+                loop.quit()
 
         except Exception:
             traceback.print_exc()
@@ -988,6 +1041,7 @@ class DbusHelper:
         self._dbusservice["/Io/AllowToCharge"] = 1 if self.battery.get_allow_to_charge() else 0
         self._dbusservice["/Io/AllowToDischarge"] = 1 if self.battery.get_allow_to_discharge() else 0
         self._dbusservice["/Io/AllowToBalance"] = 1 if self.battery.get_allow_to_balance() else 0 if self.battery.get_allow_to_balance() is not None else None
+        self._dbusservice["/Io/AllowToHeat"] = 1 if self.battery.get_allow_to_heat() else 0 if self.battery.get_allow_to_heat() is not None else None
         self._dbusservice["/System/NrOfModulesBlockingCharge"] = 0 if self.battery.get_allow_to_charge() else 1
         self._dbusservice["/System/NrOfModulesBlockingDischarge"] = 0 if self.battery.get_allow_to_discharge() else 1
         self._dbusservice["/System/NrOfModulesOnline"] = 1 if self.battery.online else 0
@@ -1035,6 +1089,11 @@ class DbusHelper:
         self._dbusservice["/System/MinCellVoltage"] = self.battery.get_min_cell_voltage()
         self._dbusservice["/System/MaxCellVoltage"] = self.battery.get_max_cell_voltage()
         self._dbusservice["/Balancing"] = self.battery.get_balancing()
+        self._dbusservice["/Heating"] = self.battery.get_heating()
+        self._dbusservice["/Info/HeatingCurrent"] = self.battery.heater_current
+        self._dbusservice["/Info/HeatingPower"] = self.battery.heater_power
+        self._dbusservice["/Info/HeatingTemperatureStart"] = self.battery.heater_temperature_start
+        self._dbusservice["/Info/HeatingTemperatureStop"] = self.battery.heater_temperature_stop
 
         # Update the alarms
         self.battery.protection.set_previous()
@@ -1060,7 +1119,7 @@ class DbusHelper:
         self._dbusservice["/Alarms/LowChargeTemperature"] = self.battery.protection.low_charge_temperature
         self._dbusservice["/Alarms/HighTemperature"] = self.battery.protection.high_temperature
         self._dbusservice["/Alarms/LowTemperature"] = self.battery.protection.low_temperature
-        self._dbusservice["/Alarms/BmsCable"] = 2 if self.battery.block_because_disconnect else 1 if not self.battery.online else 0
+        self._dbusservice["/Alarms/BmsCable"] = self.bms_cable_alarm if utils.BMS_CABLE_ALARM else 0
         self._dbusservice["/Alarms/HighInternalTemperature"] = self.battery.protection.high_internal_temperature
         self._dbusservice["/Alarms/FuseBlown"] = self.battery.protection.fuse_blown
 
@@ -1206,9 +1265,6 @@ class DbusHelper:
             logger.debug("logged to dbus [%s]" % str(round(self.battery.soc, 2)))
             self.battery.log_cell_data()
 
-        if self.battery.has_settings:
-            self._dbusservice["/Settings/ResetSoc"] = self.battery.reset_soc
-
         # get all paths from the dbus service
         if utils.PUBLISH_BATTERY_DATA_AS_JSON:
             all_items = self._dbusservice._dbusnodes["/"].GetItems()
@@ -1217,10 +1273,13 @@ class DbusHelper:
             all_items = {key: self.dbus_to_python(value["Value"]) for key, value in all_items.items()}
 
             # Filter out unwanted keys
-            filtered_data = {key: value for key, value in all_items.items() if key not in ["/JsonData", "/Settings/ResetSoc", "/Settings/HasSettings"]}
+            filtered_data = {key: value for key, value in all_items.items() if not key.startswith("/Settings") and key != "/JsonData"}
 
             # Set empty lists to empty string
             filtered_data = {key: "" if value == [] else value for key, value in filtered_data.items()}
+
+            # Convert all '' values to None (so they are exported as null in JSON)
+            filtered_data = {key: (None if value == "" else value) for key, value in filtered_data.items()}
 
             cascaded_data_json = json.dumps(self.cascade_data(filtered_data))
 
@@ -1543,8 +1602,8 @@ class DbusHelper:
         # assemble the data to be uploaded
         data = {
             "vrm_id": get_vrm_portal_id(),
-            "venus_os_version": get_venus_os_version(),
-            "gx_device_type": get_venus_os_device_type(),
+            "venus_os_version": utils.get_venus_os_version(),
+            "gx_device_type": utils.get_venus_os_device_type(),
             "driver_version": utils.DRIVER_VERSION,
             "device_instance": self.instance,
             "bms_type": self.battery.type,

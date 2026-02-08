@@ -11,11 +11,50 @@
 
 ## v2.1.x
 
+### Breaking Changes
+
+* Driver version greater or equal to `v2.1.20251222dev`
+  * The unique identifier for all Bluetooth BMS devices is now the BLE MAC address. Because of this change, your battery will appear as a new device after the update. Custom names and calculated data will be lost once during the upgrade.
+
+* Driver version greater or equal to `v2.1.20260105`
+  * Moved d-bus/MQTT path from `/Io/ForceChargingOff` to `/Settings/ForceChargingOff`
+  * Moved d-bus/MQTT path from `/Io/ForceDischargingOff` to `/Settings/ForceDischargingOff`
+  * Moved d-bus/MQTT path from `/Io/TurnBalancingOff` to `/Settings/TurnBalancingOff`
+  * Moved d-bus/MQTT path from `/Settings/ResetSoc` to `/Settings/ResetSocTo`
+
 ### What's Changed
+
+* Added: aiobmsble library (https://github.com/patman15/aiobmsble), which adds a lot of Bluetooth batteries to Venus OS by @mr-manuel
+* Added: Daren 485 BMS - Read SoH with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/344 by @kopierschnitte
+* Added: Disable serial starter if not needed by @mr-manuel
+* Added: Generic MQTT BMS by @mr-manuel
+* Added: Health check for batteries which are using the callback by @mr-manuel
+* Added: JBD CAN protocol support with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/363 by @dmitrych5
+* Added: JBD UP16S series support, including daisy-chaining, with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/375 by @dmitrych5
+* Added: JK Inverter BMS - Heating informations with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/367 by @BitSeb
+* Added: KS48100 BMS - Read SoH with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/344 by @kopierschnitte
 * Added: Venus OS 3.7x GUIv2 support by @mr-manuel
+* Changed: Daren 485 BMS - Fixed charge/discharge calculation with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/343 by @kopierschnitte
+* Changed: Driver internals - Renamed callback variables/functions and added a better description by @mr-manuel
+* Changed: Exit behavior for excluded devices to behave like Victron services by @mr-manuel
+* Changed: Fix issue with published JsonData, where None values were published as empty strings by @mr-manuel
+* Changed: Fixed discharge current limit calculations when MOSFET temperature is not available, by @dmitrych5
+* Changed: Fixed problems with the `BLOCK_ON_DISCONNECT` behavior. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/309 by @mr-manuel
 * Changed: Fixed typo in activation instructions by @mr-manuel
+* Changed: GUIv2: Add cell diff to mean and improve calculations to reduce CPU load. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/360 by @mr-manuel
+* Changed: HLPDATA BMS - Fixed wrong charge/discharge fet assignment @mr-manuel
+* Changed: HLPDATA BMS - Fixed wrong charge/discharge fet assignment @mr-manuel
+* Changed: Improved BMS Cable Alarm Logic. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/309 by @mr-manuel
 * Changed: JK Inverter BMS - Fixed serial number lenght by @mr-manuel
+* Changed: JKBMS BLE - Fixed negative temperature display. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/369 by @mr-manuel
 * Changed: JKBMS CAN - Correct calculation of arbitration_id for device_address > 0. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/288 with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/306 by @Hooorny
+* Changed: KS48100 BMS - Fixed charge/discharge calculation with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/343 by @kopierschnitte
+* Changed: LLT/JBD BLE BMS - Fixed wrong charge/discharge fet assignment @mr-manuel
+* Changed: Made some dbus settings silent to not flood the localsettings service log by @mr-manuel
+* Changed: RV-C CAN BMS - Fixed wrong charge/discharge fet assignment @mr-manuel
+* Changed: Seplos BMS - Fix problems with unique identifier when daisy chained by @KoljaWindeler
+* Changed: Use Bluetooth MAC address as unique identifier for all Bluetooth BMS by @mr-manuel
+* Changed: Use port and address as unique identifier is now available for all serial BMS by @mr-manuel
 
 ## v2.0.20250729
 
@@ -62,6 +101,7 @@
   * Changes to `config.default.ini`: `TEMP_4_NAME` was replaced by `TEMPERATURE_4_NAME`
 
 ### What's Changed
+
 * Added: BLE - Config settings do enable/disable `BLUETOOTH_USE_POLLING` and `BLUETOOTH_FORCE_RESET_BLE_STACK` by @mr-manuel
 * Added: BLE - Error message if BLE `BMS_TYPE` was misspelled by @mr-manuel
 * Added: BLE - Error message if BLE address is missing by @mr-manuel

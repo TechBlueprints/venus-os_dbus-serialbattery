@@ -5,7 +5,7 @@
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 from battery import Battery, Cell
-from utils import bytearray_to_string, logger
+from utils import generate_unique_identifier, logger
 from struct import unpack_from
 from time import sleep, time
 import sys
@@ -53,7 +53,7 @@ class RV_C_Can(Battery):
         e.g. the serial number
         If there is no such value, please remove this function
         """
-        return self.port + ("__" + bytearray_to_string(self.address).replace("\\", "0") if self.address is not None else "")
+        return generate_unique_identifier(self.port, self.address)
 
     def test_connection(self):
         """
@@ -212,8 +212,8 @@ class RV_C_Can(Battery):
             elif normalized_arbitration_id in self.CAN_FRAMES[self.BATT_STAT11]:
                 self.capacity = unpack_from("<H", bytes([data[3], data[4]]))[0]
                 fet = unpack_from("<B", bytes([data[2]]))[0]
-                self.control_allow_discharge = 1 if int(bin(fet | 0x100)[8:9]) > 0 else 0
-                self.control_allow_charge = 1 if int(bin(fet | 0x100)[10:11]) > 0 else 0
+                self.discharge_fet = 1 if int(bin(fet | 0x100)[8:9]) > 0 else 0
+                self.charge_fet = 1 if int(bin(fet | 0x100)[10:11]) > 0 else 0
                 # check if all needed data is available
                 data_check += 2
 
