@@ -25,3 +25,6 @@ sample-driver/
 
 # IDE / workspace
 *.code-workspace
+
+# Cerbo deployment configs (local backup)
+cerbo-deploy/
