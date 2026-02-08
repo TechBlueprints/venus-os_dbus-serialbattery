@@ -28,3 +28,6 @@ sample-driver/
 
 # Cerbo deployment configs (local backup)
 cerbo-deploy/
+
+# LLM-generated docs and test scripts
+llm-docs/
