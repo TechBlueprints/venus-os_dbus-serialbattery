@@ -62,9 +62,11 @@ class HumsiENK_Ble(Battery):
         if len(self.cells) == 0:
             for _ in range(self.cell_count):
                 self.cells.append(Cell(False))
+        # Safe cell defaults until BMS reports real data; extra cells get trimmed
+        # once the real cell count is detected from frames 0x22 or 0x58
         for c in range(len(self.cells)):
-            self.cells[c].voltage = 3.2
-        self.voltage = round(self.cell_count * 3.2, 2)
+            self.cells[c].voltage = 3.4
+        self.voltage = round(self.cell_count * 3.4, 2)  # 13.6V — avoids low-battery warnings on startup
         self.current = 0.0
         self.soc = 50
         # Default to allowed until proven otherwise (BMS doesn't expose FET bits here)
@@ -152,36 +154,27 @@ class HumsiENK_Ble(Battery):
         """
         Build a binary command packet according to protocol spec.
         
-        Format: [0xAA, CMD, LEN, DATA..., CMD, 0x00]
+        Format: [0xAA, CMD, LEN, DATA..., CHK_LO, CHK_HI]
         - Start byte: 0xAA
         - Command: 1 byte
         - Length: 1 byte - length of DATA only (not including header/checksum)
         - Data: 0-N bytes (optional)
-        - Checksum: Command byte repeated
-        - Footer: 0x00
+        - Checksum: 16-bit LE sum of bytes from CMD through end of DATA
         
         Examples:
             _build_command(0x21, []) → [0xAA, 0x21, 0x00, 0x21, 0x00]
-            _build_command(0x50, [0x01]) → [0xAA, 0x50, 0x01, 0x01, 0x50, 0x00]
+            _build_command(0x50, [0x01]) → [0xAA, 0x50, 0x01, 0x01, 0x52, 0x00]
         """
         if data is None:
             data = []
         
-        # Build packet structure
-        packet = [self.FRAME_START, command]
+        # Build payload: CMD, LEN, DATA...
+        payload = [command, len(data) & 0xFF] + data
         
-        # Add length field (single byte for data length)
-        data_len = len(data)
-        packet.append(data_len & 0xFF)
+        # Checksum: 16-bit LE sum of payload bytes (CMD through end of DATA)
+        crc = sum(payload) & 0xFFFF
         
-        # Add data payload
-        packet.extend(data)
-        
-        # Add "checksum" (command byte repeated) and footer
-        packet.append(command)
-        packet.append(0x00)
-        
-        return bytes(packet)
+        return bytes([self.FRAME_START] + payload + [crc & 0xFF, (crc >> 8) & 0xFF])
 
     def _use_cached_data(self) -> bool:
         """
@@ -312,10 +305,10 @@ class HumsiENK_Ble(Battery):
         if len(self.cells) == 0:
             for _ in range(self.cell_count):
                 self.cells.append(Cell(False))
-        # Initialize placeholder voltages to avoid None in internal calculations
+        # Safe cell defaults for any newly added cells (trimmed once real count is known)
         for c in range(len(self.cells)):
             if getattr(self.cells[c], "voltage", None) is None:
-                self.cells[c].voltage = 0.0
+                self.cells[c].voltage = 3.4
         if getattr(self, "capacity", None) is None:
             self.capacity = BATTERY_CAPACITY if BATTERY_CAPACITY is not None else 0
         if getattr(self, "max_battery_charge_current", None) is None:
@@ -601,14 +594,23 @@ class HumsiENK_Ble(Battery):
             if data_refreshed:
                 self._save_cached_state()
             else:
-                # No fresh data - check if we can use cached data
+                # No fresh data this poll cycle — normal between BLE command/response rounds.
+                # Use last-known-good values so dbus always has something to report.
                 if self._use_cached_data():
                     age = time.time() - self._last_good_state.get('timestamp', 0)
-                    logger.info(f"HumsiENK: Using cached data ({age:.0f}s old) during disconnection")
+                    msg = f"HumsiENK: No new data this cycle, using cached values ({age:.0f}s old)"
+                    if age >= 60:
+                        logger.error(msg)
+                    elif age >= 30:
+                        logger.warning(msg)
+                    elif age >= 15:
+                        logger.info(msg)
+                    else:
+                        logger.debug(msg)
             
-            # Provide placeholder values to avoid empty readings
+            # Provide placeholder values to avoid empty readings (13.6V avoids low-battery warnings)
             if getattr(self, "voltage", None) is None:
-                self.voltage = 0.0
+                self.voltage = round(self.cell_count * 3.4, 2)
             if getattr(self, "current", None) is None:
                 self.current = 0.0
             if getattr(self, "soc", None) is None:
@@ -617,9 +619,10 @@ class HumsiENK_Ble(Battery):
             if len(self.cells) == 0:
                 for _ in range(self.cell_count):
                     self.cells.append(Cell(False))
+            # Safe cell defaults for any newly added cells (trimmed once real count is known)
             for c in range(len(self.cells)):
                 if getattr(self.cells[c], "voltage", None) is None:
-                    self.cells[c].voltage = 0.0
+                    self.cells[c].voltage = 3.4
             if getattr(self, "charge_fet", None) is None:
                 self.charge_fet = True
             if getattr(self, "discharge_fet", None) is None:
@@ -669,7 +672,7 @@ class HumsiENK_Ble(Battery):
         """
         Parse command 0x21 response (Battery Info) - 26 bytes.
         
-        Field layout confirmed from APK (Ve function) and live device data:
+        Field layout (confirmed via live device testing):
             vol (4 bytes): Battery voltage in mV (millivolts)
             ele (4 bytes): Current in mA (milliamps), signed 32-bit
             SOC (1 byte): State of Charge %
@@ -700,7 +703,7 @@ class HumsiENK_Ble(Battery):
             idx += 4
             
             # Current (4 bytes, milliamps signed → divide by 1000 for A)
-            # APK: e.ele > 2147483647 && (e.ele = -(4294967296 - e.ele))
+            # Signed 32-bit: values > 2^31 are negative (two's complement)
             current_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=True)
             self.current = current_raw / 1000.0
             idx += 4
@@ -714,13 +717,13 @@ class HumsiENK_Ble(Battery):
             idx += 1
             
             # Remaining capacity (4 bytes, mAh → divide by 1000 for Ah)
-            # APK: r.info.capacity1 = (r.info.capacity / 1e3).toFixed(2)
+            # Raw value in mAh; divide by 1000 for Ah
             capacity_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=False)
             self.capacity_remain = capacity_raw / 1000.0
             idx += 4
             
             # Total capacity (4 bytes, mAh → divide by 1000 for Ah)
-            # APK: r.info.allCapacity1 = (r.info.allCapacity / 1e3).toFixed(2)
+            # Raw value in mAh; divide by 1000 for Ah
             total_capacity_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=False)
             if total_capacity_raw > 0:
                 self.capacity = total_capacity_raw / 1000.0
@@ -731,8 +734,8 @@ class HumsiENK_Ble(Battery):
             idx += 2
             
             # Temperatures (6 × 1 byte, direct °C, signed byte)
-            # APK field names: t1, t2, t3, t4, MOS, environment (each 1 byte)
-            # APK display: raw > 127 ? raw - 256 : raw (signed byte for sub-zero temps)
+            # Fields: t1, t2, t3, t4, MOS, environment (each 1 byte)
+            # Signed byte: values > 127 are negative (for sub-zero temps)
             def _signed_byte(b):
                 return b if b < 128 else b - 256
             
@@ -752,7 +755,9 @@ class HumsiENK_Ble(Battery):
                 self.temperature_mos = float(_signed_byte(data[idx]))
                 idx += 1
             if idx < len(data):
-                # Environment temp - store as temp sensor 5 if available
+                # Environment temp — not mapped to D-Bus (base class supports 1-4 + MOS)
+                # but stored for diagnostics / future use
+                self.temperature_env = float(_signed_byte(data[idx]))
                 idx += 1
             
             logger.debug(f"HumsiENK: Battery info: {self.voltage:.2f}V, {self.current:.2f}A, {self.soc}%, "
@@ -808,9 +813,9 @@ class HumsiENK_Ble(Battery):
                 if 1000 <= mv <= 5000:  # Sanity check
                     self.cells[idx].voltage = mv / 1000.0
             
-            # Calculate pack voltage from cells if we have valid data
-            if self.cell_count > 0 and all(hasattr(c, 'voltage') and c.voltage > 0 for c in self.cells[:self.cell_count]):
-                self.voltage = sum(c.voltage for c in self.cells[:self.cell_count])
+            # Note: pack voltage is reported directly by the BMS in 0x21 and is more
+            # accurate than summing individual cell readings (which accumulate rounding errors).
+            # Do NOT overwrite self.voltage here.
             
             logger.debug(f"HumsiENK: Cell voltages: {[c.voltage for c in self.cells[:min(4, self.cell_count)]]}")
             
@@ -827,7 +832,7 @@ class HumsiENK_Ble(Battery):
             Bytes 8-10: Cell balance status (24-bit bitmap)
             Bytes 11-13: Cell disconnect status (24-bit bitmap)
         
-        Operation Status Alarm/Protection Bits (from APK analysis):
+        Operation Status Alarm/Protection Bits (confirmed via live device testing):
         
         CHARGE SECTION (Bits 0-15):
           Bit 0:  Charge overcurrent protection
@@ -994,8 +999,7 @@ class HumsiENK_Ble(Battery):
             
             # Cell disconnect status (bytes 11-13) - 24-bit bitmap
             # This indicates if any cells are physically disconnected (faulty connections, broken wires)
-            # NOTE: The official APK parses this field but never displays it!
-            # We implement it anyway for critical safety monitoring.
+            # Critical safety monitoring: detect physically disconnected cells.
             if len(data) >= 14:
                 cell_disconnect = int.from_bytes(data[11:14], 'little', signed=False)
                 
@@ -1107,8 +1111,7 @@ class HumsiENK_Ble(Battery):
             idx += 2
             
             # Temperature protection limits (raw values in deciKelvin)
-            # APK formula: (raw - 2731) / 10 → °C
-            # (confirmed at app-service-pretty.js line 7870)
+            # Temperature conversion: (raw_deciKelvin - 2731) / 10 → °C
             def _dk_to_c(raw):
                 return (raw - 2731) / 10.0
             

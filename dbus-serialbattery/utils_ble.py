@@ -152,21 +152,37 @@ class Syncron_Ble:
             logger.warning(f"BLE connect lock: could not acquire ({repr(e)}), proceeding without lock")
 
         try:
+            connected = False
             for adapter in adapters_to_try:
-                self.client = BleakClient(address, disconnected_callback=self.client_disconnected, adapter=adapter) if adapter else BleakClient(address, disconnected_callback=self.client_disconnected)
-                try:
-                    await self.client.connect()
-                    await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
-                    await asyncio.sleep(0.2)
-                    break
-                except Exception as e:
-                    logger.error(f"Failed when trying to connect: {repr(e)}")
+                # Retry loop: BlueZ returns "InProgress" when any process (not just
+                # our own) is scanning on the same adapter.  Wait and retry instead
+                # of immediately giving up.
+                max_retries = 5
+                for attempt in range(1, max_retries + 1):
+                    self.client = BleakClient(address, disconnected_callback=self.client_disconnected, adapter=adapter) if adapter else BleakClient(address, disconnected_callback=self.client_disconnected)
                     try:
-                        await self.client.disconnect()
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.3)
-                    continue
+                        await self.client.connect()
+                        await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
+                        await asyncio.sleep(0.2)
+                        connected = True
+                        break
+                    except Exception as e:
+                        error_str = repr(e)
+                        logger.error(f"Failed when trying to connect (attempt {attempt}/{max_retries}): {error_str}")
+                        try:
+                            await self.client.disconnect()
+                        except Exception:
+                            pass
+                        # If InProgress, retry after a delay — another process is scanning
+                        if "InProgress" in error_str and attempt < max_retries:
+                            delay = 1.0 + attempt * 0.5  # 1.5s, 2.0s, 2.5s, 3.0s
+                            logger.info(f"BLE adapter busy (InProgress), retrying in {delay}s...")
+                            await asyncio.sleep(delay)
+                            continue
+                        await asyncio.sleep(0.3)
+                        break  # non-InProgress error, try next adapter
+                if connected:
+                    break
             else:
                 # all attempts failed
                 self.ble_connection_ready.set()
