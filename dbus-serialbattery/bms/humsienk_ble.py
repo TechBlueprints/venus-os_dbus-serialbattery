@@ -33,6 +33,31 @@ class HumsiENK_Ble(Battery):
     FRAME_START = 0xAA            # Command frame start byte
     FRAME_RESPONSE = 0xAA         # Response frame start byte (same as command, confirmed from live device)
 
+    # ── Caching & startup-default configuration ──────────────────────────
+    # These flags control what the driver does when it has NO fresh BMS data.
+    # Set all three to False while debugging so the dashboard shows the truth
+    # rather than masking a broken connection with stale numbers.
+    #
+    # DISK_CACHE_ENABLED: save/load battery state to /data/ across reboots.
+    DISK_CACHE_ENABLED = False
+    #
+    # MEMORY_CACHE_ENABLED: serve in-memory last-known-good values when no
+    # fresh data arrives.  When False the driver only reports values that came
+    # from the BMS in THIS session; once data is older than ~15 s it stops
+    # being re-applied to self.* so D-Bus reflects None / stale.
+    MEMORY_CACHE_ENABLED = False
+    #
+    # STARTUP_DEFAULTS_ENABLED: pre-populate voltage / current / SOC with
+    # safe-ish fabricated values so the dashboard never shows None.  When
+    # False the driver starts with whatever the base Battery class provides
+    # and only fills in real values as the BMS delivers them.
+    STARTUP_DEFAULTS_ENABLED = False
+    #
+    # Default startup voltages (only used when STARTUP_DEFAULTS_ENABLED=True)
+    STARTUP_CELL_VOLTAGE = 3.4    # Volts per cell — mid-range LiFePO4
+    STARTUP_SOC = 50              # Percent
+    STARTUP_CURRENT = 0.0         # Amps
+
     def __init__(self, port, baud, address):
         super(HumsiENK_Ble, self).__init__(port, baud, address)
         self.type = self.BATTERYTYPE
@@ -58,17 +83,26 @@ class HumsiENK_Ble(Battery):
         # Seed sane max currents so base control logic doesn't collapse to zero
         self.max_battery_charge_current = MAX_BATTERY_CHARGE_CURRENT
         self.max_battery_discharge_current = MAX_BATTERY_DISCHARGE_CURRENT
-        # Pre-initialize cells and basic values to prevent internal calculation errors
+        # Pre-initialize cells list (always needed so len(self.cells) > 0)
         if len(self.cells) == 0:
             for _ in range(self.cell_count):
                 self.cells.append(Cell(False))
-        # Safe cell defaults until BMS reports real data; extra cells get trimmed
-        # once the real cell count is detected from frames 0x22 or 0x58
-        for c in range(len(self.cells)):
-            self.cells[c].voltage = 3.4
-        self.voltage = round(self.cell_count * 3.4, 2)  # 13.6V — avoids low-battery warnings on startup
-        self.current = 0.0
-        self.soc = 50
+        # Cell voltages MUST be numeric (not None) to prevent the framework's
+        # error-recovery path from crashing on  None > float  comparisons.
+        # When STARTUP_DEFAULTS_ENABLED, use realistic mid-range values;
+        # otherwise use 0.0 which is obviously wrong and will trigger alarms.
+        if self.STARTUP_DEFAULTS_ENABLED:
+            for c in range(len(self.cells)):
+                self.cells[c].voltage = self.STARTUP_CELL_VOLTAGE
+            self.voltage = round(self.cell_count * self.STARTUP_CELL_VOLTAGE, 2)
+            self.current = self.STARTUP_CURRENT
+            self.soc = self.STARTUP_SOC
+        else:
+            for c in range(len(self.cells)):
+                self.cells[c].voltage = 0.0
+            self.voltage = 0.0
+            self.current = 0.0
+            self.soc = 0
         # Default to allowed until proven otherwise (BMS doesn't expose FET bits here)
         self.charge_fet = True
         self.discharge_fet = True
@@ -87,10 +121,13 @@ class HumsiENK_Ble(Battery):
         self._reconnecting_in_progress = False  # Flag to prevent Bleak operations during scan/reconnect
         self._reconnect_failure_count = 0  # Track consecutive failures for exponential backoff
         self._max_reconnect_attempts = 3  # Max consecutive attempts before longer backoff
-        self._load_cached_state()  # Load previous state on init
-        # Flush state to disk on process exit (SIGTERM from runit, etc.)
-        import atexit
-        atexit.register(self._flush_state_to_disk)
+        if self.DISK_CACHE_ENABLED:
+            self._load_cached_state()
+            # Flush state to disk on process exit (SIGTERM from runit, etc.)
+            import atexit
+            atexit.register(self._flush_state_to_disk)
+        else:
+            logger.info("HumsiENK: Disk caching disabled")
         logger.info("Init of HumsiENK_Ble at " + address)
 
     def connection_name(self) -> str:
@@ -213,10 +250,23 @@ class HumsiENK_Ble(Battery):
         """
         Return True if we have cached data to serve (from RAM).
         Also restores cached values to self so D-Bus always has something.
+
+        When MEMORY_CACHE_ENABLED is False, cached data is NEVER re-applied
+        to self.* — the driver only shows values that came from the BMS
+        during this session.  This makes broken connections immediately
+        visible on the dashboard instead of hiding behind stale numbers.
         """
+        if not self.MEMORY_CACHE_ENABLED:
+            return False
+
         if not self._last_good_state or 'timestamp' not in self._last_good_state:
             return False
-        
+
+        # Don't re-apply data older than 15 seconds (the INFO threshold)
+        age = time.time() - self._last_good_state.get('timestamp', 0)
+        if age > 15:
+            return False
+
         # Restore cached values
         try:
             if 'voltage' in self._last_good_state:
@@ -233,7 +283,7 @@ class HumsiENK_Ble(Battery):
                         self.cells[idx].voltage = cell_v
         except Exception as e:
             logger.debug(f"HumsiENK: Error restoring cached data: {e}")
-        
+
         return True
 
 
@@ -250,8 +300,8 @@ class HumsiENK_Ble(Battery):
                 try:
                     # Send initial trigger to start notifications
                     self._send_trigger()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"HumsiENK: Initial trigger failed: {e}")
                 
                 # Send handshake command (0x00) and wait for response
                 try:
@@ -259,7 +309,16 @@ class HumsiENK_Ble(Battery):
                     self.ble_handle.send_data(handshake_cmd)
                     time.sleep(0.5)
                 except Exception as e:
-                    logger.debug(f"HumsiENK: Handshake send failed: {e}")
+                    # If the handshake write fails, the GATT connection is broken
+                    # (e.g. "Service Discovery has not been performed yet").
+                    # Do NOT return True — this connection is useless.
+                    logger.error(f"HumsiENK: Handshake send FAILED — GATT broken: {e}")
+                    try:
+                        self.ble_handle.client.disconnect()
+                    except Exception:
+                        pass
+                    self.ble_handle = None
+                    return False
                 
                 # Send cell voltage command (0x22) to detect cell count
                 try:
@@ -334,10 +393,10 @@ class HumsiENK_Ble(Battery):
         if len(self.cells) == 0:
             for _ in range(self.cell_count):
                 self.cells.append(Cell(False))
-        # Safe cell defaults for any newly added cells (trimmed once real count is known)
+        # Cell voltages must always be numeric (framework crashes on None)
         for c in range(len(self.cells)):
             if getattr(self.cells[c], "voltage", None) is None:
-                self.cells[c].voltage = 3.4
+                self.cells[c].voltage = self.STARTUP_CELL_VOLTAGE if self.STARTUP_DEFAULTS_ENABLED else 0.0
         if getattr(self, "capacity", None) is None:
             self.capacity = BATTERY_CAPACITY if BATTERY_CAPACITY is not None else 0
         if getattr(self, "max_battery_charge_current", None) is None:
@@ -578,7 +637,7 @@ class HumsiENK_Ble(Battery):
                         
                         # Valid frame - consume it and parse
                         del self._rx_buffer[:total_len]
-                        logger.debug(f"HumsiENK: Valid frame received, cmd={frame[1]:02X}, len={data_len}")
+                        logger.debug(f"HumsiENK: VALID FRAME cmd=0x{frame[1]:02X} datalen={data_len}")
                         self._parse_and_update(frame)
                         self._last_frame_time = time.time()
                         data_refreshed = True
@@ -592,7 +651,7 @@ class HumsiENK_Ble(Battery):
                 # Status command (0x20) every 2 seconds - keep-alive
                 if (now - self._last_trigger_time) >= 2.0:
                     try:
-                        logger.debug("TX CMD_STATUS (0x20) keep-alive")
+                        logger.debug("TX CMD_STATUS (0x20)")
                         cmd = self._build_command(self.CMD_STATUS, [])
                         self.ble_handle.send_data(cmd)
                         self._last_trigger_time = now
@@ -623,16 +682,26 @@ class HumsiENK_Ble(Battery):
             # disk flush is rate-limited to every 15 minutes (+ atexit).
             if data_refreshed:
                 self._update_ram_state()
-                self._save_cached_state()
+                if self.DISK_CACHE_ENABLED:
+                    self._save_cached_state()
                 # Clear stale-data alarm now that we have fresh BMS data
                 if self.protection.internal_failure is not None and self.protection.internal_failure > 0:
                     self.protection.internal_failure = Protection.OK
             else:
-                # No fresh data this poll cycle — normal between BLE command/response rounds.
-                # Use last-known-good values so dbus always has something to report.
-                if self._use_cached_data():
+                # No fresh data this poll cycle.
+                # Log staleness — with or without caching, visibility matters.
+                if self._last_good_state and 'timestamp' in self._last_good_state:
                     age = time.time() - self._last_good_state.get('timestamp', 0)
-                    msg = f"HumsiENK: No new data this cycle, using cached values ({age:.0f}s old)"
+                else:
+                    age = time.time() - self._last_frame_time if self._last_frame_time else 0
+
+                if age > 0:
+                    cached = self._use_cached_data()  # only re-applies values if MEMORY_CACHE_ENABLED
+                    if cached:
+                        msg = f"HumsiENK: No new data, serving cached values ({age:.0f}s old)"
+                    else:
+                        msg = f"HumsiENK: No new data this cycle ({age:.0f}s since last)"
+
                     if age >= 900:  # > 15 minutes
                         logger.error(msg)
                         self.protection.internal_failure = Protection.ALARM
@@ -645,26 +714,34 @@ class HumsiENK_Ble(Battery):
                         logger.info(msg)
                     else:
                         logger.debug(msg)
-            
-            # Provide placeholder values to avoid empty readings (13.6V avoids low-battery warnings)
+
+            # Ensure no None values reach D-Bus or framework calculations.
+            # With STARTUP_DEFAULTS_ENABLED: realistic values.
+            # Without: zeros (obviously wrong → triggers framework alarms).
             if getattr(self, "voltage", None) is None:
-                self.voltage = round(self.cell_count * 3.4, 2)
+                self.voltage = round(self.cell_count * self.STARTUP_CELL_VOLTAGE, 2) if self.STARTUP_DEFAULTS_ENABLED else 0.0
             if getattr(self, "current", None) is None:
-                self.current = 0.0
+                self.current = self.STARTUP_CURRENT if self.STARTUP_DEFAULTS_ENABLED else 0.0
             if getattr(self, "soc", None) is None:
-                self.soc = 50
-            # Ensure cells exist and have numeric voltages to prevent internal calc errors
+                self.soc = self.STARTUP_SOC if self.STARTUP_DEFAULTS_ENABLED else 0
             if len(self.cells) == 0:
                 for _ in range(self.cell_count):
                     self.cells.append(Cell(False))
-            # Safe cell defaults for any newly added cells (trimmed once real count is known)
             for c in range(len(self.cells)):
                 if getattr(self.cells[c], "voltage", None) is None:
-                    self.cells[c].voltage = 3.4
+                    self.cells[c].voltage = self.STARTUP_CELL_VOLTAGE if self.STARTUP_DEFAULTS_ENABLED else 0.0
             if getattr(self, "charge_fet", None) is None:
                 self.charge_fet = True
             if getattr(self, "discharge_fet", None) is None:
                 self.discharge_fet = True
+
+            # If we still have no voltage after everything above, we have NOTHING
+            # useful to publish.  Return False so the D-Bus publisher skips this
+            # cycle rather than trying to push None → crash → loop.quit().
+            if getattr(self, "voltage", None) is None:
+                logger.warning("HumsiENK: refresh_data returning False — no voltage data to publish")
+                return False
+
         except Exception as e:
             # Keep driver alive on parsing issues but log it
             logger.warning(f"HumsiENK: refresh_data exception: {e}")
