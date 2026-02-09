@@ -179,7 +179,7 @@ class HumsiENK_Ble(Battery):
                 json.dump(self._last_good_state, f)
             self._last_state_save = time.time()
             self._state_dirty = False
-            logger.info("HumsiENK: State flushed to disk")
+            logger.debug("HumsiENK: State flushed to disk")
         except Exception as e:
             logger.debug(f"HumsiENK: Could not save state to disk: {e}")
 
