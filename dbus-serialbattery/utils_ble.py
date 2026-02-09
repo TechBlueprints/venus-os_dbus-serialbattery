@@ -158,27 +158,63 @@ class Syncron_Ble:
             logger.warning(f"BLE connect lock: could not acquire ({repr(e)}), proceeding without lock")
 
         try:
+            # Drop any stale BlueZ connection to this address left over from a
+            # previous process that was killed (e.g. by runit `svc -t`).  Without
+            # this, the BMS device refuses a new connection because BlueZ still
+            # holds the old handle, and all connect attempts time out.
+            for _adapter in (adapters_to_rotate if adapters_to_rotate != [None] else []):
+                try:
+                    _result = subprocess.run(
+                        ["hcitool", "-i", _adapter, "con"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    for _line in (_result.stdout or "").splitlines():
+                        if address.upper() in _line.upper():
+                            _parts = _line.split("handle ")
+                            if len(_parts) > 1:
+                                _handle = _parts[1].split()[0]
+                                subprocess.run(
+                                    ["hcitool", "-i", _adapter, "ledc", _handle],
+                                    timeout=3,
+                                )
+                                logger.info(f"BLE: dropped stale handle {_handle} on {_adapter} for {address}")
+                                await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+
             connected = False
-            # Rotate through adapters on each retry so InProgress on one adapter
-            # causes the next attempt to try a different adapter.
-            max_retries = 10
+            # Wall-clock deadline: the main thread waits 30s for ble_connection_ready.
+            # We MUST finish (success or failure) before that, otherwise the process
+            # exits while this daemon thread is still mid-connection, leaving BlueZ
+            # with a stale half-open handle that causes InProgress errors on restart.
+            deadline = _time.time() + 25.0  # 5s margin before 30s main-thread timeout
+            max_retries = 6
             for attempt in range(1, max_retries + 1):
+                remaining = deadline - _time.time()
+                if remaining <= 1.0:
+                    logger.warning("BLE connect: wall-clock deadline reached, no time for more attempts")
+                    break
                 adapter = adapters_to_rotate[(attempt - 1) % len(adapters_to_rotate)]
                 adapter_name = adapter or "default"
                 self.client = BleakClient(address, disconnected_callback=self.client_disconnected, adapter=adapter) if adapter else BleakClient(address, disconnected_callback=self.client_disconnected)
+                # Per-attempt timeout: shrink to fit remaining budget (leave 1s for cleanup)
+                attempt_timeout = min(8.0, remaining - 1.0)
+                if attempt_timeout < 1.0:
+                    logger.warning("BLE connect: insufficient time remaining, giving up")
+                    break
                 try:
-                    await asyncio.wait_for(self.client.connect(), timeout=10.0)
+                    await asyncio.wait_for(self.client.connect(), timeout=attempt_timeout)
                     await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
                     await asyncio.sleep(0.2)
                     connected = True
                     break
                 except asyncio.TimeoutError:
-                    logger.warning(f"BLE connect attempt {attempt}/{max_retries} on {adapter_name} timed out after 10s")
+                    logger.warning(f"BLE connect attempt {attempt}/{max_retries} on {adapter_name} timed out after {attempt_timeout:.0f}s")
                     try:
                         await self.client.disconnect()
                     except Exception:
                         pass
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
                     continue
                 except Exception as e:
                     error_str = repr(e)
@@ -188,7 +224,7 @@ class Syncron_Ble:
                     except Exception:
                         pass
                     if "InProgress" in error_str and attempt < max_retries:
-                        delay = min(0.5 + attempt * 0.25, 3.0)
+                        delay = min(0.5 + attempt * 0.25, 2.0)
                         logger.info(f"BLE adapter {adapter_name} busy (InProgress), rotating to next adapter in {delay:.1f}s...")
                         await asyncio.sleep(delay)
                         continue

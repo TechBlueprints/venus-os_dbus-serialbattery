@@ -665,9 +665,9 @@ class HumsiENK_Ble(Battery):
                 self.charge_fet = True
             if getattr(self, "discharge_fet", None) is None:
                 self.discharge_fet = True
-        except Exception:
-            # Keep driver alive on parsing issues
-            pass
+        except Exception as e:
+            # Keep driver alive on parsing issues but log it
+            logger.warning(f"HumsiENK: refresh_data exception: {e}")
         return True
 
     def _parse_and_update(self, frame: bytes):
