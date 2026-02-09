@@ -55,7 +55,7 @@ class Syncron_Ble:
         ble_async_thread.start()
 
         thread_start_ok = self.ble_async_thread_ready.wait(2)
-        connected_ok = self.ble_connection_ready.wait(10)
+        connected_ok = self.ble_connection_ready.wait(30)
         if not thread_start_ok:
             logger.error("bluetooh LE thread took to long to start")
         if not connected_ok:
@@ -156,16 +156,25 @@ class Syncron_Ble:
             for adapter in adapters_to_try:
                 # Retry loop: BlueZ returns "InProgress" when any process (not just
                 # our own) is scanning on the same adapter.  Wait and retry instead
-                # of immediately giving up.
-                max_retries = 5
+                # of immediately giving up.  Each connect() is capped at 10s — long
+                # enough for a full BLE handshake but prevents indefinite hangs.
+                max_retries = 10
                 for attempt in range(1, max_retries + 1):
                     self.client = BleakClient(address, disconnected_callback=self.client_disconnected, adapter=adapter) if adapter else BleakClient(address, disconnected_callback=self.client_disconnected)
                     try:
-                        await self.client.connect()
+                        await asyncio.wait_for(self.client.connect(), timeout=10.0)
                         await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
                         await asyncio.sleep(0.2)
                         connected = True
                         break
+                    except asyncio.TimeoutError:
+                        logger.warning(f"BLE connect attempt {attempt}/{max_retries} timed out after 10s")
+                        try:
+                            await self.client.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.5)
+                        continue
                     except Exception as e:
                         error_str = repr(e)
                         logger.error(f"Failed when trying to connect (attempt {attempt}/{max_retries}): {error_str}")
@@ -173,10 +182,10 @@ class Syncron_Ble:
                             await self.client.disconnect()
                         except Exception:
                             pass
-                        # If InProgress, retry after a delay — another process is scanning
+                        # If InProgress, retry after a short delay
                         if "InProgress" in error_str and attempt < max_retries:
-                            delay = 1.0 + attempt * 0.5  # 1.5s, 2.0s, 2.5s, 3.0s
-                            logger.info(f"BLE adapter busy (InProgress), retrying in {delay}s...")
+                            delay = 0.5 + attempt * 0.25  # 0.75s, 1.0s, 1.25s, ... 3.0s
+                            logger.info(f"BLE adapter busy (InProgress), retrying in {delay:.1f}s...")
                             await asyncio.sleep(delay)
                             continue
                         await asyncio.sleep(0.3)
