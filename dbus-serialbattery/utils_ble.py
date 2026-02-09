@@ -129,21 +129,15 @@ class Syncron_Ble:
             return sorted(list(dict.fromkeys(names)))
 
         if BLUETOOTH_DIRECT_CONNECT:
-            # Parse BLUETOOTH_PREFERRED_ADAPTER as a comma-separated list
-            # e.g. "hci1, hci0" → rotate between both on InProgress retries
-            configured = [
-                a.strip().lower()
-                for a in BLUETOOTH_PREFERRED_ADAPTER.split(",")
-                if a.strip() and a.strip().lower() not in ("auto", "default")
-            ] if BLUETOOTH_PREFERRED_ADAPTER else []
-
-            if configured:
-                adapters_to_rotate = configured
+            if BLUETOOTH_PREFERRED_ADAPTER and BLUETOOTH_PREFERRED_ADAPTER.lower() not in ("auto", "default", ""):
+                adapters_to_try = [BLUETOOTH_PREFERRED_ADAPTER.lower()]
             else:
-                adapters_to_rotate = _list_adapters() or [None]
+                adapters_to_try = _list_adapters() or []
+            # allow a final fallback to default adapter selection
+            adapters_to_try.append(None)
         else:
             # rely on BlueZ default unless configured otherwise
-            adapters_to_rotate = [None]
+            adapters_to_try = [None]
 
         # Acquire a cross-process file lock to serialize BLE scanning/connecting.
         # This prevents BlueZ "InProgress" errors when multiple battery services
@@ -159,44 +153,47 @@ class Syncron_Ble:
 
         try:
             connected = False
-            # Rotate through adapters on each retry so InProgress on one adapter
-            # causes the next attempt to try a different adapter.
-            max_retries = 10
-            for attempt in range(1, max_retries + 1):
-                adapter = adapters_to_rotate[(attempt - 1) % len(adapters_to_rotate)]
-                adapter_name = adapter or "default"
-                self.client = BleakClient(address, disconnected_callback=self.client_disconnected, adapter=adapter) if adapter else BleakClient(address, disconnected_callback=self.client_disconnected)
-                try:
-                    await asyncio.wait_for(self.client.connect(), timeout=10.0)
-                    await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
-                    await asyncio.sleep(0.2)
-                    connected = True
-                    break
-                except asyncio.TimeoutError:
-                    logger.warning(f"BLE connect attempt {attempt}/{max_retries} on {adapter_name} timed out after 10s")
+            for adapter in adapters_to_try:
+                # Retry loop: BlueZ returns "InProgress" when any process (not just
+                # our own) is scanning on the same adapter.  Wait and retry instead
+                # of immediately giving up.  Each connect() is capped at 10s — long
+                # enough for a full BLE handshake but prevents indefinite hangs.
+                max_retries = 10
+                for attempt in range(1, max_retries + 1):
+                    self.client = BleakClient(address, disconnected_callback=self.client_disconnected, adapter=adapter) if adapter else BleakClient(address, disconnected_callback=self.client_disconnected)
                     try:
-                        await self.client.disconnect()
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.5)
-                    continue
-                except Exception as e:
-                    error_str = repr(e)
-                    logger.error(f"Failed to connect on {adapter_name} (attempt {attempt}/{max_retries}): {error_str}")
-                    try:
-                        await self.client.disconnect()
-                    except Exception:
-                        pass
-                    if "InProgress" in error_str and attempt < max_retries:
-                        delay = min(0.5 + attempt * 0.25, 3.0)
-                        logger.info(f"BLE adapter {adapter_name} busy (InProgress), rotating to next adapter in {delay:.1f}s...")
-                        await asyncio.sleep(delay)
+                        await asyncio.wait_for(self.client.connect(), timeout=10.0)
+                        await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
+                        await asyncio.sleep(0.2)
+                        connected = True
+                        break
+                    except asyncio.TimeoutError:
+                        logger.warning(f"BLE connect attempt {attempt}/{max_retries} timed out after 10s")
+                        try:
+                            await self.client.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.5)
                         continue
-                    if attempt < max_retries:
+                    except Exception as e:
+                        error_str = repr(e)
+                        logger.error(f"Failed when trying to connect (attempt {attempt}/{max_retries}): {error_str}")
+                        try:
+                            await self.client.disconnect()
+                        except Exception:
+                            pass
+                        # If InProgress, retry after a short delay
+                        if "InProgress" in error_str and attempt < max_retries:
+                            delay = 0.5 + attempt * 0.25  # 0.75s, 1.0s, 1.25s, ... 3.0s
+                            logger.info(f"BLE adapter busy (InProgress), retrying in {delay:.1f}s...")
+                            await asyncio.sleep(delay)
+                            continue
                         await asyncio.sleep(0.3)
-                        continue
+                        break  # non-InProgress error, try next adapter
+                if connected:
                     break
-            if not connected:
+            else:
+                # all attempts failed
                 self.ble_connection_ready.set()
                 self.connected = False
                 return False
