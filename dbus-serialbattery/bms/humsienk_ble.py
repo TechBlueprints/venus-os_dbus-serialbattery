@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from battery import Battery, Cell
+from battery import Battery, Cell, Protection
 import time
 import json
 import os
@@ -74,18 +74,23 @@ class HumsiENK_Ble(Battery):
         self.discharge_fet = True
         # Optional extras
         self.heater_on = None
-        # State persistence for graceful disconnection handling
-        self._state_file = f"/tmp/serialbattery_state_{self.address.replace(':', '_').lower()}.json"
+        # State persistence: keep latest values in RAM (_last_good_state dict),
+        # flush to /data/ every 15 minutes and on shutdown.  /data/ survives reboots
+        # so we never fall back to hardcoded defaults after the very first start.
+        self._state_file = f"/data/serialbattery_state_{self.address.replace(':', '_').lower()}.json"
         self._last_good_state = {}
         self._last_state_save = 0.0
-        self._state_save_interval = 5.0  # Save state every 5 seconds
-        self._cached_data_max_age = 600.0  # 10 minutes
+        self._state_save_interval = 900.0  # Flush to disk every 15 minutes (gentle on flash)
+        self._state_dirty = False  # True when RAM state is newer than disk
         self._last_reconnect_attempt = 0.0  # Track last reconnection attempt
         self._reconnect_cooldown = 120.0  # Start with 2 minutes between reconnection attempts (was 30s)
         self._reconnecting_in_progress = False  # Flag to prevent Bleak operations during scan/reconnect
         self._reconnect_failure_count = 0  # Track consecutive failures for exponential backoff
         self._max_reconnect_attempts = 3  # Max consecutive attempts before longer backoff
         self._load_cached_state()  # Load previous state on init
+        # Flush state to disk on process exit (SIGTERM from runit, etc.)
+        import atexit
+        atexit.register(self._flush_state_to_disk)
         logger.info("Init of HumsiENK_Ble at " + address)
 
     def connection_name(self) -> str:
@@ -99,56 +104,84 @@ class HumsiENK_Ble(Battery):
         return self.address
 
     def _load_cached_state(self):
-        """Load previously saved battery state from disk"""
+        """Load previously saved battery state from disk.
+
+        Always restores saved state regardless of age — real data from a
+        previous run (even days old) is better than hardcoded defaults.
+        Defaults are only used on the very first start when no file exists.
+        """
         try:
             if os.path.exists(self._state_file):
                 with open(self._state_file, 'r') as f:
                     self._last_good_state = json.load(f)
-                    save_time = self._last_good_state.get('timestamp', 0)
-                    age = time.time() - save_time
-                    if age < self._cached_data_max_age:
-                        logger.info(f"HumsiENK: Loaded cached state from {age:.0f}s ago")
-                        # Restore key values
-                        if 'voltage' in self._last_good_state:
-                            self.voltage = self._last_good_state['voltage']
-                        if 'current' in self._last_good_state:
-                            self.current = self._last_good_state['current']
-                        if 'soc' in self._last_good_state:
-                            self.soc = self._last_good_state['soc']
-                        if 'capacity' in self._last_good_state:
-                            self.capacity = self._last_good_state['capacity']
-                        if 'cells' in self._last_good_state and len(self._last_good_state['cells']) > 0:
-                            # Restore cell voltages
-                            for idx, cell_v in enumerate(self._last_good_state['cells']):
-                                if idx < len(self.cells):
-                                    self.cells[idx].voltage = cell_v
-                    else:
-                        logger.info(f"HumsiENK: Cached state too old ({age:.0f}s), ignoring")
+                save_time = self._last_good_state.get('timestamp', 0)
+                age = time.time() - save_time
+                logger.info(f"HumsiENK: Loaded cached state from {age:.0f}s ago")
+                # Restore key values
+                if 'voltage' in self._last_good_state:
+                    self.voltage = self._last_good_state['voltage']
+                if 'current' in self._last_good_state:
+                    self.current = self._last_good_state['current']
+                if 'soc' in self._last_good_state:
+                    self.soc = self._last_good_state['soc']
+                if 'capacity' in self._last_good_state:
+                    self.capacity = self._last_good_state['capacity']
+                if 'cells' in self._last_good_state and len(self._last_good_state['cells']) > 0:
+                    # Resize cells list to match saved state
+                    saved_cells = self._last_good_state['cells']
+                    while len(self.cells) < len(saved_cells):
+                        self.cells.append(Cell(False))
+                    if len(saved_cells) < len(self.cells):
+                        self.cells = self.cells[:len(saved_cells)]
+                    self.cell_count = len(saved_cells)
+                    for idx, cell_v in enumerate(saved_cells):
+                        self.cells[idx].voltage = cell_v
+            else:
+                logger.info("HumsiENK: No cached state file — first start, using defaults")
         except Exception as e:
             logger.debug(f"HumsiENK: Could not load cached state: {e}")
 
+    def _update_ram_state(self):
+        """Snapshot current values into RAM dict (no disk I/O).
+
+        Called on every successful data refresh so the in-memory state is
+        always current.  Disk flush happens on a 15-minute timer or at
+        process exit.
+        """
+        self._last_good_state = {
+            'timestamp': time.time(),
+            'voltage': self.voltage if self.voltage is not None else 0.0,
+            'current': self.current if self.current is not None else 0.0,
+            'soc': self.soc if self.soc is not None else 50.0,
+            'capacity': self.capacity if self.capacity is not None else 0.0,
+            'cells': [c.voltage for c in self.cells if c.voltage is not None],
+        }
+        self._state_dirty = True
+
     def _save_cached_state(self):
-        """Save current battery state to disk for recovery after restart"""
+        """Flush state to disk if the 15-minute interval has elapsed."""
+        if not self._state_dirty:
+            return
         now = time.time()
-        # Rate limit saves
         if now - self._last_state_save < self._state_save_interval:
             return
-        
+        self._flush_state_to_disk()
+
+    def _flush_state_to_disk(self):
+        """Write in-memory state to /data/ immediately.
+
+        Called by the periodic timer and by the atexit handler on shutdown.
+        """
+        if not self._last_good_state:
+            return
         try:
-            state = {
-                'timestamp': now,
-                'voltage': self.voltage if self.voltage is not None else 0.0,
-                'current': self.current if self.current is not None else 0.0,
-                'soc': self.soc if self.soc is not None else 50.0,
-                'capacity': self.capacity if self.capacity is not None else 0.0,
-                'cells': [c.voltage for c in self.cells if c.voltage is not None],
-            }
             with open(self._state_file, 'w') as f:
-                json.dump(state, f)
-            self._last_good_state = state
-            self._last_state_save = now
+                json.dump(self._last_good_state, f)
+            self._last_state_save = time.time()
+            self._state_dirty = False
+            logger.info("HumsiENK: State flushed to disk")
         except Exception as e:
-            logger.debug(f"HumsiENK: Could not save state: {e}")
+            logger.debug(f"HumsiENK: Could not save state to disk: {e}")
 
     def _build_command(self, command: int, data: list = None) -> bytes:
         """
@@ -178,14 +211,10 @@ class HumsiENK_Ble(Battery):
 
     def _use_cached_data(self) -> bool:
         """
-        Return True if we should use cached data (disconnected but cache is fresh).
-        Also restores cached values to self.
+        Return True if we have cached data to serve (from RAM).
+        Also restores cached values to self so D-Bus always has something.
         """
         if not self._last_good_state or 'timestamp' not in self._last_good_state:
-            return False
-        
-        age = time.time() - self._last_good_state.get('timestamp', 0)
-        if age > self._cached_data_max_age:
             return False
         
         # Restore cached values
@@ -590,20 +619,29 @@ class HumsiENK_Ble(Battery):
                     except Exception as e:
                         logger.warning(f"HumsiENK: Failed to send cell voltages command: {e}")
             
-            # Save state on successful data refresh
+            # Update in-memory state on successful data refresh;
+            # disk flush is rate-limited to every 15 minutes (+ atexit).
             if data_refreshed:
+                self._update_ram_state()
                 self._save_cached_state()
+                # Clear stale-data alarm now that we have fresh BMS data
+                if self.protection.internal_failure is not None and self.protection.internal_failure > 0:
+                    self.protection.internal_failure = Protection.OK
             else:
                 # No fresh data this poll cycle — normal between BLE command/response rounds.
                 # Use last-known-good values so dbus always has something to report.
                 if self._use_cached_data():
                     age = time.time() - self._last_good_state.get('timestamp', 0)
                     msg = f"HumsiENK: No new data this cycle, using cached values ({age:.0f}s old)"
-                    if age >= 60:
+                    if age >= 900:  # > 15 minutes
                         logger.error(msg)
-                    elif age >= 30:
+                        self.protection.internal_failure = Protection.ALARM
+                    elif age >= 300:  # 5–15 minutes
                         logger.warning(msg)
-                    elif age >= 15:
+                        self.protection.internal_failure = Protection.WARNING
+                    elif age >= 60:  # 1–5 minutes
+                        logger.warning(msg)
+                    elif age >= 15:  # 15–60 seconds
                         logger.info(msg)
                     else:
                         logger.debug(msg)
