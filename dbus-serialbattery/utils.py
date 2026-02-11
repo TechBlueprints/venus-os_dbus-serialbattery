@@ -534,13 +534,6 @@ GUI_PARAMETERS_SHOW_ADDITIONAL_INFO: bool = get_bool_from_config("DEFAULT", "GUI
 TELEMETRY: bool = get_bool_from_config("DEFAULT", "TELEMETRY")
 LOG_DBUS_UPDATES: bool = get_bool_from_config("DEFAULT", "LOG_DBUS_UPDATES")
 
-# --------- Optional JBD BLE Handshake (app parity) ---------
-JBD_BLE_HANDSHAKE_ENABLE: bool = get_bool_from_config("DEFAULT", "JBD_BLE_HANDSHAKE_ENABLE")
-JBD_BLE_HANDSHAKE_CLEAN_PSW: bool = get_bool_from_config("DEFAULT", "JBD_BLE_HANDSHAKE_CLEAN_PSW")
-JBD_BLE_HANDSHAKE_ENABLE_FFAA: bool = get_bool_from_config("DEFAULT", "JBD_BLE_HANDSHAKE_ENABLE_FFAA")
-# ASCII password used by some stacks (e.g., "123456"). Only used when JBD_BLE_HANDSHAKE_ENABLE_FFAA is True
-JBD_BLE_HANDSHAKE_PASSWORD: str = config["DEFAULT"].get("JBD_BLE_HANDSHAKE_PASSWORD", "123456")
-
 
 # --------- Voltage drop ---------
 VOLTAGE_DROP: float = get_float_from_config("DEFAULT", "VOLTAGE_DROP")
