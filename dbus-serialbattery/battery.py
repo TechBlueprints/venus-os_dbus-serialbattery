@@ -1313,7 +1313,7 @@ class Battery(ABC):
             # set error code, to show in the GUI that something is wrong
             self.manage_error_code(8)
 
-            logger.error("calc_max_discharge_current_from_cell_voltage(): Error while executing," + " using default current instead.")
+            logger.error("calc_max_discharge_current_from_cell_voltage(): Error while executing, using default current instead.")
             logger.error(
                 f"get_min_cell_voltage: {self.get_min_cell_voltage()}"
                 + f" • CELL_VOLTAGES_WHILE_DISCHARGING: {utils.CELL_VOLTAGES_WHILE_DISCHARGING}"
@@ -1333,12 +1333,14 @@ class Battery(ABC):
         :return: The maximum charge current
         """
         if self.get_max_temperature() is None or self.get_min_temperature() is None:
-            logging.warning(
-                "calc_max_charge_current_from_temperature():"
-                + f" get_max_temperature() is {self.get_max_temperature()} or get_min_temperature() is {self.get_min_temperature()}"
-                + ", using default current instead."
-                + " If you don't see this warning very often, you can ignore it."
-            )
+            # Not all AioBmsBle BMS provide temperature readings
+            if not self.connection_name().startswith("aiobmsble"):
+                logging.warning(
+                    "calc_max_charge_current_from_temperature():"
+                    + f" get_max_temperature() is {self.get_max_temperature()} or get_min_temperature() is {self.get_min_temperature()}"
+                    + ", using default current instead."
+                    + " If you don't see this warning very often, you can ignore it."
+                )
             return self.max_battery_charge_current
 
         temperatures = {0: self.get_max_temperature(), 1: self.get_min_temperature()}
@@ -1368,7 +1370,7 @@ class Battery(ABC):
             # set error code, to show in the GUI that something is wrong
             self.manage_error_code(8)
 
-            logger.error("calc_max_charge_current_from_temperature(): Error while executing," + " using default current instead.")
+            logger.error("calc_max_charge_current_from_temperature(): Error while executing, using default current instead.")
             logger.error(
                 f"temperatures: {temperatures}"
                 + f" • TEMPERATURES_WHILE_CHARGING: {utils.TEMPERATURES_WHILE_CHARGING}"
@@ -1388,12 +1390,14 @@ class Battery(ABC):
         :return: The maximum discharge current
         """
         if self.get_max_temperature() is None or self.get_min_temperature() is None:
-            logging.warning(
-                "calc_max_discharge_current_from_temperature():"
-                + f" get_max_temperature() is {self.get_max_temperature()} or get_min_temperature() is {self.get_min_temperature()}"
-                + ", using default current instead."
-                + " If you don't see this warning very often, you can ignore it."
-            )
+            # Not all AioBmsBle BMS provide temperature readings
+            if not self.connection_name().startswith("aiobmsble"):
+                logging.warning(
+                    "calc_max_discharge_current_from_temperature():"
+                    + f" get_max_temperature() is {self.get_max_temperature()} or get_min_temperature() is {self.get_min_temperature()}"
+                    + ", using default current instead."
+                    + " If you don't see this warning very often, you can ignore it."
+                )
             return self.max_battery_discharge_current
 
         temperatures = {0: self.get_max_temperature(), 1: self.get_min_temperature()}
@@ -1423,7 +1427,7 @@ class Battery(ABC):
             # set error code, to show in the GUI that something is wrong
             self.manage_error_code(8)
 
-            logger.error("calc_max_discharge_current_from_temperature(): Error while executing," + " using default current instead.")
+            logger.error("calc_max_discharge_current_from_temperature(): Error while executing, using default current instead.")
             logger.error(
                 f"temperatures: {temperatures}"
                 + f" • TEMPERATURES_WHILE_DISCHARGING: {utils.TEMPERATURES_WHILE_DISCHARGING}"
@@ -1463,7 +1467,7 @@ class Battery(ABC):
             # set error code, to show in the GUI that something is wrong
             self.manage_error_code(8)
 
-            logger.error("calc_max_charge_current_from_mosfet_temperature(): Error while executing," + " using default current instead.")
+            logger.error("calc_max_charge_current_from_mosfet_temperature(): Error while executing, using default current instead.")
             logger.error(
                 f"temperature_mos: {self.temperature_mos}"
                 + f" • MOSFET_TEMPERATURES_WHILE_CHARGING: {utils.MOSFET_TEMPERATURES_WHILE_CHARGING}"
@@ -1503,7 +1507,7 @@ class Battery(ABC):
             # set error code, to show in the GUI that something is wrong
             self.manage_error_code(8)
 
-            logger.error("calc_max_discharge_current_from_mosfet_temperature(): Error while executing," + " using default current instead.")
+            logger.error("calc_max_discharge_current_from_mosfet_temperature(): Error while executing, using default current instead.")
             logger.error(
                 f"temperature_mos: {self.temperature_mos}"
                 + f" • MOSFET_TEMPERATURES_WHILE_DISCHARGING: {utils.MOSFET_TEMPERATURES_WHILE_DISCHARGING}"
@@ -1540,7 +1544,7 @@ class Battery(ABC):
             # set error code, to show in the GUI that something is wrong
             self.manage_error_code(8)
 
-            logger.error("calc_max_charge_current_from_soc(): Error while executing," + " using default current instead.")
+            logger.error("calc_max_charge_current_from_soc(): Error while executing, using default current instead.")
             logger.error(
                 f"soc_calc: {self.soc_calc}"
                 + f" • SOC_WHILE_CHARGING: {utils.SOC_WHILE_CHARGING}"
@@ -1577,7 +1581,7 @@ class Battery(ABC):
             # set error code, to show in the GUI that something is wrong
             self.manage_error_code(8)
 
-            logger.error("calc_max_discharge_current_from_soc: Error while executing," + " using default current instead.")
+            logger.error("calc_max_discharge_current_from_soc: Error while executing, using default current instead.")
             logger.error(
                 f"soc_calc: {self.soc_calc}"
                 + f" • SOC_WHILE_DISCHARGING: {utils.SOC_WHILE_DISCHARGING}"
