@@ -867,15 +867,30 @@ class DbusHelper:
                 # Manage battery state, if not set to error (10)
                 # change state from initializing to running, if there is no error
                 if self.battery.state == 0:
-                    self.battery.state = 9
+                    self.battery.state = 1  # default to Charging until we know current direction
 
                 # change state from running to standby, if charging and discharging is not allowed
-                if self.battery.state == 9 and not self.battery.get_allow_to_charge() and not self.battery.get_allow_to_discharge():
+                if self.battery.state in (1, 2, 5, 9) and not self.battery.get_allow_to_charge() and not self.battery.get_allow_to_discharge():
                     self.battery.state = 14
 
                 # change state from standby to running, if charging or discharging is allowed
                 if self.battery.state == 14 and (self.battery.get_allow_to_charge() or self.battery.get_allow_to_discharge()):
-                    self.battery.state = 9
+                    self.battery.state = 1
+
+                # Set battery state based on actual current direction
+                # 1 = Charging, 2 = Discharging, 5 = Float (Charging)
+                if self.battery.state not in (0, 10, 14):
+                    if self.battery.current is not None:
+                        if self.battery.current < -0.5:
+                            self.battery.state = 2  # Discharging
+                        elif self.battery.current > 0.5:
+                            # Preserve Float (5) if charge_mode says Float
+                            if self.battery.charge_mode is not None and self.battery.charge_mode.startswith("Float"):
+                                self.battery.state = 5  # Float
+                            else:
+                                self.battery.state = 1  # Charging
+                        else:
+                            self.battery.state = 0  # Idle
 
             else:
                 # update error variables

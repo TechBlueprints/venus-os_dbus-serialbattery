@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from battery import Battery, Cell, Protection
+from battery import Battery, Cell
 import time
 import json
 import os
@@ -42,9 +42,7 @@ class HumsiENK_Ble(Battery):
         self._rx_buffer = bytearray()  # Receive buffer for assembling frames
         self._min_response_len = 5  # Minimum: [0xAA, CMD, LEN, CHK_LO, CHK_HI] = 5 bytes (zero data)
         self._last_frame_time = 0.0
-        self._last_trigger_time = 0.0
-        self._last_battery_info_time = 0.0
-        self._last_cell_voltages_time = 0.0
+        self._last_trigger_time = 0.0  # Unified polling timer (all cmds every 3s)
         self._last_heartbeat_log = 0.0
         self._last_update_log_time = 0.0
         # Wake-up trigger backoff tracking
@@ -62,11 +60,9 @@ class HumsiENK_Ble(Battery):
         if len(self.cells) == 0:
             for _ in range(self.cell_count):
                 self.cells.append(Cell(False))
-        # Safe cell defaults until BMS reports real data; extra cells get trimmed
-        # once the real cell count is detected from frames 0x22 or 0x58
         for c in range(len(self.cells)):
             self.cells[c].voltage = 3.4
-        self.voltage = round(self.cell_count * 3.4, 2)  # 13.6V — avoids low-battery warnings on startup
+        self.voltage = round(self.cell_count * 3.4, 2)
         self.current = 0.0
         self.soc = 50
         # Default to allowed until proven otherwise (BMS doesn't expose FET bits here)
@@ -74,21 +70,17 @@ class HumsiENK_Ble(Battery):
         self.discharge_fet = True
         # Optional extras
         self.heater_on = None
-        # State persistence: keep latest values in RAM (_last_good_state dict),
-        # flush to /data/ every 15 minutes and on shutdown.  /data/ survives reboots
-        # so we never fall back to hardcoded defaults after the very first start.
+        # State persistence — RAM cache updated every cycle, disk flush every 15 min or on shutdown
         self._state_file = f"/data/serialbattery_state_{self.address.replace(':', '_').lower()}.json"
-        self._last_good_state = {}
-        self._last_state_save = 0.0
-        self._state_save_interval = 900.0  # Flush to disk every 15 minutes (gentle on flash)
-        self._state_dirty = False  # True when RAM state is newer than disk
+        self._ram_state = {}  # In-memory snapshot of last good data
+        self._last_disk_flush = 0.0
+        self._disk_flush_interval = 900.0  # Flush to /data/ every 15 minutes
         self._last_reconnect_attempt = 0.0  # Track last reconnection attempt
         self._reconnect_cooldown = 120.0  # Start with 2 minutes between reconnection attempts (was 30s)
         self._reconnecting_in_progress = False  # Flag to prevent Bleak operations during scan/reconnect
         self._reconnect_failure_count = 0  # Track consecutive failures for exponential backoff
         self._max_reconnect_attempts = 3  # Max consecutive attempts before longer backoff
-        self._load_cached_state()  # Load previous state on init
-        # Flush state to disk on process exit (SIGTERM from runit, etc.)
+        self._load_cached_state()  # Load previous state on init (any age)
         import atexit
         atexit.register(self._flush_state_to_disk)
         logger.info("Init of HumsiENK_Ble at " + address)
@@ -99,56 +91,49 @@ class HumsiENK_Ble(Battery):
     def custom_name(self) -> str:
         return "SerialBattery(" + self.type + ") " + self.address[-5:]
 
-    @property
     def unique_identifier(self) -> str:
         return self.address
 
     def _load_cached_state(self):
-        """Load previously saved battery state from disk.
-
-        Always restores saved state regardless of age — real data from a
-        previous run (even days old) is better than hardcoded defaults.
-        Defaults are only used on the very first start when no file exists.
+        """Load previously saved battery state from /data/.
+        
+        Always load regardless of age — old real data is better than
+        hardcoded defaults.  Defaults (3.4 V/cell, 50 % SOC) are only
+        used on the very first start when no state file exists.
         """
         try:
-            if os.path.exists(self._state_file):
-                with open(self._state_file, 'r') as f:
-                    self._last_good_state = json.load(f)
-                save_time = self._last_good_state.get('timestamp', 0)
-                age = time.time() - save_time
-                logger.info(f"HumsiENK: Loaded cached state from {age:.0f}s ago")
-                # Restore key values
-                if 'voltage' in self._last_good_state:
-                    self.voltage = self._last_good_state['voltage']
-                if 'current' in self._last_good_state:
-                    self.current = self._last_good_state['current']
-                if 'soc' in self._last_good_state:
-                    self.soc = self._last_good_state['soc']
-                if 'capacity' in self._last_good_state:
-                    self.capacity = self._last_good_state['capacity']
-                if 'cells' in self._last_good_state and len(self._last_good_state['cells']) > 0:
-                    # Resize cells list to match saved state
-                    saved_cells = self._last_good_state['cells']
-                    while len(self.cells) < len(saved_cells):
-                        self.cells.append(Cell(False))
-                    if len(saved_cells) < len(self.cells):
-                        self.cells = self.cells[:len(saved_cells)]
-                    self.cell_count = len(saved_cells)
-                    for idx, cell_v in enumerate(saved_cells):
-                        self.cells[idx].voltage = cell_v
-            else:
-                logger.info("HumsiENK: No cached state file — first start, using defaults")
+            if not os.path.exists(self._state_file):
+                logger.info("HumsiENK: No saved state file, using startup defaults")
+                return
+            with open(self._state_file, 'r') as f:
+                self._ram_state = json.load(f)
+            age = time.time() - self._ram_state.get('timestamp', 0)
+            logger.info(f"HumsiENK: Loaded saved state ({age:.0f}s old)")
+            self._restore_from_ram_state()
         except Exception as e:
             logger.debug(f"HumsiENK: Could not load cached state: {e}")
 
-    def _update_ram_state(self):
-        """Snapshot current values into RAM dict (no disk I/O).
+    def _restore_from_ram_state(self):
+        """Apply values from _ram_state onto self."""
+        try:
+            if 'voltage' in self._ram_state:
+                self.voltage = self._ram_state['voltage']
+            if 'current' in self._ram_state:
+                self.current = self._ram_state['current']
+            if 'soc' in self._ram_state:
+                self.soc = self._ram_state['soc']
+            if 'capacity' in self._ram_state:
+                self.capacity = self._ram_state['capacity']
+            if 'cells' in self._ram_state and len(self._ram_state['cells']) > 0:
+                for idx, cell_v in enumerate(self._ram_state['cells']):
+                    if idx < len(self.cells):
+                        self.cells[idx].voltage = cell_v
+        except Exception as e:
+            logger.debug(f"HumsiENK: Error restoring state: {e}")
 
-        Called on every successful data refresh so the in-memory state is
-        always current.  Disk flush happens on a 15-minute timer or at
-        process exit.
-        """
-        self._last_good_state = {
+    def _update_ram_state(self):
+        """Snapshot current values into RAM (called every refresh cycle)."""
+        self._ram_state = {
             'timestamp': time.time(),
             'voltage': self.voltage if self.voltage is not None else 0.0,
             'current': self.current if self.current is not None else 0.0,
@@ -156,32 +141,22 @@ class HumsiENK_Ble(Battery):
             'capacity': self.capacity if self.capacity is not None else 0.0,
             'cells': [c.voltage for c in self.cells if c.voltage is not None],
         }
-        self._state_dirty = True
-
-    def _save_cached_state(self):
-        """Flush state to disk if the 15-minute interval has elapsed."""
-        if not self._state_dirty:
-            return
+        # Periodic flush to persistent storage
         now = time.time()
-        if now - self._last_state_save < self._state_save_interval:
-            return
-        self._flush_state_to_disk()
+        if now - self._last_disk_flush >= self._disk_flush_interval:
+            self._flush_state_to_disk()
 
     def _flush_state_to_disk(self):
-        """Write in-memory state to /data/ immediately.
-
-        Called by the periodic timer and by the atexit handler on shutdown.
-        """
-        if not self._last_good_state:
+        """Write RAM state to /data/ (called every 15 min and on shutdown)."""
+        if not self._ram_state:
             return
         try:
             with open(self._state_file, 'w') as f:
-                json.dump(self._last_good_state, f)
-            self._last_state_save = time.time()
-            self._state_dirty = False
+                json.dump(self._ram_state, f)
+            self._last_disk_flush = time.time()
             logger.debug("HumsiENK: State flushed to disk")
         except Exception as e:
-            logger.debug(f"HumsiENK: Could not save state to disk: {e}")
+            logger.debug(f"HumsiENK: Could not flush state to disk: {e}")
 
     def _build_command(self, command: int, data: list = None) -> bytes:
         """
@@ -190,9 +165,9 @@ class HumsiENK_Ble(Battery):
         Format: [0xAA, CMD, LEN, DATA..., CHK_LO, CHK_HI]
         - Start byte: 0xAA
         - Command: 1 byte
-        - Length: 1 byte - length of DATA only (not including header/checksum)
+        - Length: 1 byte - length of DATA only
         - Data: 0-N bytes (optional)
-        - Checksum: 16-bit LE sum of bytes from CMD through end of DATA
+        - Checksum: 16-bit LE sum of CMD + LEN + DATA bytes
         
         Examples:
             _build_command(0x21, []) → [0xAA, 0x21, 0x00, 0x21, 0x00]
@@ -201,130 +176,168 @@ class HumsiENK_Ble(Battery):
         if data is None:
             data = []
         
-        # Build payload: CMD, LEN, DATA...
-        payload = [command, len(data) & 0xFF] + data
+        # Build packet structure
+        packet = [self.FRAME_START, command]
         
-        # Checksum: 16-bit LE sum of payload bytes (CMD through end of DATA)
-        crc = sum(payload) & 0xFFFF
+        # Add length field (single byte for data length)
+        data_len = len(data)
+        packet.append(data_len & 0xFF)
         
-        return bytes([self.FRAME_START] + payload + [crc & 0xFF, (crc >> 8) & 0xFF])
+        # Add data payload
+        packet.extend(data)
+        
+        # Checksum: 16-bit LE sum of bytes from CMD through end of DATA
+        checksum = command + data_len
+        for b in data:
+            checksum += b
+        packet.append(checksum & 0xFF)
+        packet.append((checksum >> 8) & 0xFF)
+        
+        return bytes(packet)
 
     def _use_cached_data(self) -> bool:
+        """Serve stale RAM state and apply escalating log / D-Bus alarms.
+
+        Thresholds:
+            <15 s   — DEBUG, internal_failure = 0
+            15-60 s — INFO,  internal_failure = 0
+            1-5 m   — WARN,  internal_failure = 0
+            5-15 m  — WARN,  internal_failure = 1 (warning)
+            >15 m   — ERROR, internal_failure = 2 (alarm)
+        Fresh data resets internal_failure to 0.
         """
-        Return True if we have cached data to serve (from RAM).
-        Also restores cached values to self so D-Bus always has something.
-        """
-        if not self._last_good_state or 'timestamp' not in self._last_good_state:
+        if not self._ram_state or 'timestamp' not in self._ram_state:
             return False
-        
-        # Restore cached values
-        try:
-            if 'voltage' in self._last_good_state:
-                self.voltage = self._last_good_state['voltage']
-            if 'current' in self._last_good_state:
-                self.current = self._last_good_state['current']
-            if 'soc' in self._last_good_state:
-                self.soc = self._last_good_state['soc']
-            if 'capacity' in self._last_good_state:
-                self.capacity = self._last_good_state['capacity']
-            if 'cells' in self._last_good_state and len(self._last_good_state['cells']) > 0:
-                for idx, cell_v in enumerate(self._last_good_state['cells']):
-                    if idx < len(self.cells):
-                        self.cells[idx].voltage = cell_v
-        except Exception as e:
-            logger.debug(f"HumsiENK: Error restoring cached data: {e}")
-        
+
+        age = time.time() - self._ram_state['timestamp']
+
+        # Restore values from RAM snapshot
+        self._restore_from_ram_state()
+
+        # Escalating log levels and D-Bus alarms
+        if age < 15:
+            logger.debug(f"HumsiENK: No new data this cycle ({age:.0f}s since last)")
+        elif age < 60:
+            logger.info(f"HumsiENK: No new data ({age:.0f}s since last)")
+        elif age < 300:
+            logger.warning(f"HumsiENK: Stale data ({age:.0f}s since last)")
+        elif age < 900:
+            logger.warning(f"HumsiENK: Stale data ({age:.0f}s since last), D-Bus warning")
+            if hasattr(self, 'protection') and self.protection is not None:
+                self.protection.internal_failure = 1
+        else:
+            logger.error(f"HumsiENK: Stale data ({age:.0f}s since last), D-Bus alarm")
+            if hasattr(self, 'protection') and self.protection is not None:
+                self.protection.internal_failure = 2
+
         return True
 
 
     def test_connection(self):
+        """Create the BLE handle and return True so the framework registers us.
+
+        The daemon thread in Syncron_Ble retries the BLE connection in the
+        background indefinitely.  We return True even if the initial 30-second
+        window didn't yield a connection, because:
+          1. Exiting (returning False) makes runit restart the whole process,
+             which kills the daemon thread mid-connect and leaves BlueZ dirty.
+             Repeated restarts degrade BlueZ until both adapters are unusable.
+          2. Staying alive lets the daemon thread keep retrying without any
+             BlueZ corruption, and refresh_data() serves cached/default data
+             in the meantime.
+        """
         try:
             self.ble_handle = Syncron_Ble(self.address, read_characteristic=self.BLE_RX_UUID, write_characteristic=self.BLE_TX_UUID)
-            ok = bool(self.ble_handle and self.ble_handle.connected)
-            # Send initial trigger to start notifications, per app behavior
-            if ok:
-                # Mark connection start time for planned reconnections
-                self._connection_start_time = time.time()
-                # Initialize frame time so the 9-minute emergency reconnect doesn't fire immediately
-                self._last_frame_time = time.time()
-                try:
-                    # Send initial trigger to start notifications
-                    self._send_trigger()
-                except Exception:
-                    pass
-                
-                # Send handshake command (0x00) and wait for response
-                try:
-                    handshake_cmd = self._build_command(self.CMD_HANDSHAKE, [])
-                    self.ble_handle.send_data(handshake_cmd)
-                    time.sleep(0.5)
-                except Exception as e:
-                    logger.debug(f"HumsiENK: Handshake send failed: {e}")
-                
-                # Send cell voltage command (0x22) to detect cell count
-                try:
-                    cell_cmd = self._build_command(self.CMD_CELL_VOLTAGES, [])
-                    self.ble_handle.send_data(cell_cmd)
-                    logger.debug("HumsiENK: Sent cell voltage request for detection")
-                except Exception as e:
-                    logger.debug(f"HumsiENK: Cell voltage command failed: {e}")
-                
-                # Collect responses for up to 3 seconds to detect cell count
-                deadline = time.time() + 3.0
-                detected_cells = None
-                while time.time() < deadline:
-                    chunk = self._pop_next_notification(timeout=0.3)
-                    if chunk and isinstance(chunk, (bytes, bytearray)):
-                        self._rx_buffer.extend(chunk)
-                        
-                        # Try to find and parse a 0x22 response
-                        start_idx = self._rx_buffer.find(self.FRAME_RESPONSE)
-                        if start_idx >= 0 and len(self._rx_buffer) >= start_idx + 5:
-                            cmd = self._rx_buffer[start_idx + 1]
-                            if cmd == self.CMD_CELL_VOLTAGES:
-                                # Parse length (1 byte)
-                                data_len = self._rx_buffer[start_idx + 2]
-                                total_len = 3 + data_len + 2  # header(3) + data + checksum(2)
-                                
-                                if len(self._rx_buffer) >= start_idx + total_len:
-                                    # Extract frame
-                                    frame = bytes(self._rx_buffer[start_idx:start_idx + total_len])
-                                    data = frame[3:3+data_len]
-                                    
-                                    # Count cells
-                                    cell_count_detected = 0
-                                    for i in range(0, min(len(data), 48), 2):
-                                        if i + 1 < len(data):
-                                            cell_mv = int.from_bytes(data[i:i+2], byteorder='little', signed=False)
-                                            if 1000 <= cell_mv <= 5000:
-                                                cell_count_detected += 1
-                                            elif cell_count_detected > 0:
-                                                break
-                                    
-                                    if cell_count_detected >= 4:
-                                        detected_cells = cell_count_detected
-                                        logger.info(f"HumsiENK: Detected {detected_cells} cells during connection")
-                                        break
-                    
-                    time.sleep(0.1)
-                
-                # Update cell count if detected
-                if detected_cells is not None:
-                    self.cell_count = detected_cells
-                    # Resize cells list
-                    if len(self.cells) < self.cell_count:
-                        for _ in range(self.cell_count - len(self.cells)):
-                            self.cells.append(Cell(False))
-                    elif len(self.cells) > self.cell_count:
-                        self.cells = self.cells[:self.cell_count]
-                
-                # Clear buffer after detection
-                self._rx_buffer.clear()
-                
-            return ok
+            # Initialize frame time so the 9-minute emergency reconnect doesn't fire immediately
+            self._last_frame_time = time.time()
+            self._connection_start_time = time.time()
+
+            if self.ble_handle.connected:
+                # Connection succeeded within the initial window — do handshake
+                self._do_initial_handshake()
+            else:
+                logger.info("HumsiENK: BLE not connected yet — daemon thread retrying in background")
+
+            # Always return True so the framework keeps the process alive.
+            return True
         except Exception as e:
             logger.error(f"HumsiENK_Ble: connection error: {e}")
             return False
+
+    def _do_initial_handshake(self):
+        """Send handshake and detect cell count on first connection."""
+        try:
+            self._send_trigger()
+        except Exception:
+            pass
+
+        # Send handshake command (0x00)
+        try:
+            handshake_cmd = self._build_command(self.CMD_HANDSHAKE, [])
+            result = self.ble_handle.send_data(handshake_cmd)
+            if result is False:
+                logger.warning("HumsiENK: Handshake got no response — will retry on next poll")
+                return
+            time.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"HumsiENK: Handshake send failed: {e}")
+            return
+
+        # Send cell voltage command (0x22) to detect cell count
+        try:
+            cell_cmd = self._build_command(self.CMD_CELL_VOLTAGES, [])
+            self.ble_handle.send_data(cell_cmd)
+            logger.debug("HumsiENK: Sent cell voltage request for detection")
+        except Exception as e:
+            logger.debug(f"HumsiENK: Cell voltage command failed: {e}")
+
+        # Collect responses for up to 3 seconds to detect cell count
+        deadline = time.time() + 3.0
+        detected_cells = None
+        while time.time() < deadline:
+            chunk = self._pop_next_notification(timeout=0.3)
+            if chunk and isinstance(chunk, (bytes, bytearray)):
+                self._rx_buffer.extend(chunk)
+
+                # Try to find and parse a 0x22 response
+                start_idx = self._rx_buffer.find(self.FRAME_RESPONSE)
+                if start_idx >= 0 and len(self._rx_buffer) >= start_idx + 5:
+                    cmd = self._rx_buffer[start_idx + 1]
+                    if cmd == self.CMD_CELL_VOLTAGES:
+                        data_len = self._rx_buffer[start_idx + 2]
+                        total_len = 3 + data_len + 2  # header(3) + data + checksum(2)
+
+                        if len(self._rx_buffer) >= start_idx + total_len:
+                            frame = bytes(self._rx_buffer[start_idx:start_idx + total_len])
+                            data = frame[3:3+data_len]
+
+                            cell_count_detected = 0
+                            for i in range(0, min(len(data), 48), 2):
+                                if i + 1 < len(data):
+                                    cell_mv = int.from_bytes(data[i:i+2], byteorder='little', signed=False)
+                                    if 1000 <= cell_mv <= 5000:
+                                        cell_count_detected += 1
+                                    elif cell_count_detected > 0:
+                                        break
+
+                            if cell_count_detected >= 4:
+                                detected_cells = cell_count_detected
+                                logger.info(f"HumsiENK: Detected {detected_cells} cells during connection")
+                                break
+
+            time.sleep(0.1)
+
+        # Update cell count if detected
+        if detected_cells is not None:
+            self.cell_count = detected_cells
+            if len(self.cells) < self.cell_count:
+                for _ in range(self.cell_count - len(self.cells)):
+                    self.cells.append(Cell(False))
+            elif len(self.cells) > self.cell_count:
+                self.cells = self.cells[:self.cell_count]
+
+        # Clear buffer after detection
+        self._rx_buffer.clear()
 
     def get_settings(self):
         # Ensure critical fields are initialized (keep conservative defaults)
@@ -334,10 +347,10 @@ class HumsiENK_Ble(Battery):
         if len(self.cells) == 0:
             for _ in range(self.cell_count):
                 self.cells.append(Cell(False))
-        # Safe cell defaults for any newly added cells (trimmed once real count is known)
+        # Initialize placeholder voltages to avoid None in internal calculations
         for c in range(len(self.cells)):
             if getattr(self.cells[c], "voltage", None) is None:
-                self.cells[c].voltage = 3.4
+                self.cells[c].voltage = 0.0
         if getattr(self, "capacity", None) is None:
             self.capacity = BATTERY_CAPACITY if BATTERY_CAPACITY is not None else 0
         if getattr(self, "max_battery_charge_current", None) is None:
@@ -418,14 +431,7 @@ class HumsiENK_Ble(Battery):
         return True
 
     def refresh_data(self):
-        # If reconnection is in progress, wait the same time as a scan would take, then continue
-        if self._reconnecting_in_progress:
-            try:
-                logger.debug("HumsiENK: Reconnection in progress, waiting 4s (scan duration)...")
-                time.sleep(4.0)  # Wait same duration as scan (3s scan + 1s settle)
-            except Exception:
-                pass
-            # Continue with normal refresh after waiting - don't skip the cycle
+        logger.debug("HumsiENK: >>> refresh_data START")
         
         # Collect binary response frames and parse commands 0x21, 0x22, 0x20
         data_refreshed = False
@@ -435,68 +441,24 @@ class HumsiENK_Ble(Battery):
                 logger.debug("HumsiENK refresh tick")
                 self._last_heartbeat_log = now_tick
             
-            # Emergency reconnection only if we truly haven't received ANY data for 9 minutes
-            # This is error recovery, not a routine maintenance cycle
-            # Mirror the app's behavior: NEVER disconnect under normal circumstances
-            # The app does NOT have reconnection logic - it just sends triggers indefinitely
-            # However, if we truly haven't received ANY data for 9 minutes (540s),
-            # disconnect and reconnect as a last resort (keeps us inside the 10-minute cached data window)
-            if self.ble_handle and (now_tick - self._last_frame_time) > 540.0:
-                try:
-                    logger.warning(f"HumsiENK: No data for 9 minutes, attempting full reconnection as last resort...")
-                    # Close old handle
-                    try:
-                        if hasattr(self.ble_handle, 'disconnect'):
-                            self.ble_handle.disconnect()
-                    except Exception:
-                        pass
-                    self.ble_handle = None
-                    
-                    # Brief scan to refresh BlueZ cache before reconnecting
-                    try:
-                        import subprocess
-                        logger.info("HumsiENK: Running brief scan to refresh device cache...")
-                        scan_proc = subprocess.Popen(['bluetoothctl', 'scan', 'on'], 
-                                                    stdout=subprocess.DEVNULL, 
-                                                    stderr=subprocess.DEVNULL)
-                        time.sleep(3.0)
-                        scan_proc.terminate()
-                        try:
-                            scan_proc.wait(timeout=1.0)
-                        except Exception:
-                            scan_proc.kill()
-                        time.sleep(1.0)
-                    except Exception as e:
-                        logger.debug(f"HumsiENK: Scan attempt: {e}")
-                    
-                    # Reconnect
-                    from utils_ble import Syncron_Ble
-                    try:
-                        self.ble_handle = Syncron_Ble(self.address, read_characteristic=self.BLE_RX_UUID, write_characteristic=self.BLE_TX_UUID)
-                        if self.ble_handle and self.ble_handle.connected:
-                            logger.warning(f"HumsiENK: Reconnection successful after 9-minute timeout!")
-                            self._last_frame_time = time.time()
-                            self._last_trigger_time = time.time()
-                            self._last_battery_info_time = time.time()
-                            self._last_cell_voltages_time = time.time()
-                            # Send initial trigger after reconnection
-                            try:
-                                self._send_trigger()
-                            except Exception:
-                                pass
-                        else:
-                            logger.warning(f"HumsiENK: Reconnection failed, will retry in 9 minutes")
-                    except Exception as conn_err:
-                        logger.warning(f"HumsiENK: Reconnection exception: {conn_err}")
-                except Exception as e:
-                    logger.warning(f"HumsiENK: Reconnection outer exception: {e}")
+            # No manual reconnection logic here.  The Syncron_Ble daemon
+            # thread handles reconnection automatically: its async_main loop
+            # re-enters connect_to_bms whenever the connection drops, and the
+            # 3-minute notification watchdog catches zombie connections.
+            # Spawning a new Syncron_Ble from refresh_data caused multiple
+            # daemon threads fighting BlueZ, corrupting the adapter state.
             
             
             if self.ble_handle:
-                # Get one notification chunk; assemble frames locally
-                chunk = self._pop_next_notification(timeout=0.3)
-                if chunk and isinstance(chunk, (bytes, bytearray)):
-                    logger.debug(f"HumsiENK got chunk: {len(chunk)} bytes")
+                # Drain ALL available notification chunks from the queue
+                # (the app accumulates all chunks then parses; we should too)
+                chunks_read = 0
+                while True:
+                    chunk = self._pop_next_notification(timeout=0.05 if chunks_read > 0 else 0.3)
+                    if not chunk or not isinstance(chunk, (bytes, bytearray)):
+                        break
+                    chunks_read += 1
+                    logger.debug(f"HumsiENK got chunk: {len(chunk)} bytes (#{chunks_read})")
                     
                     # Buffer overflow protection: if buffer is already too large and has no valid frame start,
                     # clear it before adding new data
@@ -519,136 +481,146 @@ class HumsiENK_Ble(Battery):
                             self._rx_buffer.clear()
                     
                     self._rx_buffer.extend(chunk)
+                
+                # Process as many complete binary frames as present
+                # Frame format: [0xAA, CMD, LEN, DATA..., CHK_LO, CHK_HI]
+                while True:
+                    # Need at least 5 bytes: [0xAA, CMD, LEN] + 2-byte checksum
+                    if len(self._rx_buffer) < 5:
+                        break
                     
-                    # Process as many complete binary frames as present
-                    # Frame format: [0xAA, CMD, LEN, DATA..., CHK_LO, CHK_HI]
-                    while True:
-                        # Need at least 5 bytes: [0xAA, CMD, LEN] + 2-byte checksum
-                        if len(self._rx_buffer) < 5:
-                            break
-                        
-                        # Look for frame start byte 0xAA
-                        start_idx = self._rx_buffer.find(self.FRAME_RESPONSE)
-                        if start_idx == -1:
-                            # No frame start found, clear old junk if buffer too large
-                            if len(self._rx_buffer) > 512:
-                                self._rx_buffer.clear()
-                            break
-                        
-                        # Discard bytes before frame start
-                        if start_idx > 0:
-                            del self._rx_buffer[:start_idx]
-                        
-                        # Now buffer starts with 0xAA
-                        # Need at least 5 bytes: [0xAA, CMD, LEN, CHK_LO, CHK_HI]
-                        if len(self._rx_buffer) < 5:
-                            break
-                        
-                        # Parse length field (1 byte at position 2)
-                        data_len = self._rx_buffer[2]
-                        
-                        # Sanity check: reasonable data length (0-255 bytes)
-                        if data_len > 200:
-                            # Invalid length, discard this start byte and resync
-                            logger.debug(f"HumsiENK: Invalid data_len={data_len}, resyncing")
-                            del self._rx_buffer[0:1]
-                            continue
-                        
-                        # Calculate total frame length: header(3) + data + checksum(2)
-                        total_len = 3 + data_len + 2
-                        
-                        # Wait for complete frame
-                        if len(self._rx_buffer) < total_len:
-                            break
-                        
-                        # Extract complete frame
-                        frame = bytes(self._rx_buffer[:total_len])
-                        
-                        # Validate checksum: 16-bit LE sum of bytes from CMD to end of DATA
-                        # (excludes start byte 0xAA and the checksum itself)
-                        payload = frame[1:-2]  # CMD through end of data
-                        calculated_checksum = sum(payload) & 0xFFFF
-                        received_checksum = frame[-2] | (frame[-1] << 8)  # Little-endian
-                        
-                        if calculated_checksum != received_checksum:
-                            logger.warning(f"HumsiENK: Checksum mismatch! Calculated: {calculated_checksum:04X}, Received: {received_checksum:04X}")
-                            # Discard this start byte and try to resync
-                            del self._rx_buffer[0:1]
-                            continue
-                        
-                        # Valid frame - consume it and parse
-                        del self._rx_buffer[:total_len]
-                        logger.debug(f"HumsiENK: Valid frame received, cmd={frame[1]:02X}, len={data_len}")
-                        self._parse_and_update(frame)
-                        self._last_frame_time = time.time()
-                        data_refreshed = True
-                # Send trigger every 10 seconds to keep BMS awake
-                # We're a persistent service (not an interactive app), so we can poll less frequently
-                # The app uses 2 seconds for real-time UI updates, but 10 seconds is sufficient for monitoring
-                now = time.time()
-                # Send periodic commands to keep connection alive and get fresh data
+                    # Look for frame start byte 0xAA
+                    start_idx = self._rx_buffer.find(self.FRAME_RESPONSE)
+                    if start_idx == -1:
+                        # No frame start found, clear old junk if buffer too large
+                        if len(self._rx_buffer) > 512:
+                            self._rx_buffer.clear()
+                        break
+                    
+                    # Discard bytes before frame start
+                    if start_idx > 0:
+                        del self._rx_buffer[:start_idx]
+                    
+                    # Now buffer starts with 0xAA
+                    # Need at least 5 bytes: [0xAA, CMD, LEN, CHK_LO, CHK_HI]
+                    if len(self._rx_buffer) < 5:
+                        break
+                    
+                    # Parse length field (1 byte at position 2)
+                    data_len = self._rx_buffer[2]
+                    
+                    # Sanity check: reasonable data length (0-255 bytes)
+                    if data_len > 200:
+                        # Invalid length, discard this start byte and resync
+                        logger.debug(f"HumsiENK: Invalid data_len={data_len}, resyncing")
+                        del self._rx_buffer[0:1]
+                        continue
+                    
+                    # Calculate total frame length: header(3) + data + checksum(2)
+                    total_len = 3 + data_len + 2
+                    
+                    # Wait for complete frame
+                    if len(self._rx_buffer) < total_len:
+                        break
+                    
+                    # Extract complete frame
+                    frame = bytes(self._rx_buffer[:total_len])
+                    
+                    # Validate checksum: 16-bit LE sum of bytes from CMD to end of DATA
+                    # (excludes start byte 0xAA and the checksum itself)
+                    payload = frame[1:-2]  # CMD through end of data
+                    calculated_checksum = sum(payload) & 0xFFFF
+                    received_checksum = frame[-2] | (frame[-1] << 8)  # Little-endian
+                    
+                    if calculated_checksum != received_checksum:
+                        logger.warning(f"HumsiENK: Checksum mismatch! Calculated: {calculated_checksum:04X}, Received: {received_checksum:04X}")
+                        # Discard this start byte and try to resync
+                        del self._rx_buffer[0:1]
+                        continue
+                    
+                    # Valid frame - consume it and parse
+                    del self._rx_buffer[:total_len]
+                    cmd_name = {0x00: "handshake", 0x20: "status", 0x21: "battery_info",
+                                0x22: "cell_voltages", 0x58: "config", 0xF5: "version"}.get(frame[1], f"0x{frame[1]:02X}")
+                    # Log at INFO on first frame after stale period; DEBUG otherwise
+                    if (time.time() - self._last_frame_time) > 5.0:
+                        logger.info(f"HumsiENK: Data resumed — RX {cmd_name} ({data_len}B)")
+                    else:
+                        logger.debug(f"HumsiENK: RX {cmd_name} ({data_len}B)")
+                    self._parse_and_update(frame)
+                    self._last_frame_time = time.time()
+                    data_refreshed = True
+                
+                # ── Polling: match the app's pattern ──────────────────────
+                # The official app sends ALL THREE data commands every 3-3.5s
+                # with 500 ms spacing:  0x21 (+500 ms), 0x20 (+1000 ms), 0x22 (+1500 ms).
+                # Matching this cadence is critical — the BMS expects staggered
+                # commands, not rapid-fire bursts.
                 now = time.time()
                 
-                # Status command (0x20) every 2 seconds - keep-alive
-                if (now - self._last_trigger_time) >= 2.0:
+                # Guard: only send BLE commands if the connection is up.
+                # During daemon-thread reconnection, send_data would fail with
+                # "Service Discovery has not been performed yet" — skip silently.
+                ble_connected = (self.ble_handle and
+                                 hasattr(self.ble_handle, 'connected') and
+                                 self.ble_handle.connected)
+                
+                # If no data for >10s, re-send handshake (0x00) to re-initialize
+                # BMS notification stream after a daemon-thread auto-reconnection.
+                stale_seconds = now - self._last_frame_time
+                if ble_connected and stale_seconds > 10.0 and not getattr(self, '_handshake_resent', False):
                     try:
-                        logger.debug("TX CMD_STATUS (0x20) keep-alive")
-                        cmd = self._build_command(self.CMD_STATUS, [])
-                        self.ble_handle.send_data(cmd)
-                        self._last_trigger_time = now
+                        logger.info(f"HumsiENK: Re-sending handshake (0x00) after {stale_seconds:.0f}s stale")
+                        handshake_cmd = self._build_command(self.CMD_HANDSHAKE, [])
+                        self.ble_handle.send_data(handshake_cmd)
+                        self._handshake_resent = True
                     except Exception as e:
-                        logger.warning(f"HumsiENK: Failed to send status command: {e}")
+                        logger.warning(f"HumsiENK: Handshake resend failed: {e}")
+                elif stale_seconds <= 5.0:
+                    # Reset flag once fresh data is flowing
+                    self._handshake_resent = False
                 
-                # Battery info command (0x21) every 10 seconds
-                if (now - self._last_battery_info_time) >= 10.0:
+                # Full data poll every 3 seconds (matches app's setInterval 3000-3500ms).
+                # The app staggers commands with setTimeout (non-blocking), but we
+                # can't block the GLib main loop with time.sleep().  Instead, send
+                # all three commands back-to-back — the BMS handles this fine.
+                # The ~3s silence between bursts mirrors the app's overall cadence.
+                if ble_connected and (now - self._last_trigger_time) >= 3.0:
+                    self._last_trigger_time = now
+                    # 0x21 — battery info (voltage, current, SOC, temps)
                     try:
-                        logger.debug("TX CMD_BATTERY_INFO (0x21)")
+                        logger.debug("HumsiENK: TX 0x21")
                         cmd = self._build_command(self.CMD_BATTERY_INFO, [])
                         self.ble_handle.send_data(cmd)
-                        self._last_battery_info_time = now
                     except Exception as e:
                         logger.warning(f"HumsiENK: Failed to send battery info command: {e}")
-                
-                # Cell voltages command (0x22) every 30 seconds
-                if (now - self._last_cell_voltages_time) >= 30.0:
+                    # 0x20 — operating status (FETs, alarms, balance, runtime)
                     try:
-                        logger.debug("TX CMD_CELL_VOLTAGES (0x22)")
+                        logger.debug("HumsiENK: TX 0x20")
+                        cmd = self._build_command(self.CMD_STATUS, [])
+                        self.ble_handle.send_data(cmd)
+                    except Exception as e:
+                        logger.warning(f"HumsiENK: Failed to send status command: {e}")
+                    # 0x22 — cell voltages
+                    try:
+                        logger.debug("HumsiENK: TX 0x22")
                         cmd = self._build_command(self.CMD_CELL_VOLTAGES, [])
                         self.ble_handle.send_data(cmd)
-                        self._last_cell_voltages_time = now
                     except Exception as e:
                         logger.warning(f"HumsiENK: Failed to send cell voltages command: {e}")
             
-            # Update in-memory state on successful data refresh;
-            # disk flush is rate-limited to every 15 minutes (+ atexit).
+            # On fresh data: update RAM state and clear any stale-data alarm
             if data_refreshed:
                 self._update_ram_state()
-                self._save_cached_state()
-                # Clear stale-data alarm now that we have fresh BMS data
-                if self.protection.internal_failure is not None and self.protection.internal_failure > 0:
-                    self.protection.internal_failure = Protection.OK
+                if hasattr(self, 'protection') and self.protection is not None:
+                    self.protection.internal_failure = 0
             else:
-                # No fresh data this poll cycle — normal between BLE command/response rounds.
-                # Use last-known-good values so dbus always has something to report.
-                if self._use_cached_data():
-                    age = time.time() - self._last_good_state.get('timestamp', 0)
-                    msg = f"HumsiENK: No new data this cycle, using cached values ({age:.0f}s old)"
-                    if age >= 900:  # > 15 minutes
-                        logger.error(msg)
-                        self.protection.internal_failure = Protection.ALARM
-                    elif age >= 300:  # 5–15 minutes
-                        logger.warning(msg)
-                        self.protection.internal_failure = Protection.WARNING
-                    elif age >= 60:  # 1–5 minutes
-                        logger.warning(msg)
-                    elif age >= 15:  # 15–60 seconds
-                        logger.info(msg)
-                    else:
-                        logger.debug(msg)
+                # No fresh data — serve stale RAM values with escalating warnings
+                self._use_cached_data()
             
-            # Provide placeholder values to avoid empty readings (13.6V avoids low-battery warnings)
+            # Provide placeholder values to avoid empty readings
             if getattr(self, "voltage", None) is None:
-                self.voltage = round(self.cell_count * 3.4, 2)
+                self.voltage = 0.0
             if getattr(self, "current", None) is None:
                 self.current = 0.0
             if getattr(self, "soc", None) is None:
@@ -657,17 +629,17 @@ class HumsiENK_Ble(Battery):
             if len(self.cells) == 0:
                 for _ in range(self.cell_count):
                     self.cells.append(Cell(False))
-            # Safe cell defaults for any newly added cells (trimmed once real count is known)
             for c in range(len(self.cells)):
                 if getattr(self.cells[c], "voltage", None) is None:
-                    self.cells[c].voltage = 3.4
+                    self.cells[c].voltage = 0.0
             if getattr(self, "charge_fet", None) is None:
                 self.charge_fet = True
             if getattr(self, "discharge_fet", None) is None:
                 self.discharge_fet = True
-        except Exception as e:
-            # Keep driver alive on parsing issues but log it
-            logger.warning(f"HumsiENK: refresh_data exception: {e}")
+        except Exception as ex:
+            # Keep driver alive on parsing issues
+            logger.warning(f"HumsiENK: refresh_data exception: {repr(ex)}")
+        logger.debug(f"HumsiENK: <<< refresh_data returning True, refreshed={data_refreshed}")
         return True
 
     def _parse_and_update(self, frame: bytes):
@@ -710,7 +682,7 @@ class HumsiENK_Ble(Battery):
         """
         Parse command 0x21 response (Battery Info) - 26 bytes.
         
-        Field layout (confirmed via live device testing):
+        Field layout confirmed from APK (Ve function) and live device data:
             vol (4 bytes): Battery voltage in mV (millivolts)
             ele (4 bytes): Current in mA (milliamps), signed 32-bit
             SOC (1 byte): State of Charge %
@@ -741,7 +713,7 @@ class HumsiENK_Ble(Battery):
             idx += 4
             
             # Current (4 bytes, milliamps signed → divide by 1000 for A)
-            # Signed 32-bit: values > 2^31 are negative (two's complement)
+            # APK: e.ele > 2147483647 && (e.ele = -(4294967296 - e.ele))
             current_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=True)
             self.current = current_raw / 1000.0
             idx += 4
@@ -755,13 +727,13 @@ class HumsiENK_Ble(Battery):
             idx += 1
             
             # Remaining capacity (4 bytes, mAh → divide by 1000 for Ah)
-            # Raw value in mAh; divide by 1000 for Ah
+            # APK: r.info.capacity1 = (r.info.capacity / 1e3).toFixed(2)
             capacity_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=False)
             self.capacity_remain = capacity_raw / 1000.0
             idx += 4
             
             # Total capacity (4 bytes, mAh → divide by 1000 for Ah)
-            # Raw value in mAh; divide by 1000 for Ah
+            # APK: r.info.allCapacity1 = (r.info.allCapacity / 1e3).toFixed(2)
             total_capacity_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=False)
             if total_capacity_raw > 0:
                 self.capacity = total_capacity_raw / 1000.0
@@ -772,8 +744,8 @@ class HumsiENK_Ble(Battery):
             idx += 2
             
             # Temperatures (6 × 1 byte, direct °C, signed byte)
-            # Fields: t1, t2, t3, t4, MOS, environment (each 1 byte)
-            # Signed byte: values > 127 are negative (for sub-zero temps)
+            # APK field names: t1, t2, t3, t4, MOS, environment (each 1 byte)
+            # APK display: raw > 127 ? raw - 256 : raw (signed byte for sub-zero temps)
             def _signed_byte(b):
                 return b if b < 128 else b - 256
             
@@ -793,8 +765,8 @@ class HumsiENK_Ble(Battery):
                 self.temperature_mos = float(_signed_byte(data[idx]))
                 idx += 1
             if idx < len(data):
-                # Environment temp — not mapped to D-Bus (base class supports 1-4 + MOS)
-                # but stored for diagnostics / future use
+                # Environment temperature — not mapped to D-Bus by the base
+                # Battery class, but stored for logging/diagnostics.
                 self.temperature_env = float(_signed_byte(data[idx]))
                 idx += 1
             
@@ -851,9 +823,9 @@ class HumsiENK_Ble(Battery):
                 if 1000 <= mv <= 5000:  # Sanity check
                     self.cells[idx].voltage = mv / 1000.0
             
-            # Note: pack voltage is reported directly by the BMS in 0x21 and is more
-            # accurate than summing individual cell readings (which accumulate rounding errors).
-            # Do NOT overwrite self.voltage here.
+            # NOTE: Do NOT overwrite self.voltage here — the BMS-reported pack
+            # voltage from 0x21 is more accurate than the sum of individual
+            # cell voltages (which accumulate rounding errors).
             
             logger.debug(f"HumsiENK: Cell voltages: {[c.voltage for c in self.cells[:min(4, self.cell_count)]]}")
             
@@ -870,7 +842,7 @@ class HumsiENK_Ble(Battery):
             Bytes 8-10: Cell balance status (24-bit bitmap)
             Bytes 11-13: Cell disconnect status (24-bit bitmap)
         
-        Operation Status Alarm/Protection Bits (confirmed via live device testing):
+        Operation Status Alarm/Protection Bits (from APK analysis):
         
         CHARGE SECTION (Bits 0-15):
           Bit 0:  Charge overcurrent protection
@@ -1037,7 +1009,8 @@ class HumsiENK_Ble(Battery):
             
             # Cell disconnect status (bytes 11-13) - 24-bit bitmap
             # This indicates if any cells are physically disconnected (faulty connections, broken wires)
-            # Critical safety monitoring: detect physically disconnected cells.
+            # NOTE: The official APK parses this field but never displays it!
+            # We implement it anyway for critical safety monitoring.
             if len(data) >= 14:
                 cell_disconnect = int.from_bytes(data[11:14], 'little', signed=False)
                 
@@ -1149,7 +1122,8 @@ class HumsiENK_Ble(Battery):
             idx += 2
             
             # Temperature protection limits (raw values in deciKelvin)
-            # Temperature conversion: (raw_deciKelvin - 2731) / 10 → °C
+            # APK formula: (raw - 2731) / 10 → °C
+            # (confirmed at app-service-pretty.js line 7870)
             def _dk_to_c(raw):
                 return (raw - 2731) / 10.0
             

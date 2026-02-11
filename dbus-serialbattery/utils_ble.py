@@ -35,6 +35,11 @@ class Syncron_Ble:
 
     write_characteristic = None
     read_characteristic = None
+    _first_connect = True
+    # Watchdog: force-disconnect if no BLE notifications for this many seconds.
+    # Catches "zombie connections" where BlueZ thinks it's connected but the
+    # radio link has silently died (no disconnect callback fires).
+    _notification_watchdog_timeout = 180  # 3 minutes
 
     def __init__(self, address, read_characteristic, write_characteristic):
         """
@@ -48,18 +53,31 @@ class Syncron_Ble:
         self.read_characteristic = read_characteristic
         self.address = address
         self._notification_queue = deque()
+        self._last_notification_time = _time.time()
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
-        ble_async_thread = threading.Thread(name="BMS_bluetooth_async_thread", target=self.initiate_ble_thread_main, daemon=True)
-        ble_async_thread.start()
+        self._ble_thread = threading.Thread(name="BMS_bluetooth_async_thread", target=self.initiate_ble_thread_main, daemon=True)
+        self._ble_thread.start()
 
         thread_start_ok = self.ble_async_thread_ready.wait(2)
-        connected_ok = self.ble_connection_ready.wait(30)
         if not thread_start_ok:
             logger.error("bluetooh LE thread took to long to start")
+
+        # Wait up to 30 s for the first connection.  If it doesn't happen
+        # in time, log a warning but do NOT mark the handle as failed.
+        # The daemon thread keeps retrying in the background, so the
+        # process stays alive and serves cached / default data until the
+        # connection succeeds.  This prevents the destructive crash-loop
+        # where each killed process leaves BlueZ in a dirty state.
+        connected_ok = self.ble_connection_ready.wait(30)
         if not connected_ok:
-            logger.error(f"bluetooh LE connection to address: {self.address} took to long to inititate")
+            logger.warning(
+                f"BLE initial connection to {self.address} not ready in 30 s — "
+                f"daemon thread will keep retrying in background"
+            )
+            # Mark as not-yet-connected; daemon thread will flip this
+            # to True as soon as it succeeds.
             self.connected = False
         else:
             # Mark connected only if client exists and is connected
@@ -69,7 +87,12 @@ class Syncron_Ble:
                 self.connected = False
 
     def initiate_ble_thread_main(self):
-        asyncio.run(self.async_main(self.address))
+        try:
+            asyncio.run(self.async_main(self.address))
+        except Exception as e:
+            logger.error(f"BLE daemon thread crashed: {repr(e)}")
+        finally:
+            logger.error(f"BLE daemon thread exited for {self.address}")
 
     async def async_main(self, address):
         self.ble_async_thread_event_loop = asyncio.get_event_loop()
@@ -78,7 +101,11 @@ class Syncron_Ble:
         # try to connect over and over if the connection fails
         consecutive_failures = 0
         while self.main_thread.is_alive():
-            result = await self.connect_to_bms(self.address)
+            try:
+                result = await self.connect_to_bms(self.address)
+            except Exception as e:
+                logger.error(f"BLE connect_to_bms raised unhandled exception: {repr(e)}")
+                result = False
             if result is False:
                 consecutive_failures += 1
                 # exponential backoff: 0.5s, 1s, 2s, 4s, 8s (cap at 8s)
@@ -88,18 +115,14 @@ class Syncron_Ble:
                 except Exception:
                     pass
                 if consecutive_failures >= 5:
-                    # cooldown after 5 consecutive failures, then retry
-                    try:
-                        await asyncio.sleep(600)
-                    except Exception:
-                        pass
                     consecutive_failures = 0
-                    continue
             else:
-                # reset failure counter after any successful session (even if later disconnected)
+                # reset failure counter after any successful session
                 consecutive_failures = 0
-                # yield control
-                await asyncio.sleep(0)
+                # Brief pause before reconnecting to let BlueZ clean up.
+                # Too short (1s) causes unstable reconnections; too long
+                # (3s+) wastes data time.  2s is a good compromise.
+                await asyncio.sleep(2.0)
 
     def client_disconnected(self, client):
         logger.error(f"bluetooh device with address: {self.address} disconnected")
@@ -140,99 +163,197 @@ class Syncron_Ble:
             if configured:
                 adapters_to_rotate = configured
             else:
-                adapters_to_rotate = _list_adapters() or [None]
+                adapters_to_rotate = _list_adapters() or ["hci0"]
         else:
-            # rely on BlueZ default unless configured otherwise
             adapters_to_rotate = [None]
 
         # Acquire a cross-process file lock to serialize BLE scanning/connecting.
         # This prevents BlueZ "InProgress" errors when multiple battery services
         # attempt to scan simultaneously via bleak's implicit discover().
+        # CRITICAL: must use LOCK_NB (non-blocking) with async sleep between
+        # attempts.  A blocking LOCK_EX freezes the entire asyncio event loop,
+        # making the daemon thread permanently unresponsive if the other process
+        # holds the lock for a long time (e.g. during a hanging connect()).
         lock_fd = None
+        lock_acquired = False
         try:
             lock_fd = open(_BLE_CONNECT_LOCK_PATH, "w")
             logger.info(f"BLE connect lock: waiting to acquire for {address}")
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            logger.info(f"BLE connect lock: acquired for {address}")
+            lock_timeout = _time.time() + 15.0  # max 15s waiting for lock
+            while _time.time() < lock_timeout:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    lock_acquired = True
+                    logger.info(f"BLE connect lock: acquired for {address}")
+                    break
+                except (IOError, OSError):
+                    # Lock held by other process — yield to event loop and retry
+                    await asyncio.sleep(0.5)
+            if not lock_acquired:
+                logger.warning(
+                    f"BLE connect lock: timed out after 15s for {address}, "
+                    f"proceeding without lock"
+                )
         except Exception as e:
             logger.warning(f"BLE connect lock: could not acquire ({repr(e)}), proceeding without lock")
 
-        try:
-            # Drop any stale BlueZ connection to this address left over from a
-            # previous process that was killed (e.g. by runit `svc -t`).  Without
-            # this, the BMS device refuses a new connection because BlueZ still
-            # holds the old handle, and all connect attempts time out.
-            for _adapter in (adapters_to_rotate if adapters_to_rotate != [None] else []):
-                try:
-                    _result = subprocess.run(
-                        ["hcitool", "-i", _adapter, "con"],
-                        capture_output=True, text=True, timeout=3,
-                    )
-                    for _line in (_result.stdout or "").splitlines():
-                        if address.upper() in _line.upper():
-                            _parts = _line.split("handle ")
-                            if len(_parts) > 1:
-                                _handle = _parts[1].split()[0]
-                                subprocess.run(
-                                    ["hcitool", "-i", _adapter, "ledc", _handle],
-                                    timeout=3,
-                                )
-                                logger.info(f"BLE: dropped stale handle {_handle} on {_adapter} for {address}")
-                                await asyncio.sleep(0.5)
-                except Exception:
-                    pass
+        # Wall-clock deadline — must finish before main thread timeout (20s)
+        deadline = _time.time() + 18.0
+        max_retries = 8
+        connected = False
+        inprogress_failures = 0  # track how many attempts failed with InProgress
 
-            connected = False
-            # Wall-clock deadline: the main thread waits 30s for ble_connection_ready.
-            # We MUST finish (success or failure) before that, otherwise the process
-            # exits while this daemon thread is still mid-connection, leaving BlueZ
-            # with a stale half-open handle that causes InProgress errors on restart.
-            deadline = _time.time() + 25.0  # 5s margin before 30s main-thread timeout
-            max_retries = 6
+        try:
+            # On the very first connect after process start, clean up any
+            # stale BlueZ state left over from a previously killed process.
+            if self._first_connect:
+                for _adapter in adapters_to_rotate:
+                    if _adapter is None:
+                        continue
+                    # Cancel any pending LE Create Connection left by a
+                    # killed process.  Without this, BlueZ may be stuck
+                    # waiting for a connection that will never complete,
+                    # causing the next connect() to hang indefinitely.
+                    try:
+                        subprocess.run(
+                            ["hcitool", "-i", _adapter, "cmd", "0x08", "0x000E"],
+                            capture_output=True, timeout=3,
+                        )
+                    except Exception:
+                        pass
+                    # Drop any stale LE connection handles.
+                    try:
+                        _result = subprocess.run(
+                            ["hcitool", "-i", _adapter, "con"],
+                            capture_output=True, text=True, timeout=3,
+                        )
+                        for _line in (_result.stdout or "").splitlines():
+                            if address.upper() in _line.upper():
+                                _parts = _line.split("handle ")
+                                if len(_parts) > 1:
+                                    _handle = _parts[1].split()[0]
+                                    subprocess.run(
+                                        ["hcitool", "-i", _adapter, "ledc", _handle],
+                                        timeout=3,
+                                    )
+                                    logger.info(f"BLE: dropped stale handle {_handle} on {_adapter} for {address}")
+                                    await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
+
+            logger.info(f"BLE connect: entering retry loop for {address} (deadline in {deadline - _time.time():.0f}s)")
             for attempt in range(1, max_retries + 1):
                 remaining = deadline - _time.time()
                 if remaining <= 1.0:
-                    logger.warning("BLE connect: wall-clock deadline reached, no time for more attempts")
+                    logger.warning(f"BLE connect deadline reached for {address}")
                     break
+
+                # Rotate through adapters on successive attempts
                 adapter = adapters_to_rotate[(attempt - 1) % len(adapters_to_rotate)]
                 adapter_name = adapter or "default"
-                self.client = BleakClient(address, disconnected_callback=self.client_disconnected, adapter=adapter) if adapter else BleakClient(address, disconnected_callback=self.client_disconnected)
-                # Per-attempt timeout: shrink to fit remaining budget (leave 1s for cleanup)
-                attempt_timeout = min(8.0, remaining - 1.0)
-                if attempt_timeout < 1.0:
-                    logger.warning("BLE connect: insufficient time remaining, giving up")
-                    break
+                logger.info(f"BLE connect: attempt {attempt}/{max_retries} on {adapter_name} for {address} ({remaining:.0f}s left)")
+
+                # Cap each connect attempt so a hanging BlueZ doesn't
+                # consume the entire deadline budget.
+                connect_timeout = min(10.0, max(remaining - 1.0, 3.0))
+
+                self.client = BleakClient(
+                    address,
+                    disconnected_callback=self.client_disconnected,
+                    adapter=adapter,
+                    timeout=connect_timeout,
+                ) if adapter else BleakClient(
+                    address,
+                    disconnected_callback=self.client_disconnected,
+                    timeout=connect_timeout,
+                )
+
                 try:
-                    await asyncio.wait_for(self.client.connect(), timeout=attempt_timeout)
-                    await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
-                    await asyncio.sleep(0.2)
+                    # Wrap the ENTIRE connection setup (connect + GATT check
+                    # + start_notify) in a single hard timeout.  On BlueZ,
+                    # any of these calls can hang indefinitely despite the
+                    # BleakClient timeout parameter being set.
+                    async with asyncio.timeout(connect_timeout):
+                        await self.client.connect()
+
+                        # Verify GATT service discovery completed
+                        if not bool(self.client.services):
+                            logger.error(f"BLE GATT services not resolved on {adapter_name} for {address}")
+                            try:
+                                await self.client.disconnect()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.3)
+                            continue
+
+                        # Request larger MTU (the HumsiENK app requests 150).
+                        # Larger MTU avoids ATT fragmentation for multi-byte responses.
+                        try:
+                            mtu = self.client.mtu_size
+                            if mtu and mtu < 150:
+                                logger.debug(f"BLE negotiated MTU={mtu} for {address}")
+                        except Exception:
+                            pass
+
+                        await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
+                        await asyncio.sleep(0.2)
+
+                    logger.info(f"BLE connected to {address} on {adapter_name} (attempt {attempt})")
+                    self._first_connect = False
                     connected = True
                     break
-                except asyncio.TimeoutError:
-                    logger.warning(f"BLE connect attempt {attempt}/{max_retries} on {adapter_name} timed out after {attempt_timeout:.0f}s")
-                    try:
-                        await self.client.disconnect()
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.3)
-                    continue
                 except Exception as e:
                     error_str = repr(e)
-                    logger.error(f"Failed to connect on {adapter_name} (attempt {attempt}/{max_retries}): {error_str}")
                     try:
                         await self.client.disconnect()
                     except Exception:
                         pass
+
                     if "InProgress" in error_str and attempt < max_retries:
-                        delay = min(0.5 + attempt * 0.25, 2.0)
-                        logger.info(f"BLE adapter {adapter_name} busy (InProgress), rotating to next adapter in {delay:.1f}s...")
+                        inprogress_failures += 1
+                        delay = min(0.75 + attempt * 0.25, 3.0)
+                        logger.info(f"BLE {adapter_name} busy (InProgress), retry in {delay:.1f}s ({attempt}/{max_retries})")
                         await asyncio.sleep(delay)
                         continue
-                    if attempt < max_retries:
+                    elif "InProgress" in error_str:
+                        inprogress_failures += 1
+                    else:
+                        logger.error(f"BLE connect failed on {adapter_name} ({attempt}/{max_retries}): {error_str}")
                         await asyncio.sleep(0.3)
                         continue
-                    break
+
             if not connected:
+                # Auto-recovery: if most attempts failed with "InProgress",
+                # BlueZ has a stale connecting/connected state for this device.
+                # Clear it by cancelling pending HCI connections and removing
+                # the device so it can be re-discovered cleanly.
+                if inprogress_failures >= max_retries // 2:
+                    logger.warning(
+                        f"BLE auto-recovery: {inprogress_failures}/{max_retries} attempts "
+                        f"failed with InProgress for {address} — clearing BlueZ state"
+                    )
+                    for _adapter in adapters_to_rotate:
+                        if _adapter is None:
+                            continue
+                        try:
+                            subprocess.run(
+                                ["hcitool", "-i", _adapter, "cmd", "0x08", "0x000E"],
+                                capture_output=True, timeout=3,
+                            )
+                        except Exception:
+                            pass
+                    # Remove device from BlueZ to clear stale connection state.
+                    # It will be re-discovered via BLE advertisements automatically.
+                    try:
+                        subprocess.run(
+                            ["bluetoothctl", "remove", address],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        logger.info(f"BLE auto-recovery: removed {address} from BlueZ, waiting for re-discovery")
+                        await asyncio.sleep(3.0)
+                    except Exception as e:
+                        logger.warning(f"BLE auto-recovery: bluetoothctl remove failed: {repr(e)}")
+
                 self.ble_connection_ready.set()
                 self.connected = False
                 return False
@@ -249,8 +370,23 @@ class Syncron_Ble:
         try:
             self.ble_connection_ready.set()
             self.connected = True
+            self._last_notification_time = _time.time()  # reset watchdog on connect
             while self.client.is_connected and self.main_thread.is_alive():
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.5)
+                # Watchdog: if no BLE notifications for 3 minutes, the radio
+                # link is likely dead even though BlueZ still says "connected".
+                # Force a disconnect so the outer loop can reconnect.
+                silence = _time.time() - self._last_notification_time
+                if silence > self._notification_watchdog_timeout:
+                    logger.warning(
+                        f"BLE watchdog: no notifications for {silence:.0f}s "
+                        f"from {self.address}, forcing reconnect"
+                    )
+                    try:
+                        await self.client.disconnect()
+                    except Exception:
+                        pass
+                    break
         finally:
             try:
                 await self.client.disconnect()
@@ -263,6 +399,7 @@ class Syncron_Ble:
         # Append to queue to avoid races and packet drops
         try:
             self._notification_queue.append(bytes(data))
+            self._last_notification_time = _time.time()
         except Exception:
             pass
         self.response_data = data
@@ -288,8 +425,28 @@ class Syncron_Ble:
         return result
 
     def send_data(self, data):
-        data = asyncio.run(self.send_coroutine_to_ble_thread_and_wait_for_result(self.ble_thread_send_com(data)))
-        return data
+        # Guard: if the daemon thread has died, fail fast instead of blocking
+        # on a dead event loop for the full 2s timeout.
+        if not self._ble_thread.is_alive():
+            logger.error("BLE: daemon thread is dead, send_data returning False")
+            return False
+        # Guard: if not connected, fail fast — avoids the 2s timeout and
+        # "Service Discovery has not been performed yet" warnings.
+        if not self.connected:
+            logger.debug("BLE: send_data skipped — not connected")
+            return False
+        # Schedule the BLE write on the daemon thread's event loop and wait
+        # synchronously for the result.  Avoids asyncio.run() which would
+        # create a throwaway event loop and block the calling thread during
+        # its cleanup phase.
+        future = asyncio.run_coroutine_threadsafe(
+            self.ble_thread_send_com(data), self.ble_async_thread_event_loop
+        )
+        try:
+            return future.result(timeout=2.0)
+        except Exception as e:
+            logger.warning(f"BLE: send_data failed: {e}")
+            return False
 
 
 def restart_ble_hardware_and_bluez_driver():

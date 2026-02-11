@@ -579,6 +579,12 @@ class Battery(ABC):
             self.control_voltage = round(self.max_battery_voltage, 2)
             self.charge_mode = "Keep always max voltage"
 
+        # If battery is actively discharging, override the charge mode label
+        # so the UI reflects the actual state instead of showing a misleading
+        # charging label (e.g. "Bulk") while the battery is being drained.
+        if self.current is not None and self.current < 0:
+            self.charge_mode = "Discharging"
+
     def soc_calculation(self) -> float:
         """
         Calculates the SoC based on the coulomb counting method.
