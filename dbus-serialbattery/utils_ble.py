@@ -40,6 +40,13 @@ class Syncron_Ble:
     # Catches "zombie connections" where BlueZ thinks it's connected but the
     # radio link has silently died (no disconnect callback fires).
     _notification_watchdog_timeout = 180  # 3 minutes
+    # Adapter reset escalation: after this many consecutive full connect_to_bms
+    # failures, reset the BLE adapter as a last resort to clear deeply-stuck
+    # phantom BlueZ states (Connected=yes with no HCI handle).
+    _consecutive_connect_failures = 0
+    _adapter_reset_threshold = 3  # full cycles before escalation
+    _last_adapter_reset_time = 0.0
+    _adapter_reset_cooldown = 300.0  # min 5 minutes between resets
 
     def __init__(self, address, read_characteristic, write_characteristic):
         """
@@ -204,10 +211,12 @@ class Syncron_Ble:
         inprogress_failures = 0  # track how many attempts failed with InProgress
 
         try:
-            # On the very first connect after process start, clean up any
-            # stale BlueZ state left over from a previously killed process.
-            if self._first_connect:
-                for _adapter in adapters_to_rotate:
+            # Clean up any stale BlueZ state before every connect attempt.
+            # Previously gated by _first_connect, but phantom "Connected"
+            # states persist across watchdog-triggered reconnects too:
+            # BlueZ reports Connected=yes with no HCI handle, causing
+            # BleakClient.connect() to "succeed" instantly on a dead link.
+            for _adapter in adapters_to_rotate:
                     if _adapter is None:
                         continue
                     # Cancel any pending LE Create Connection left by a
@@ -240,6 +249,19 @@ class Syncron_Ble:
                                     await asyncio.sleep(0.5)
                     except Exception:
                         pass
+
+            # Clear phantom BlueZ "Connected" state via D-Bus disconnect.
+            # BlueZ can report Connected=yes with no real HCI handle after
+            # a radio link dies silently.  hcitool cleanup above handles
+            # actual HCI handles, but the D-Bus property needs a separate
+            # Disconnect call to clear.
+            try:
+                subprocess.run(
+                    ["bluetoothctl", "disconnect", address],
+                    capture_output=True, text=True, timeout=5,
+                )
+            except Exception:
+                pass
 
             logger.info(f"BLE connect: entering retry loop for {address} (deadline in {deadline - _time.time():.0f}s)")
             for attempt in range(1, max_retries + 1):
@@ -354,6 +376,69 @@ class Syncron_Ble:
                     except Exception as e:
                         logger.warning(f"BLE auto-recovery: bluetoothctl remove failed: {repr(e)}")
 
+                # Track consecutive full-cycle failures for adapter reset escalation
+                self._consecutive_connect_failures += 1
+                logger.warning(
+                    f"BLE connect failed for {address} "
+                    f"({self._consecutive_connect_failures}/{self._adapter_reset_threshold} "
+                    f"consecutive failures before adapter reset)"
+                )
+
+                # Last resort: reset the BLE adapter to clear deeply-stuck
+                # phantom states where BlueZ reports Connected=yes but there
+                # is no HCI handle.  bluetoothctl disconnect/remove and D-Bus
+                # RemoveDevice all hang in this state — only an adapter
+                # down/up clears it.
+                if (
+                    self._consecutive_connect_failures >= self._adapter_reset_threshold
+                    and (_time.time() - self._last_adapter_reset_time) > self._adapter_reset_cooldown
+                ):
+                    # Find which adapter(s) to reset — only reset adapters
+                    # that were actually tried, not all adapters.
+                    for _adapter in adapters_to_rotate:
+                        if _adapter is None:
+                            continue
+                        logger.error(
+                            f"BLE ADAPTER RESET: resetting {_adapter} after "
+                            f"{self._consecutive_connect_failures} consecutive failures "
+                            f"for {address}"
+                        )
+                        try:
+                            subprocess.run(
+                                ["hciconfig", _adapter, "down"],
+                                capture_output=True, timeout=5,
+                            )
+                            await asyncio.sleep(1.0)
+                            subprocess.run(
+                                ["hciconfig", _adapter, "up"],
+                                capture_output=True, timeout=5,
+                            )
+                            logger.info(f"BLE ADAPTER RESET: {_adapter} reset complete")
+                        except Exception as e:
+                            logger.error(f"BLE ADAPTER RESET: failed for {_adapter}: {repr(e)}")
+
+                    # An adapter down/up can crash bluetoothd.  Verify it's
+                    # still running and restart if needed.
+                    try:
+                        _check = subprocess.run(
+                            ["/etc/init.d/bluetooth", "status"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if "is stopped" in (_check.stdout or ""):
+                            logger.error("BLE ADAPTER RESET: bluetoothd crashed, restarting")
+                            subprocess.run(
+                                ["/etc/init.d/bluetooth", "restart"],
+                                capture_output=True, timeout=10,
+                            )
+                            await asyncio.sleep(3.0)
+                    except Exception as e:
+                        logger.warning(f"BLE ADAPTER RESET: bluetooth status check failed: {repr(e)}")
+
+                    self._last_adapter_reset_time = _time.time()
+                    self._consecutive_connect_failures = 0
+                    # Give BlueZ time to re-initialize the adapter
+                    await asyncio.sleep(3.0)
+
                 self.ble_connection_ready.set()
                 self.connected = False
                 return False
@@ -370,6 +455,7 @@ class Syncron_Ble:
         try:
             self.ble_connection_ready.set()
             self.connected = True
+            self._consecutive_connect_failures = 0  # reset escalation counter on success
             self._last_notification_time = _time.time()  # reset watchdog on connect
             while self.client.is_connected and self.main_thread.is_alive():
                 await asyncio.sleep(0.5)
