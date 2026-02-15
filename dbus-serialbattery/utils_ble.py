@@ -310,6 +310,42 @@ class Syncron_Ble:
                 except Exception:
                     pass
 
+            # Thread-level safety timer: if the entire connection phase
+            # takes longer than the deadline + grace period, forcefully
+            # remove the device from BlueZ.  This breaks any stuck
+            # BleakClient.connect() or start_notify() call that
+            # asyncio.wait_for cannot cancel (e.g. when bleak is blocked
+            # deep inside a synchronous D-Bus call).
+            _safety_timer_fired = threading.Event()
+
+            def _safety_timer_cleanup():
+                logger.error(
+                    f"BLE SAFETY TIMER: connection phase stuck for {address}, "
+                    f"force-removing device from BlueZ"
+                )
+                _safety_timer_fired.set()
+                try:
+                    subprocess.run(
+                        ["bluetoothctl", "remove", address],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+                for _adp in adapters_to_rotate:
+                    if _adp is None:
+                        continue
+                    try:
+                        subprocess.run(
+                            ["hcitool", "-i", _adp, "cmd", "0x08", "0x000E"],
+                            capture_output=True, timeout=3,
+                        )
+                    except Exception:
+                        pass
+
+            _safety_timer = threading.Timer(25.0, _safety_timer_cleanup)
+            _safety_timer.daemon = True
+            _safety_timer.start()
+
             logger.info(f"BLE connect: entering retry loop for {address} (deadline in {deadline - _time.time():.0f}s)")
             for attempt in range(1, max_retries + 1):
                 remaining = deadline - _time.time()
@@ -498,8 +534,10 @@ class Syncron_Ble:
 
                 self.ble_connection_ready.set()
                 self.connected = False
+                _safety_timer.cancel()
                 return False
         finally:
+            _safety_timer.cancel()
             # Release the lock so the next service instance can connect
             if lock_fd:
                 try:
@@ -510,6 +548,7 @@ class Syncron_Ble:
                     pass
 
         try:
+            _safety_timer.cancel()
             self.ble_connection_ready.set()
             self.connected = True
             self._consecutive_connect_failures = 0  # reset escalation counter on success
