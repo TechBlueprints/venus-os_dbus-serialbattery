@@ -216,13 +216,63 @@ class Syncron_Ble:
             # states persist across watchdog-triggered reconnects too:
             # BlueZ reports Connected=yes with no HCI handle, causing
             # BleakClient.connect() to "succeed" instantly on a dead link.
+
+            # --- Phantom detection ---
+            # Check if BlueZ *thinks* the device is connected but no real
+            # HCI handle exists.  In this state, bluetoothctl disconnect
+            # hangs and bleak's connect() "succeeds" on a dead link.
+            # The only reliable fix is bluetoothctl remove, which is
+            # non-destructive to other devices on the same adapter.
+            _bluez_says_connected = False
+            try:
+                _info = subprocess.run(
+                    ["bluetoothctl", "info", address],
+                    capture_output=True, text=True, timeout=3,
+                )
+                _bluez_says_connected = "Connected: yes" in (_info.stdout or "")
+            except Exception:
+                pass
+
+            _has_hci_handle = False
+            if _bluez_says_connected:
+                for _adapter in adapters_to_rotate:
+                    if _adapter is None:
+                        continue
+                    try:
+                        _result = subprocess.run(
+                            ["hcitool", "-i", _adapter, "con"],
+                            capture_output=True, text=True, timeout=3,
+                        )
+                        if address.upper() in (_result.stdout or "").upper():
+                            _has_hci_handle = True
+                            break
+                    except Exception:
+                        pass
+
+                if not _has_hci_handle:
+                    # Phantom confirmed: BlueZ Connected=yes, no HCI handle.
+                    # Remove the device entirely so BlueZ forgets the stale
+                    # state.  It will be re-discovered from advertisements.
+                    logger.warning(
+                        f"BLE phantom detected for {address}: "
+                        f"BlueZ Connected=yes but no HCI handle — removing device"
+                    )
+                    try:
+                        subprocess.run(
+                            ["bluetoothctl", "remove", address],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                    except Exception:
+                        pass
+                    # Give BlueZ time to process the removal and re-discover
+                    # the device from BLE advertisements.
+                    await asyncio.sleep(3.0)
+
+            # Cancel pending LE Create Connection on each adapter and drop
+            # any stale HCI handles (covers non-phantom stuck states).
             for _adapter in adapters_to_rotate:
                     if _adapter is None:
                         continue
-                    # Cancel any pending LE Create Connection left by a
-                    # killed process.  Without this, BlueZ may be stuck
-                    # waiting for a connection that will never complete,
-                    # causing the next connect() to hang indefinitely.
                     try:
                         subprocess.run(
                             ["hcitool", "-i", _adapter, "cmd", "0x08", "0x000E"],
@@ -230,7 +280,6 @@ class Syncron_Ble:
                         )
                     except Exception:
                         pass
-                    # Drop any stale LE connection handles.
                     try:
                         _result = subprocess.run(
                             ["hcitool", "-i", _adapter, "con"],
@@ -250,18 +299,16 @@ class Syncron_Ble:
                     except Exception:
                         pass
 
-            # Clear phantom BlueZ "Connected" state via D-Bus disconnect.
-            # BlueZ can report Connected=yes with no real HCI handle after
-            # a radio link dies silently.  hcitool cleanup above handles
-            # actual HCI handles, but the D-Bus property needs a separate
-            # Disconnect call to clear.
-            try:
-                subprocess.run(
-                    ["bluetoothctl", "disconnect", address],
-                    capture_output=True, text=True, timeout=5,
-                )
-            except Exception:
-                pass
+            # If not a phantom but BlueZ thinks it's connected, try a
+            # D-Bus disconnect (has a real handle, so this should work).
+            if _bluez_says_connected and _has_hci_handle:
+                try:
+                    subprocess.run(
+                        ["bluetoothctl", "disconnect", address],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                except Exception:
+                    pass
 
             logger.info(f"BLE connect: entering retry loop for {address} (deadline in {deadline - _time.time():.0f}s)")
             for attempt in range(1, max_retries + 1):
@@ -291,34 +338,44 @@ class Syncron_Ble:
                 )
 
                 try:
-                    # Wrap the ENTIRE connection setup (connect + GATT check
-                    # + start_notify) in a single hard timeout.  On BlueZ,
-                    # any of these calls can hang indefinitely despite the
-                    # BleakClient timeout parameter being set.
-                    async with asyncio.timeout(connect_timeout):
-                        await self.client.connect()
+                    # Connect with a hard timeout.  BleakClient.connect()
+                    # includes GATT discovery which can hang on phantom links.
+                    await asyncio.wait_for(
+                        self.client.connect(), timeout=connect_timeout
+                    )
 
-                        # Verify GATT service discovery completed
-                        if not bool(self.client.services):
-                            logger.error(f"BLE GATT services not resolved on {adapter_name} for {address}")
-                            try:
-                                await self.client.disconnect()
-                            except Exception:
-                                pass
-                            await asyncio.sleep(0.3)
-                            continue
-
-                        # Request larger MTU (the HumsiENK app requests 150).
-                        # Larger MTU avoids ATT fragmentation for multi-byte responses.
+                    # Verify GATT service discovery completed
+                    if not bool(self.client.services):
+                        logger.error(f"BLE GATT services not resolved on {adapter_name} for {address}")
                         try:
-                            mtu = self.client.mtu_size
-                            if mtu and mtu < 150:
-                                logger.debug(f"BLE negotiated MTU={mtu} for {address}")
-                        except Exception:
+                            await asyncio.wait_for(self.client.disconnect(), timeout=3.0)
+                        except (asyncio.TimeoutError, Exception):
                             pass
+                        await asyncio.sleep(0.3)
+                        continue
 
-                        await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
-                        await asyncio.sleep(0.2)
+                    # Request larger MTU (the HumsiENK app requests 150).
+                    # Larger MTU avoids ATT fragmentation for multi-byte responses.
+                    try:
+                        mtu = self.client.mtu_size
+                        if mtu and mtu < 150:
+                            logger.debug(f"BLE negotiated MTU={mtu} for {address}")
+                    except Exception:
+                        pass
+
+                    # start_notify subscribes to BLE notifications.  On a
+                    # phantom link this can hang forever because BlueZ tries
+                    # to send a GATT write over a dead radio.  Use a
+                    # separate tight timeout so the daemon thread is never
+                    # permanently stuck.
+                    await asyncio.wait_for(
+                        self.client.start_notify(
+                            self.read_characteristic,
+                            self.notify_read_callback,
+                        ),
+                        timeout=5.0,
+                    )
+                    await asyncio.sleep(0.2)
 
                     logger.info(f"BLE connected to {address} on {adapter_name} (attempt {attempt})")
                     self._first_connect = False
@@ -327,8 +384,8 @@ class Syncron_Ble:
                 except Exception as e:
                     error_str = repr(e)
                     try:
-                        await self.client.disconnect()
-                    except Exception:
+                        await asyncio.wait_for(self.client.disconnect(), timeout=3.0)
+                    except (asyncio.TimeoutError, Exception):
                         pass
 
                     if "InProgress" in error_str and attempt < max_retries:
@@ -468,15 +525,56 @@ class Syncron_Ble:
                         f"BLE watchdog: no notifications for {silence:.0f}s "
                         f"from {self.address}, forcing reconnect"
                     )
+                    # Clear phantom BlueZ state BEFORE attempting client.disconnect().
+                    # In a phantom state (BlueZ Connected=yes, no HCI handle),
+                    # the D-Bus Disconnect call can hang indefinitely, trapping
+                    # the daemon thread forever.  Shell commands bypass this:
                     try:
-                        await self.client.disconnect()
+                        subprocess.run(
+                            ["bluetoothctl", "disconnect", self.address],
+                            capture_output=True, text=True, timeout=5,
+                        )
                     except Exception:
                         pass
+                    for _adapter in adapters_to_rotate:
+                        if _adapter is None:
+                            continue
+                        try:
+                            subprocess.run(
+                                ["hcitool", "-i", _adapter, "cmd", "0x08", "0x000E"],
+                                capture_output=True, timeout=3,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            _result = subprocess.run(
+                                ["hcitool", "-i", _adapter, "con"],
+                                capture_output=True, text=True, timeout=3,
+                            )
+                            for _line in (_result.stdout or "").splitlines():
+                                if self.address.upper() in _line.upper():
+                                    _parts = _line.split("handle ")
+                                    if len(_parts) > 1:
+                                        _handle = _parts[1].split()[0]
+                                        subprocess.run(
+                                            ["hcitool", "-i", _adapter, "ledc", _handle],
+                                            timeout=3,
+                                        )
+                                        logger.info(f"BLE watchdog: dropped stale handle {_handle} on {_adapter}")
+                        except Exception:
+                            pass
+
+                    # Attempt BleakClient disconnect with a hard timeout.
+                    # If it hangs (common in phantom state), we abandon it.
+                    try:
+                        await asyncio.wait_for(self.client.disconnect(), timeout=5.0)
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger.warning(f"BLE watchdog: disconnect timed out or failed ({repr(e)}), forcing break")
                     break
         finally:
             try:
-                await self.client.disconnect()
-            except Exception:
+                await asyncio.wait_for(self.client.disconnect(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
                 pass
             self.connected = False
 
