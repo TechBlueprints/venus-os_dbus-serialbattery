@@ -43,6 +43,8 @@ try:
         validate_gatt_services,
         PROFILE_BATTERY,
     )
+    from bleak_connection_manager.adapters import discover_adapters
+    from bleak_connection_manager.recovery import reset_adapter as _bcm_reset_adapter
     _HAS_BCM = True
 except ImportError:
     _HAS_BCM = False
@@ -89,10 +91,18 @@ class Syncron_Ble:
     read_characteristic = None
     _first_connect = True
 
-    # Watchdog timeout: 4 minutes (240s).  If no BLE notifications arrive
-    # for this long, the connection is assumed dead and will be torn down
-    # and re-established.
-    _notification_watchdog_timeout = 240
+    # Watchdog timeout: 90s.  If no BLE notifications arrive for this long,
+    # the connection is assumed dead and will be torn down and re-established.
+    # The HumsiENK BMS sends battery_info every ~60s, so 90s gives one
+    # missed cycle before we act.
+    _notification_watchdog_timeout = 90
+
+    # Hard stale timeout: if the connection appears "connected" but no
+    # actual BMS data frames have been received for this long, force a
+    # full teardown including adapter reset.  Catches the pathological
+    # case where scan-fail + direct-connect loops keep cycling without
+    # ever getting real data.
+    _hard_stale_timeout = 300  # 5 minutes
 
     def __init__(self, address, read_characteristic, write_characteristic):
         self.write_characteristic = write_characteristic
@@ -143,8 +153,57 @@ class Syncron_Ble:
         self.ble_async_thread_event_loop = asyncio.get_event_loop()
         self.ble_async_thread_ready.set()
 
+        # Discover adapters once for the escalation policy
+        if _HAS_BCM:
+            self._adapters = discover_adapters()
+            logger.info("BLE [%s] discovered adapters: %s", address, self._adapters)
+        else:
+            self._adapters = ["hci0"]
+
         consecutive_failures = 0
+        # Track when last actual notification data was received (for hard stale timeout)
+        self._last_data_time = _time.time()
+        total_reconnect_cycles = 0
         while self.main_thread.is_alive():
+            total_reconnect_cycles += 1
+            stale_seconds = _time.time() - self._last_data_time
+
+            # ── Hard stale timeout: if we've been cycling through connect
+            # attempts for too long without getting real data, force an
+            # adapter reset to clear any stuck BlueZ/HCI state.
+            if (
+                consecutive_failures >= 3
+                and stale_seconds > self._hard_stale_timeout
+                and _HAS_BCM
+            ):
+                logger.error(
+                    "BLE [%s] HARD STALE TIMEOUT: %d consecutive failures, "
+                    "no data for %.0fs — forcing adapter reset",
+                    address, consecutive_failures, stale_seconds,
+                )
+                for adapter in self._adapters:
+                    try:
+                        success = await _bcm_reset_adapter(adapter)
+                        logger.info(
+                            "BLE [%s] adapter %s reset %s",
+                            address, adapter,
+                            "succeeded" if success else "FAILED",
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "BLE [%s] adapter %s reset error: %s",
+                            address, adapter, repr(e),
+                        )
+                consecutive_failures = 0
+                await asyncio.sleep(5.0)
+                continue
+
+            logger.info(
+                "BLE [%s] connect cycle %d (failures=%d, stale=%.0fs)",
+                address, total_reconnect_cycles, consecutive_failures,
+                stale_seconds,
+            )
+
             try:
                 result = await self.connect_to_bms(self.address)
             except Exception as e:
@@ -154,9 +213,10 @@ class Syncron_Ble:
             if result is False:
                 consecutive_failures += 1
                 delay = min(0.5 * (2 ** (consecutive_failures - 1)), 8.0)
-                logger.info(
-                    "BLE [%s] connection failed (%d consecutive), retry in %.1fs",
-                    self.address, consecutive_failures, delay,
+                logger.warning(
+                    "BLE [%s] connection attempt failed (%d consecutive, "
+                    "stale=%.0fs), retry in %.1fs",
+                    self.address, consecutive_failures, stale_seconds, delay,
                 )
                 try:
                     await asyncio.sleep(delay)
@@ -170,7 +230,13 @@ class Syncron_Ble:
                 await asyncio.sleep(2.0)
 
     def client_disconnected(self, client):
-        logger.warning("BLE device %s disconnected", self.address)
+        logger.warning(
+            "BLE device %s disconnected (was connected=%s, thread_alive=%s)",
+            self.address,
+            getattr(self, 'connected', '?'),
+            self._ble_thread.is_alive() if hasattr(self, '_ble_thread') else '?',
+        )
+        self.connected = False
 
     async def connect_to_bms(self, address):
         """Connect to BMS using bleak-connection-manager.
@@ -183,7 +249,8 @@ class Syncron_Ble:
             logger.error("BLE: bleak-connection-manager not available")
             return False
 
-        escalation = EscalationPolicy([], config=PROFILE_BATTERY)
+        adapters = getattr(self, '_adapters', None) or discover_adapters()
+        escalation = EscalationPolicy(adapters, config=PROFILE_BATTERY)
 
         # Step 1: Find the device via managed scan
         logger.info("BLE [%s] scanning...", address)
@@ -289,12 +356,22 @@ class Syncron_Ble:
         self.connected = True
         self._last_notification_time = _time.time()
 
-        logger.info("BLE [%s] fully connected, starting watchdog", address)
+        logger.info(
+            "BLE [%s] fully connected, starting watchdog (timeout=%ds)",
+            address, self._notification_watchdog_timeout,
+        )
 
         # Step 5: Connection maintenance loop with watchdog
+        #
+        # The watchdog is NOT fed from raw BLE notifications.  Instead,
+        # the BMS driver calls feed_watchdog() after it successfully
+        # parses a valid, checksum-verified frame.  This ensures the
+        # watchdog fires when the BMS stops sending *real data*, not
+        # just when the BLE transport goes quiet.
         async def _on_watchdog_timeout():
-            logger.warning(
-                "BLE [%s] watchdog: no notifications for %ds, forcing reconnect",
+            logger.error(
+                "BLE [%s] WATCHDOG FIRED: no valid BMS frames for %ds "
+                "— forcing disconnect+reconnect",
                 address, self._notification_watchdog_timeout,
             )
 
@@ -304,21 +381,32 @@ class Syncron_Ble:
             client=self.client,
         )
         watchdog.start()
+        self._watchdog = watchdog
 
+        connection_start = _time.time()
+        last_maintenance_log = 0.0
         try:
             while self.client.is_connected and self.main_thread.is_alive():
                 await asyncio.sleep(0.5)
 
-                # Feed the watchdog whenever we have recent notifications
-                silence = _time.time() - self._last_notification_time
-                if silence < 5.0:
-                    watchdog.notify_activity()
+                # Periodic maintenance status log (every 5 min)
+                now = _time.time()
+                silence = now - self._last_notification_time
+                if now - last_maintenance_log > 300:
+                    uptime = now - connection_start
+                    logger.info(
+                        "BLE [%s] connection alive %.0fs, last notification %.0fs ago, "
+                        "watchdog_running=%s",
+                        address, uptime, silence, watchdog.is_running,
+                    )
+                    last_maintenance_log = now
 
                 # Check if watchdog fired (it stops itself after timeout)
                 if not watchdog.is_running:
                     logger.warning(
-                        "BLE [%s] watchdog expired, breaking connection loop",
-                        address,
+                        "BLE [%s] watchdog expired after %.0fs silence, "
+                        "breaking connection loop (connection was up %.0fs)",
+                        address, silence, now - connection_start,
                     )
                     break
         finally:
@@ -328,7 +416,24 @@ class Syncron_Ble:
             except (asyncio.TimeoutError, Exception):
                 pass
             self.connected = False
-            logger.info("BLE [%s] disconnected", address)
+            uptime = _time.time() - connection_start
+            logger.info(
+                "BLE [%s] disconnected after %.0fs connection",
+                address, uptime,
+            )
+
+    # ── Watchdog feeding ────────────────────────────────────────────
+
+    def feed_watchdog(self):
+        """Signal that a valid BMS frame was received.
+
+        Called by the BMS driver (e.g. HumsiENK_Ble) after it
+        successfully parses a checksum-verified frame.  This is the
+        ONLY way the connection watchdog gets fed — raw BLE
+        notifications are not sufficient.
+        """
+        if hasattr(self, '_watchdog') and self._watchdog is not None:
+            self._watchdog.notify_activity()
 
     # ── Notification handling ─────────────────────────────────────────
 
@@ -337,10 +442,16 @@ class Syncron_Ble:
 
         Queues the data for consumption by the synchronous caller and
         updates the notification timestamp for watchdog tracking.
+        Also updates _last_data_time used by the hard stale timeout
+        in async_main.
         """
         try:
             self._notification_queue.append(bytes(data))
-            self._last_notification_time = _time.time()
+            now = _time.time()
+            self._last_notification_time = now
+            # Also update the async_main stale tracker so the hard stale
+            # timeout knows we're getting real BLE data
+            self._last_data_time = now
         except Exception:
             pass
         self.response_data = data

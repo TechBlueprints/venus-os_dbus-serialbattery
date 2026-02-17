@@ -1,5 +1,6 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
+import faulthandler
 import math
 import os
 import signal
@@ -7,6 +8,10 @@ import sys
 from datetime import datetime
 from time import sleep
 from typing import Union
+
+# Enable faulthandler so SIGUSR1 dumps all Python thread tracebacks
+faulthandler.enable()
+faulthandler.register(signal.SIGUSR1)
 
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib

@@ -437,8 +437,14 @@ class HumsiENK_Ble(Battery):
         data_refreshed = False
         try:
             now_tick = time.time()
-            if (now_tick - self._last_heartbeat_log) > 10.0:
-                logger.debug("HumsiENK refresh tick")
+            if (now_tick - self._last_heartbeat_log) > 60.0:
+                ble_up = bool(self.ble_handle and getattr(self.ble_handle, 'connected', False))
+                stale = now_tick - self._last_frame_time
+                logger.info(
+                    f"HumsiENK heartbeat: BLE={'UP' if ble_up else 'DOWN'}, "
+                    f"last_data={stale:.0f}s ago, V={getattr(self, 'voltage', '?')}, "
+                    f"SoC={getattr(self, 'soc', '?')}%"
+                )
                 self._last_heartbeat_log = now_tick
             
             # No manual reconnection logic here.  The Syncron_Ble daemon
@@ -550,6 +556,11 @@ class HumsiENK_Ble(Battery):
                     self._parse_and_update(frame)
                     self._last_frame_time = time.time()
                     data_refreshed = True
+                    # Feed the connection watchdog — this is the ONLY
+                    # place it gets fed, proving the BMS is sending
+                    # real, checksum-verified data.
+                    if self.ble_handle:
+                        self.ble_handle.feed_watchdog()
                 
                 # ── Polling: match the app's pattern ──────────────────────
                 # The official app sends ALL THREE data commands every 3-3.5s
