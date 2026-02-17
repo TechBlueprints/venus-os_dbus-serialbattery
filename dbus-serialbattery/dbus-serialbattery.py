@@ -53,6 +53,11 @@ from bms.seplosv3 import Seplosv3
 # add ext folder to sys.path
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext"))
 
+# bleak-connection-manager (BCM) from ext/ submodule
+_bcm_src = os.path.join(os.path.dirname(__file__), "ext", "bleak-connection-manager", "src")
+if os.path.isdir(_bcm_src) and _bcm_src not in sys.path:
+    sys.path.insert(0, _bcm_src)
+
 # enabled only if explicitly set in config under "BMS_TYPE"
 if "ANT" in BMS_TYPE:
     from bms.ant import ANT

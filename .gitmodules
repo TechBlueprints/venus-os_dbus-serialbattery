@@ -1,0 +1,3 @@
+[submodule "dbus-serialbattery/ext/bleak-connection-manager"]
+	path = dbus-serialbattery/ext/bleak-connection-manager
+	url = https://github.com/techblueprints/bleak-connection-manager.git
