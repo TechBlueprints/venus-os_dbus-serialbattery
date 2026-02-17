@@ -187,6 +187,7 @@ class Syncron_Ble:
 
         # Step 1: Find the device via managed scan
         logger.info("BLE [%s] scanning...", address)
+        device = None
         try:
             device = await managed_find_device(
                 address,
@@ -196,19 +197,23 @@ class Syncron_Ble:
             )
         except Exception as e:
             logger.warning("BLE [%s] scan failed: %s", address, repr(e))
-            self.ble_connection_ready.set()
-            self.connected = False
-            return False
-
-        if device is None:
-            logger.warning("BLE [%s] device not found after scan", address)
-            self.ble_connection_ready.set()
-            self.connected = False
-            return False
 
         # Step 2: Establish connection via BCM
-        # overall_timeout=240s (4 min) prevents indefinite hangs; BMS is critical
-        logger.info("BLE [%s] connecting...", address)
+        # If scan found the device, connect normally.
+        # If scan failed (InProgress, device not advertising, etc.),
+        # fall back to direct connect using BlueZ cached device info.
+        direct_fallback = device is None
+        if direct_fallback:
+            logger.info(
+                "BLE [%s] scan failed, trying direct connect (cached device info)",
+                address,
+            )
+            from bleak.backends.device import BLEDevice
+
+            device = BLEDevice(address=address, name=None, rssi=0, details={})
+
+        logger.info("BLE [%s] connecting%s...", address,
+                     " (direct fallback)" if direct_fallback else "")
         try:
             self.client = await establish_connection(
                 BleakClient,
@@ -217,7 +222,7 @@ class Syncron_Ble:
                 disconnected_callback=self.client_disconnected,
                 max_attempts=5,
                 close_inactive_connections=True,
-                try_direct_first=BLUETOOTH_DIRECT_CONNECT,
+                try_direct_first=direct_fallback or BLUETOOTH_DIRECT_CONNECT,
                 validate_connection=validate_gatt_services,
                 lock_config=_lock_config,
                 escalation_policy=escalation,
