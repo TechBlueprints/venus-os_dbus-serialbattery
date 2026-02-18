@@ -44,6 +44,7 @@ class HumsiENK_Ble(Battery):
         self._last_frame_time = 0.0
         self._last_trigger_time = 0.0  # Unified polling timer (all cmds every 3s)
         self._last_heartbeat_log = 0.0
+        self._last_stale_log = 0.0
         self._last_update_log_time = 0.0
         # Wake-up trigger backoff tracking
         self._wake_trigger_attempt = 0  # Track which wake-up attempt we're on
@@ -201,9 +202,9 @@ class HumsiENK_Ble(Battery):
         Thresholds:
             <15 s   — DEBUG, internal_failure = 0
             15-60 s — INFO,  internal_failure = 0
-            1-5 m   — WARN,  internal_failure = 0
-            5-15 m  — WARN,  internal_failure = 1 (warning)
-            >15 m   — ERROR, internal_failure = 2 (alarm)
+            1-10 m  — WARN,  internal_failure = 0
+            10-30 m — WARN,  internal_failure = 1 (warning)
+            >30 m   — ERROR, internal_failure = 2 (alarm)
         Fresh data resets internal_failure to 0.
         """
         if not self._ram_state or 'timestamp' not in self._ram_state:
@@ -214,19 +215,29 @@ class HumsiENK_Ble(Battery):
         # Restore values from RAM snapshot
         self._restore_from_ram_state()
 
-        # Escalating log levels and D-Bus alarms
+        now = time.time()
+        stale_throttle = (now - self._last_stale_log) >= 60.0
+
         if age < 15:
             logger.debug(f"HumsiENK: No new data this cycle ({age:.0f}s since last)")
         elif age < 60:
-            logger.info(f"HumsiENK: No new data ({age:.0f}s since last)")
-        elif age < 300:
-            logger.warning(f"HumsiENK: Stale data ({age:.0f}s since last)")
-        elif age < 900:
-            logger.warning(f"HumsiENK: Stale data ({age:.0f}s since last), D-Bus warning")
+            if stale_throttle:
+                logger.info(f"HumsiENK: No new data ({age:.0f}s since last)")
+                self._last_stale_log = now
+        elif age < 600:
+            if stale_throttle:
+                logger.warning(f"HumsiENK: Stale data ({age:.0f}s since last)")
+                self._last_stale_log = now
+        elif age < 1800:
+            if stale_throttle:
+                logger.warning(f"HumsiENK: Stale data ({age:.0f}s since last), D-Bus warning")
+                self._last_stale_log = now
             if hasattr(self, 'protection') and self.protection is not None:
                 self.protection.internal_failure = 1
         else:
-            logger.error(f"HumsiENK: Stale data ({age:.0f}s since last), D-Bus alarm")
+            if stale_throttle:
+                logger.error(f"HumsiENK: Stale data ({age:.0f}s since last), D-Bus alarm")
+                self._last_stale_log = now
             if hasattr(self, 'protection') and self.protection is not None:
                 self.protection.internal_failure = 2
 
@@ -437,7 +448,7 @@ class HumsiENK_Ble(Battery):
         data_refreshed = False
         try:
             now_tick = time.time()
-            if (now_tick - self._last_heartbeat_log) > 60.0:
+            if (now_tick - self._last_heartbeat_log) > 900.0:
                 ble_up = bool(self.ble_handle and getattr(self.ble_handle, 'connected', False))
                 stale = now_tick - self._last_frame_time
                 logger.info(
@@ -548,8 +559,7 @@ class HumsiENK_Ble(Battery):
                     del self._rx_buffer[:total_len]
                     cmd_name = {0x00: "handshake", 0x20: "status", 0x21: "battery_info",
                                 0x22: "cell_voltages", 0x58: "config", 0xF5: "version"}.get(frame[1], f"0x{frame[1]:02X}")
-                    # Log at INFO on first frame after stale period; DEBUG otherwise
-                    if (time.time() - self._last_frame_time) > 5.0:
+                    if (time.time() - self._last_frame_time) > 60.0:
                         logger.info(f"HumsiENK: Data resumed — RX {cmd_name} ({data_len}B)")
                     else:
                         logger.debug(f"HumsiENK: RX {cmd_name} ({data_len}B)")

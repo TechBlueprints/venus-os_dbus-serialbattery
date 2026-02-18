@@ -1239,10 +1239,9 @@ class Battery(ABC):
         :return: The maximum charge current
         """
         if self.get_max_cell_voltage() is None:
-            logger.warning(
+            logger.debug(
                 "calc_max_charge_current_from_cell_voltage():"
                 + f" get_max_cell_voltage() is {self.get_max_cell_voltage()}, using default current instead."
-                + " If you don't see this warning very often, you can ignore it."
             )
             return self.max_battery_charge_current
 
@@ -1288,10 +1287,9 @@ class Battery(ABC):
         :return: The maximum discharge current
         """
         if self.get_min_cell_voltage() is None:
-            logger.warning(
+            logger.debug(
                 "calc_max_discharge_current_from_cell_voltage():"
                 + f" get_min_cell_voltage() is {self.get_min_cell_voltage()}, using default current instead."
-                + " If you don't see this warning very often, you can ignore it."
             )
             return self.max_battery_discharge_current
 
@@ -1333,13 +1331,11 @@ class Battery(ABC):
         :return: The maximum charge current
         """
         if self.get_max_temperature() is None or self.get_min_temperature() is None:
-            # Not all AioBmsBle BMS provide temperature readings
             if not self.connection_name().startswith("aiobmsble"):
-                logging.warning(
+                logging.debug(
                     "calc_max_charge_current_from_temperature():"
                     + f" get_max_temperature() is {self.get_max_temperature()} or get_min_temperature() is {self.get_min_temperature()}"
                     + ", using default current instead."
-                    + " If you don't see this warning very often, you can ignore it."
                 )
             return self.max_battery_charge_current
 
@@ -1390,13 +1386,11 @@ class Battery(ABC):
         :return: The maximum discharge current
         """
         if self.get_max_temperature() is None or self.get_min_temperature() is None:
-            # Not all AioBmsBle BMS provide temperature readings
             if not self.connection_name().startswith("aiobmsble"):
-                logging.warning(
+                logging.debug(
                     "calc_max_discharge_current_from_temperature():"
                     + f" get_max_temperature() is {self.get_max_temperature()} or get_min_temperature() is {self.get_min_temperature()}"
                     + ", using default current instead."
-                    + " If you don't see this warning very often, you can ignore it."
                 )
             return self.max_battery_discharge_current
 
