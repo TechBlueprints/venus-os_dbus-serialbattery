@@ -19,6 +19,31 @@ from ve_utils import get_vrm_portal_id  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
 
+class _CachedDbusProxy:
+    """Thin proxy around VeDbusService that skips D-Bus writes when the value is unchanged."""
+
+    __slots__ = ("_svc", "_cache")
+
+    def __init__(self, svc):
+        self._svc = svc
+        self._cache = {}
+
+    def __setitem__(self, path, value):
+        prev = self._cache.get(path, _SENTINEL)
+        if prev is not value and prev != value:
+            self._cache[path] = value
+            self._svc[path] = value
+
+    def __getitem__(self, path):
+        return self._svc[path]
+
+    def __getattr__(self, name):
+        return getattr(self._svc, name)
+
+
+_SENTINEL = object()
+
+
 class SystemBus(dbus.bus.BusConnection):
     def __new__(cls):
         return dbus.bus.BusConnection.__new__(cls, dbus.bus.BusConnection.TYPE_SYSTEM)
@@ -53,7 +78,8 @@ class DbusHelper:
             + self.battery.port[self.battery.port.rfind("/") + 1 :]
             + ("__" + str(bms_address) if bms_address is not None and bms_address != 0 else "")
         )
-        self._dbusservice: VeDbusService = VeDbusService(self._dbusname, get_bus(), register=False)
+        self._dbusservice_raw: VeDbusService = VeDbusService(self._dbusname, get_bus(), register=False)
+        self._dbusservice = _CachedDbusProxy(self._dbusservice_raw)
         self.bms_id: str = (
             "".join(
                 # remove all non alphanumeric characters except underscore from the identifier
