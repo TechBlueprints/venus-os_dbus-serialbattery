@@ -703,7 +703,7 @@ class HumsiENK_Ble(Battery):
         """
         Parse command 0x21 response (Battery Info) - 26 bytes.
         
-        Field layout confirmed from APK (Ve function) and live device data:
+        Field layout confirmed from vendor protocol references and live device data:
             vol (4 bytes): Battery voltage in mV (millivolts)
             ele (4 bytes): Current in mA (milliamps), signed 32-bit
             SOC (1 byte): State of Charge %
@@ -734,7 +734,7 @@ class HumsiENK_Ble(Battery):
             idx += 4
             
             # Current (4 bytes, milliamps signed → divide by 1000 for A)
-            # APK: e.ele > 2147483647 && (e.ele = -(4294967296 - e.ele))
+            # Vendor formula: e.ele > 2147483647 && (e.ele = -(4294967296 - e.ele))
             current_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=True)
             self.current = current_raw / 1000.0
             idx += 4
@@ -748,13 +748,13 @@ class HumsiENK_Ble(Battery):
             idx += 1
             
             # Remaining capacity (4 bytes, mAh → divide by 1000 for Ah)
-            # APK: r.info.capacity1 = (r.info.capacity / 1e3).toFixed(2)
+            # Vendor formula: r.info.capacity1 = (r.info.capacity / 1e3).toFixed(2)
             capacity_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=False)
             self.capacity_remain = capacity_raw / 1000.0
             idx += 4
             
             # Total capacity (4 bytes, mAh → divide by 1000 for Ah)
-            # APK: r.info.allCapacity1 = (r.info.allCapacity / 1e3).toFixed(2)
+            # Vendor formula: r.info.allCapacity1 = (r.info.allCapacity / 1e3).toFixed(2)
             total_capacity_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=False)
             if total_capacity_raw > 0:
                 self.capacity = total_capacity_raw / 1000.0
@@ -765,8 +765,8 @@ class HumsiENK_Ble(Battery):
             idx += 2
             
             # Temperatures (6 × 1 byte, direct °C, signed byte)
-            # APK field names: t1, t2, t3, t4, MOS, environment (each 1 byte)
-            # APK display: raw > 127 ? raw - 256 : raw (signed byte for sub-zero temps)
+            # Vendor field names: t1, t2, t3, t4, MOS, environment (each 1 byte)
+            # Vendor display: raw > 127 ? raw - 256 : raw (signed byte for sub-zero temps)
             def _signed_byte(b):
                 return b if b < 128 else b - 256
             
@@ -863,7 +863,7 @@ class HumsiENK_Ble(Battery):
             Bytes 8-10: Cell balance status (24-bit bitmap)
             Bytes 11-13: Cell disconnect status (24-bit bitmap)
         
-        Operation Status Alarm/Protection Bits (from APK analysis):
+        Operation Status Alarm/Protection Bits (from vendor protocol analysis):
         
         CHARGE SECTION (Bits 0-15):
           Bit 0:  Charge overcurrent protection
@@ -1030,7 +1030,7 @@ class HumsiENK_Ble(Battery):
             
             # Cell disconnect status (bytes 11-13) - 24-bit bitmap
             # This indicates if any cells are physically disconnected (faulty connections, broken wires)
-            # NOTE: The official APK parses this field but never displays it!
+            # NOTE: The official vendor app parses this field but never displays it!
             # We implement it anyway for critical safety monitoring.
             if len(data) >= 14:
                 cell_disconnect = int.from_bytes(data[11:14], 'little', signed=False)
@@ -1143,7 +1143,7 @@ class HumsiENK_Ble(Battery):
             idx += 2
             
             # Temperature protection limits (raw values in deciKelvin)
-            # APK formula: (raw - 2731) / 10 → °C
+            # Vendor formula: (raw - 2731) / 10 → °C
             # (confirmed at app-service-pretty.js line 7870)
             def _dk_to_c(raw):
                 return (raw - 2731) / 10.0
