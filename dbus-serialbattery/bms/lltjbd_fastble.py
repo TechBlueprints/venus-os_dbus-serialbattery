@@ -1215,7 +1215,7 @@ class LltJbd_FastBle(LltJbd):
                     pass
                 if self._prefer_alt_once:
                     self._prefer_alt_once = False
-                # Use write-without-response for all commands (matching Android app behavior)
+                # Use write-without-response for all commands (matching vendor app behavior)
                 try:
                     write_type = 'command'  # Always use write-without-response
                     opts = dbus.Dictionary({'type': dbus.String(write_type)}, signature='sv')
@@ -1502,7 +1502,7 @@ class LltJbd_FastBle(LltJbd):
             logger.warning(f"|  init: 0xFA initialization failed: {e}")
 
     async def _maybe_do_handshake(self) -> None:
-        # HCI capture shows Android app sends 0xFA commands, but BMS sends spontaneous data
+        # HCI capture shows vendor app sends 0xFA commands, but BMS sends spontaneous data
         # continuously, so we don't need any initialization - just let regular polling handle it
         try:
             logger.info("|  init: Skipping init sequence (BMS sends spontaneous data)")
