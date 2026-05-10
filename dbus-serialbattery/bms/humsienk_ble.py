@@ -1,5 +1,26 @@
 # -*- coding: utf-8 -*-
 
+"""HumsiENK BLE battery driver.
+
+Read-only driver for HumsiENK BLE batteries, using the existing
+utils_ble.Syncron_Ble helper for BLE I/O.
+
+The HumsiENK BLE wire protocol — GATT service / characteristic UUIDs,
+[0xAA, CMD, LEN, DATA, CHK_LO, CHK_HI] frame format, command codes,
+register maps for the 0x21 / 0x20 / 0x22 / 0x58 responses, and the
+operation_status bit definitions — is documented in the aiobmsble
+project:
+
+  https://github.com/patman15/aiobmsble/blob/main/docs/humsienk_bms.md
+  https://github.com/patman15/aiobmsble/blob/main/aiobmsble/bms/humsienk_bms.py
+
+The same protocol was contributed to aiobmsble in parallel with this
+driver; the two implementations decode the same frames. This driver
+exists for users who want a standalone driver via the serialbatteries
+Syncron_Ble path while the aiobmsble integration in serialbatteries is
+being worked through separately.
+"""
+
 from battery import Battery, Cell
 import time
 import json
