@@ -313,13 +313,14 @@ def serial_communication_patches(
 ) -> Generator[tuple[MagicMock, MagicMock], None, None]:
     """Context manager for common patches."""
     with patch("bms.lltjbd_up16s.UP16S_REQUIRE_DIRECT_CONNECTION", require_direct_connection):
-        with patch("serial.Serial") as mock_serial_class:
-            mock_serial_class.return_value.__enter__.return_value = mock_serial
-            with patch("bms.lltjbd_up16s.read_serialport_data") as mock_read_serialport_data:
-                mock_read_serialport_data.side_effect = read_serialport_data_emulator if responses is None else responses
-                with patch("termios.tcgetattr", side_effect=lambda _: [0, 0, termios.CS8, 0, termios.B9600, termios.B9600]):
-                    with patch("time.sleep"):
-                        yield mock_read_serialport_data
+        with patch("bms.lltjbd_up16s.USE_BMS_DVCC_VALUES", True):
+            with patch("serial.Serial") as mock_serial_class:
+                mock_serial_class.return_value.__enter__.return_value = mock_serial
+                with patch("bms.lltjbd_up16s.read_serialport_data") as mock_read_serialport_data:
+                    mock_read_serialport_data.side_effect = read_serialport_data_emulator if responses is None else responses
+                    with patch("termios.tcgetattr", side_effect=lambda _: [0, 0, termios.CS8, 0, termios.B9600, termios.B9600]):
+                        with patch("time.sleep"):
+                            yield mock_read_serialport_data
 
 
 # =============================================================================
@@ -729,7 +730,7 @@ class TestRefreshData:
         on which master is able to forward this data from slaves."""
         TestRefreshData.verify_charge_cycles_and_total_ah_drawn_are_added_once_to_calculation_exclusions_list(battery)
         TestRefreshData.verify_soc_is_high_resolution(battery)
-        assert battery.history.total_ah_drawn == pytest.approx(-791.4)
+        assert battery.history.total_ah_drawn == pytest.approx(791.4)
         # Verifies that the unique identifier is in the non-fallback format (since the proper unique serial number could be retrieved)
         assert battery.unique_identifier() == "UP16S015000000000000000000"
 

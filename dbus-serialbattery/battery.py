@@ -116,27 +116,27 @@ class History:
         """
         Deepest discharge in Ampere hours (lifetime).
         Overwritten each time the battery discharges deeper.
-        **Should be negative.**
+        Stored as positive; published as negative to dbus.
         """
 
         self.last_discharge: float = None
         """
         Last discharge in Ampere hours until the battery was charged again.
-        **Should be negative.**
+        Stored as positive; published as negative to dbus.
         """
 
         self.average_discharge: float = None
         """
         Average discharge in Ampere hours.
         Cumulative Ah drawn divided by total cycles.
-        **Should be negative.**
+        Stored as positive; published as negative to dbus.
         """
 
         self.total_ah_drawn: float = None
         """
         Total Ah drawn (lifetime).
         Cumulative Amp hours drawn from the battery.
-        **Should be negative.**
+        Stored as positive; published as negative to dbus.
         """
 
         # Charge
@@ -150,6 +150,12 @@ class History:
         self.timestamp_last_full_charge: int = None
         """
         Timestamp of full charge.
+        """
+
+        self.automatic_syncs: int = None
+        """
+        Number of automatic synchronisations (lifetime).
+        Incremented each time the battery reaches full charge.
         """
 
         self.full_discharges: int = None
@@ -216,7 +222,7 @@ class History:
         Total charged energy in Kilowatt-hour.
         """
 
-    def reset_values(self, attributes: list = []) -> None:
+    def reset_values(self, attributes: list = None) -> None:
         """
         Reset all calculated values that are not excluded.
 
@@ -231,6 +237,7 @@ class History:
                 "total_ah_drawn",
                 "charge_cycles",
                 "timestamp_last_full_charge",
+                "automatic_syncs",
                 "full_discharges",
                 "minimum_voltage",
                 "maximum_voltage",
@@ -301,7 +308,7 @@ class Battery(ABC):
         # max battery charge/discharge current
         self.max_battery_charge_current: float = utils.MAX_BATTERY_CHARGE_CURRENT
         self.max_battery_discharge_current: float = utils.MAX_BATTERY_DISCHARGE_CURRENT
-        self.has_settings: bool = False
+        self.has_settings: bool = True if utils.SOC_CALCULATION else False
 
         # this values should only be initialized once,
         # else the BMS turns off the inverter on disconnect
@@ -339,6 +346,7 @@ class Battery(ABC):
         self.cells: List[Cell] = []
         self.control_voltage: float = None
         self.control_voltage_last_limit_time: int = None
+        self.control_voltage_ramp_base: float = None
         self.soc_reset_requested: bool = False
         self.soc_reset_last_reached: int = 0  # save state to preserve on restart
         self.soc_reset_battery_voltage: int = None
@@ -356,6 +364,12 @@ class Battery(ABC):
         self.linear_cvl_last_set: int = 0
         self.linear_ccl_last_set: int = 0
         self.linear_dcl_last_set: int = 0
+        self.ccl_hold_start_time: int = None
+        self.ccl_ramp_start_time: int = None
+        self.ccl_ramp_start_value: float = None
+        self.dcl_hold_start_time: int = None
+        self.dcl_ramp_start_time: int = None
+        self.dcl_ramp_start_value: float = None
         self.heating: bool = None
         self.heater_current: float = None
         self.heater_power: float = None
@@ -381,6 +395,8 @@ class Battery(ABC):
 
         # list of available callbacks, in order to display the buttons in the GUI
         self.callbacks_available: List[str] = []
+        if utils.SOC_CALCULATION:
+            self.callbacks_available.append("callback_soc_reset_to")
 
         # display errors in the GUI
         # https://github.com/victronenergy/veutil/blob/master/inc/veutil/ve_regs_payload.h
@@ -661,7 +677,6 @@ class Battery(ABC):
         if (
             utils.SOC_RESET_AFTER_DAYS is not False
             and self.soc_reset_requested is False
-            and self.allow_max_voltage
             and (self.soc_reset_last_reached == 0 or utils.SOC_RESET_AFTER_DAYS < soc_reset_last_reached_days_ago)
         ):
             self.soc_reset_requested = True
@@ -832,12 +847,14 @@ class Battery(ABC):
                 # Set control voltage immediately, if not reduced by the controller
                 if control_voltage >= self.max_battery_voltage and self.control_voltage_last_limit_time is None:
                     self.control_voltage = round(self.max_battery_voltage, 6)
+                    self.control_voltage_ramp_base = None
 
-                # Set control voltage immediately, if control voltage is lower then previous control voltage
+                # Set control voltage immediately, if control voltage is lower than previous control voltage
                 # or if it remains the same
                 elif self.control_voltage is None or control_voltage <= self.control_voltage:
                     self.control_voltage_last_limit_time = current_time
                     self.control_voltage = round(control_voltage, 6)
+                    self.control_voltage_ramp_base = None
                     self.charge_mode += " (Cell OVP)"  # Cell over voltage protection
 
                 # Slowly recover
@@ -848,19 +865,28 @@ class Battery(ABC):
 
                     seconds_since_limit = current_time - self.control_voltage_last_limit_time
                     # Calculate the allowed recovery voltage
-                    if seconds_since_limit < 60:
-                        allowed_voltage = self.control_voltage  # hold voltage steady
+                    if seconds_since_limit < utils.CVL_RECOVERY_HOLD_SEC:
+                        # Hold: continuously update ramp_base so it equals the held voltage when ramp starts
+                        self.control_voltage_ramp_base = self.control_voltage
+                        allowed_voltage = self.control_voltage
                         self.charge_mode += " (Cell OVP)"  # Cell over voltage protection
                     else:
-                        allowed_voltage = min(
-                            self.control_voltage + VOLTAGE_STEP_PER_SECOND * (seconds_since_limit - 60),
-                            self.max_battery_voltage,
-                        )
+                        # Ramp: use the voltage captured at hold-end as a fixed base to avoid quadratic growth
+                        if self.control_voltage_ramp_base is None:
+                            self.control_voltage_ramp_base = self.control_voltage
+                        if utils.CVL_RECOVERY_RATE_V_PER_SEC <= 0:
+                            allowed_voltage = min(control_voltage, self.max_battery_voltage)
+                        else:
+                            allowed_voltage = min(
+                                self.control_voltage_ramp_base + utils.CVL_RECOVERY_RATE_V_PER_SEC * (seconds_since_limit - utils.CVL_RECOVERY_HOLD_SEC),
+                                self.max_battery_voltage,
+                            )
                         self.charge_mode += " (Cell OVP*)"  # Cell over voltage protection
 
-                    # If control voltage is the same as max battery voltage, reset control_voltage_last_limit_time
+                    # If control voltage reached max battery voltage, reset timers
                     if allowed_voltage == self.max_battery_voltage:
-                        self.control_voltage_last_limit_time is None
+                        self.control_voltage_last_limit_time = None
+                        self.control_voltage_ramp_base = None
 
                     self.control_voltage = round(allowed_voltage, 6)
 
@@ -898,6 +924,13 @@ class Battery(ABC):
                         # Set timestamp of full charge for history
                         if "timestamp_last_full_charge" not in self.history.exclude_values_to_calculate:
                             self.history.timestamp_last_full_charge = int(time())
+
+                        # Increment synchronisation count for history
+                        if "automatic_syncs" not in self.history.exclude_values_to_calculate:
+                            if self.history.automatic_syncs is None:
+                                self.history.automatic_syncs = 1
+                            else:
+                                self.history.automatic_syncs += 1
 
                         if utils.SOC_CALCULATION:
                             logger.info("SOC set to 100%")
@@ -978,7 +1011,7 @@ class Battery(ABC):
                             "soc_reset_last_reached: "
                             + ("Never" if self.soc_reset_last_reached == 0 else f"{soc_reset_days_ago} d ago")
                             + ", next "
-                            + (" already planned" if soc_reset_in_days < 0 else f"in {soc_reset_in_days} d")
+                            + ("already planned" if soc_reset_in_days < 0 else f"in {soc_reset_in_days} d")
                             + "\n"
                         )
                         if utils.SOC_RESET_AFTER_DAYS is not False
@@ -1106,27 +1139,69 @@ class Battery(ABC):
         - after CVL_RECALCULATION_EVERY passed
         - if CCL changes to 0
         - if CCL changes more than CVL_RECALCULATION_ON_MAX_PERCENTAGE_CHANGE
+        - if CCL is recovering (ramp bypasses throttle for per-cycle updates)
         """
         ccl = round(min(charge_limits), 3)
         diff = abs(self.control_charge_current - ccl) if self.control_charge_current is not None else 0
+        recovering_ccl = self.control_charge_current is not None and ccl > self.control_charge_current
         if (
-            int(time()) - self.linear_ccl_last_set >= utils.CVL_RECALCULATION_EVERY
-            or (diff >= self.control_charge_current * utils.CVL_RECALCULATION_ON_MAX_PERCENTAGE_CHANGE / 100)
+            recovering_ccl  # always update during recovery so the ramp progresses every cycle
+            or int(time()) - self.linear_ccl_last_set >= utils.CVL_RECALCULATION_EVERY
+            or (diff >= (self.control_charge_current or 0) * utils.CVL_RECALCULATION_ON_MAX_PERCENTAGE_CHANGE / 100)
             or (ccl == 0 and self.control_charge_current != 0)
         ):
             self.linear_ccl_last_set = int(time())
 
-            # Introduce a threshold mechanism to prevent flapping
             if ccl == 0:
+                # Hard stop - always immediate, cancel hold and ramp
+                self.control_charge_current = 0
+                self.charge_limitation = charge_limits[min(charge_limits)]
+                self.ccl_hold_start_time = None
+                self.ccl_ramp_start_time = None
+                self.ccl_ramp_start_value = None
+            elif not recovering_ccl:
+                # Restriction or no change - apply immediately, cancel hold and ramp
                 self.control_charge_current = ccl
                 self.charge_limitation = charge_limits[min(charge_limits)]
+                self.ccl_hold_start_time = None
+                self.ccl_ramp_start_time = None
+                self.ccl_ramp_start_value = None
             else:
-                # Don't allow recovery if the new allowed current is smaller than 1% of the previous allowed current
+                # Recovery (ccl > current) - check threshold, then hold, then ramp
                 if self.control_charge_current == 0 and ccl < utils.MAX_BATTERY_CHARGE_CURRENT * utils.CHARGE_CURRENT_RECOVERY_THRESHOLD_PERCENT:
+                    # Below threshold - stay at 0, don't start hold yet
                     self.charge_limitation = charge_limits[min(charge_limits)] + " *"
+                    self.ccl_hold_start_time = None
+                    self.ccl_ramp_start_time = None
+                    self.ccl_ramp_start_value = None
                 else:
-                    self.control_charge_current = ccl
-                    self.charge_limitation = charge_limits[min(charge_limits)]
+                    if self.ccl_hold_start_time is None:
+                        self.ccl_hold_start_time = int(time())
+                    seconds_since_recovery = int(time()) - self.ccl_hold_start_time
+                    if seconds_since_recovery < utils.CCL_RECOVERY_HOLD_SEC:
+                        # Hold period - wait for condition to stabilize before ramping
+                        self.charge_limitation = charge_limits[min(charge_limits)] + " *"
+                        self.ccl_ramp_start_time = None
+                        self.ccl_ramp_start_value = None
+                    else:
+                        if utils.CCL_RECOVERY_RATE_A_PER_SEC <= 0:
+                            # Instant recovery (ramp disabled)
+                            new_ccl = ccl
+                            self.ccl_hold_start_time = None
+                            self.ccl_ramp_start_time = None
+                            self.ccl_ramp_start_value = None
+                        else:
+                            if self.ccl_ramp_start_time is None:
+                                self.ccl_ramp_start_time = int(time())
+                                self.ccl_ramp_start_value = self.control_charge_current or 0
+                            elapsed = int(time()) - self.ccl_ramp_start_time
+                            new_ccl = round(min(ccl, self.ccl_ramp_start_value + utils.CCL_RECOVERY_RATE_A_PER_SEC * elapsed), 3)
+                            if new_ccl >= ccl:
+                                self.ccl_hold_start_time = None
+                                self.ccl_ramp_start_time = None
+                                self.ccl_ramp_start_value = None
+                        self.control_charge_current = new_ccl
+                        self.charge_limitation = charge_limits[min(charge_limits)]
 
         # set allow to charge to no, if CCL is 0
         if self.control_charge_current == 0:
@@ -1204,27 +1279,69 @@ class Battery(ABC):
         - after CVL_RECALCULATION_EVERY passed
         - if DCL changes to 0
         - if DCL changes more than CVL_RECALCULATION_ON_MAX_PERCENTAGE_CHANGE
+        - if DCL is recovering (ramp bypasses throttle for per-cycle updates)
         """
         dcl = round(min(discharge_limits), 3)
         diff = abs(self.control_discharge_current - dcl) if self.control_discharge_current is not None else 0
+        recovering_dcl = self.control_discharge_current is not None and dcl > self.control_discharge_current
         if (
-            int(time()) - self.linear_dcl_last_set >= utils.CVL_RECALCULATION_EVERY
-            or (diff >= self.control_discharge_current * utils.CVL_RECALCULATION_ON_MAX_PERCENTAGE_CHANGE / 100)
+            recovering_dcl  # always update during recovery so the ramp progresses every cycle
+            or int(time()) - self.linear_dcl_last_set >= utils.CVL_RECALCULATION_EVERY
+            or (diff >= (self.control_discharge_current or 0) * utils.CVL_RECALCULATION_ON_MAX_PERCENTAGE_CHANGE / 100)
             or (dcl == 0 and self.control_discharge_current != 0)
         ):
             self.linear_dcl_last_set = int(time())
 
-            # Introduce a threshold mechanism to prevent flapping
             if dcl == 0:
+                # Hard stop - always immediate, cancel hold and ramp
+                self.control_discharge_current = 0
+                self.discharge_limitation = discharge_limits[min(discharge_limits)]
+                self.dcl_hold_start_time = None
+                self.dcl_ramp_start_time = None
+                self.dcl_ramp_start_value = None
+            elif not recovering_dcl:
+                # Restriction or no change - apply immediately, cancel hold and ramp
                 self.control_discharge_current = dcl
                 self.discharge_limitation = discharge_limits[min(discharge_limits)]
+                self.dcl_hold_start_time = None
+                self.dcl_ramp_start_time = None
+                self.dcl_ramp_start_value = None
             else:
-                # Don't allow recovery if the new allowed current is smaller than 1% of the previous allowed current
+                # Recovery (dcl > current) - check threshold, then hold, then ramp
                 if self.control_discharge_current == 0 and dcl < utils.MAX_BATTERY_DISCHARGE_CURRENT * utils.DISCHARGE_CURRENT_RECOVERY_THRESHOLD_PERCENT:
+                    # Below threshold - stay at 0, don't start hold yet
                     self.discharge_limitation = discharge_limits[min(discharge_limits)] + " *"
+                    self.dcl_hold_start_time = None
+                    self.dcl_ramp_start_time = None
+                    self.dcl_ramp_start_value = None
                 else:
-                    self.control_discharge_current = dcl
-                    self.discharge_limitation = discharge_limits[min(discharge_limits)]
+                    if self.dcl_hold_start_time is None:
+                        self.dcl_hold_start_time = int(time())
+                    seconds_since_recovery = int(time()) - self.dcl_hold_start_time
+                    if seconds_since_recovery < utils.DCL_RECOVERY_HOLD_SEC:
+                        # Hold period - wait for condition to stabilize before ramping
+                        self.discharge_limitation = discharge_limits[min(discharge_limits)] + " *"
+                        self.dcl_ramp_start_time = None
+                        self.dcl_ramp_start_value = None
+                    else:
+                        if utils.DCL_RECOVERY_RATE_A_PER_SEC <= 0:
+                            # Instant recovery (ramp disabled)
+                            new_dcl = dcl
+                            self.dcl_hold_start_time = None
+                            self.dcl_ramp_start_time = None
+                            self.dcl_ramp_start_value = None
+                        else:
+                            if self.dcl_ramp_start_time is None:
+                                self.dcl_ramp_start_time = int(time())
+                                self.dcl_ramp_start_value = self.control_discharge_current or 0
+                            elapsed = int(time()) - self.dcl_ramp_start_time
+                            new_dcl = round(min(dcl, self.dcl_ramp_start_value + utils.DCL_RECOVERY_RATE_A_PER_SEC * elapsed), 3)
+                            if new_dcl >= dcl:
+                                self.dcl_hold_start_time = None
+                                self.dcl_ramp_start_time = None
+                                self.dcl_ramp_start_value = None
+                        self.control_discharge_current = new_dcl
+                        self.discharge_limitation = discharge_limits[min(discharge_limits)]
 
         # set allow to discharge to no, if DCL is 0
         if self.control_discharge_current == 0:
@@ -1322,7 +1439,7 @@ class Battery(ABC):
             file = exception_traceback.tb_frame.f_code.co_filename
             line = exception_traceback.tb_lineno
             logger.error(f"Non blocking exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
-            return self.max_battery_charge_current
+            return self.max_battery_discharge_current
 
     def calc_max_charge_current_from_temperature(self) -> float:
         """
@@ -1331,6 +1448,7 @@ class Battery(ABC):
         :return: The maximum charge current
         """
         if self.get_max_temperature() is None or self.get_min_temperature() is None:
+            # Not all AioBmsBle BMS provide temperature readings
             if not self.connection_name().startswith("aiobmsble"):
                 logging.debug(
                     "calc_max_charge_current_from_temperature():"
@@ -1386,6 +1504,7 @@ class Battery(ABC):
         :return: The maximum discharge current
         """
         if self.get_max_temperature() is None or self.get_min_temperature() is None:
+            # Not all AioBmsBle BMS provide temperature readings
             if not self.connection_name().startswith("aiobmsble"):
                 logging.debug(
                     "calc_max_discharge_current_from_temperature():"
@@ -1680,15 +1799,27 @@ class Battery(ABC):
     def get_capacity_remain(self) -> Union[float, None]:
         """
         Get the remaining capacity of the battery.
-        Use `self.capacity_remain` if it is set, otherwise calculate it using `self.capacity` and `self.soc_calc`.
+        When SOC_CALCULATION is enabled, derive from soc_calc so the displayed Ah matches the calculated SOC.
+        Otherwise use the BMS-reported value, falling back to soc_calc if the BMS does not provide it.
 
         :return: The remaining capacity of the battery
         """
+        if utils.SOC_CALCULATION and self.capacity is not None and self.soc_calc is not None:
+            return self.capacity * self.soc_calc / 100
         if self.capacity_remain is not None:
             return self.capacity_remain
         if self.capacity is not None and self.soc_calc is not None:
             return self.capacity * self.soc_calc / 100
         return None
+
+    def get_capacity_remain_bms(self) -> Union[float, None]:
+        """
+        Get the BMS-reported remaining capacity, regardless of SOC_CALCULATION.
+        Used to expose the raw BMS value alongside the calculated value for comparison.
+
+        :return: The BMS-reported remaining capacity, or None if not available
+        """
+        return self.capacity_remain
 
     def get_capacity_consumed(self) -> Union[float, None]:
         """
@@ -1699,6 +1830,17 @@ class Battery(ABC):
         if self.capacity is not None and self.get_capacity_remain() is not None:
             return abs(self.capacity - self.get_capacity_remain()) * -1
 
+        return None
+
+    def get_capacity_consumed_bms(self) -> Union[float, None]:
+        """
+        Get the BMS-reported consumed capacity, regardless of SOC_CALCULATION.
+        Used to expose the raw BMS value alongside the calculated value for comparison.
+
+        :return: The BMS-reported consumed capacity, or None if not available
+        """
+        if self.capacity is not None and self.get_capacity_remain_bms() is not None:
+            return abs(self.capacity - self.get_capacity_remain_bms()) * -1
         return None
 
     def get_time_to_soc(self, soc_target: float, percent_per_second: float, only_number: bool = False) -> str:
@@ -1783,25 +1925,33 @@ class Battery(ABC):
 
         :return: The voltage of the cell with the lowest voltage
         """
+        cell_voltage_max = utils.MAX_CELL_VOLTAGE * 2
         min_voltage = None
         if hasattr(self, "cell_min_voltage"):
             min_voltage = self.cell_min_voltage
+            if min_voltage is not None and min_voltage > cell_voltage_max:
+                logger.warning(f"Implausible cell_min_voltage {min_voltage} V detected, ignoring")
+                min_voltage = None
 
         if min_voltage is None:
             try:
-                min_voltage = min(c.voltage for c in self.cells if c.voltage is not None)
+                min_voltage = min(c.voltage for c in self.cells if c.voltage is not None and c.voltage <= cell_voltage_max)
             except ValueError:
                 pass
         return min_voltage
 
     def get_max_cell_voltage(self) -> Union[float, None]:
+        cell_voltage_max = utils.MAX_CELL_VOLTAGE * 2
         max_voltage = None
         if hasattr(self, "cell_max_voltage"):
             max_voltage = self.cell_max_voltage
+            if max_voltage is not None and max_voltage > cell_voltage_max:
+                logger.warning(f"Implausible cell_max_voltage {max_voltage} V detected, ignoring")
+                max_voltage = None
 
         if max_voltage is None:
             try:
-                max_voltage = max(c.voltage for c in self.cells if c.voltage is not None)
+                max_voltage = max(c.voltage for c in self.cells if c.voltage is not None and c.voltage <= cell_voltage_max)
             except ValueError:
                 pass
         return max_voltage
@@ -2050,6 +2200,15 @@ class Battery(ABC):
                 # use current as it is
                 current = self.current
 
+        # When a FET is off, the BMS physically blocks that direction of current flow.
+        # Clamp to prevent calibration offsets from reporting non-physical current.
+        # Convention: negative = discharge, positive = charge.
+        if current is not None:
+            if self.discharge_fet is False:
+                current = max(0.0, current)
+            if self.charge_fet is False:
+                current = min(0.0, current)
+
         self.current_calc_last_time = current_time
         return current
 
@@ -2287,12 +2446,13 @@ class Battery(ABC):
         Calculate missing values based on the history data
         """
         if "deepest_discharge" not in self.history.exclude_values_to_calculate and self.get_capacity_consumed() is not None:
-            # Has to be negative
-            if self.history.deepest_discharge is None or self.history.deepest_discharge > self.get_capacity_consumed():
-                self.history.deepest_discharge = self.get_capacity_consumed()
+            # Stored as positive; negated to negative when published to dbus
+            capacity_consumed = abs(self.get_capacity_consumed())
+            if self.history.deepest_discharge is None or self.history.deepest_discharge < capacity_consumed:
+                self.history.deepest_discharge = capacity_consumed
 
         if "last_discharge" not in self.history.exclude_values_to_calculate:
-            # Has to be negative
+            # Stored as positive; negated to negative when published to dbus
             if self.history.last_discharge is None:
                 self.history.last_discharge = 0
             elif self.current_avg is not None:
@@ -2305,7 +2465,7 @@ class Battery(ABC):
             if self.history.full_discharges is None:
                 self.history.full_discharges = 0
             else:
-                if self.soc_calc == 0:
+                if self.soc_calc == 0 and not self.full_discharge_active:
                     self.history.full_discharges += 1
                     self.full_discharge_active = True
 
@@ -2313,11 +2473,11 @@ class Battery(ABC):
                     self.full_discharge_active = False
 
         if "total_ah_drawn" not in self.history.exclude_values_to_calculate:
-            # Has to be negative
+            # Stored as positive; negated to negative when published to dbus
             if self.history.total_ah_drawn is None:
                 # Check if charge_cycles are already available from BMS
                 if self.history.charge_cycles is not None and self.history.charge_cycles > 0 and self.capacity is not None and self.capacity > 0:
-                    self.history.total_ah_drawn = self.history.charge_cycles * self.capacity * -1
+                    self.history.total_ah_drawn = self.history.charge_cycles * self.capacity
                 else:
                     self.history.total_ah_drawn = 0
             elif self.charge_discharged is not None:
@@ -2330,7 +2490,7 @@ class Battery(ABC):
                 self.history.charge_cycles = self.history.total_ah_drawn / self.capacity
 
         if "average_discharge" not in self.history.exclude_values_to_calculate:
-            # Has to be negative
+            # Stored as positive; negated to negative when published to dbus
             if self.history.total_ah_drawn is not None and self.history.charge_cycles is not None and self.history.charge_cycles > 0:
                 self.history.average_discharge = self.history.total_ah_drawn / self.history.charge_cycles
 
@@ -2418,7 +2578,7 @@ class Battery(ABC):
             # Reset voltage history values
             3: ["minimum_voltage", "maximum_voltage", "minimum_cell_voltage", "maximum_cell_voltage"],
             # Reset time history values
-            4: ["timestamp_last_full_charge"],
+            4: ["timestamp_last_full_charge", "automatic_syncs"],
             # Reset alarm history values
             5: ["low_voltage_alarms", "high_voltage_alarms"],
             # Reset temperature history values

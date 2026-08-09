@@ -10,6 +10,7 @@ from utils import (
     open_serial_port,
     logger,
     AUTO_RESET_SOC,
+    SOC_CALCULATION,
     BATTERY_CAPACITY,
     INVERT_CURRENT_MEASUREMENT,
     MIN_CELL_VOLTAGE,
@@ -334,41 +335,43 @@ class Daly(Battery):
         else:
             self.protection.low_temperature = 0
 
-        # if al_crnt_soc & 2:
-        #    # High charge current - Alarm
-        #    self.protection.high_charge_current = 2
-        # elif al_crnt_soc & 1:
-        #    # High charge current - Pre-alarm
-        #    self.protection.high_charge_current = 1
-        # else:
-        #    self.protection.high_charge_current = 0
+        # When INVERT_CURRENT_MEASUREMENT == -1 the BMS's charge/discharge
+        # polarity is swapped relative to the driver's convention, so the
+        # alarm bits must be mapped accordingly.
+        if INVERT_CURRENT_MEASUREMENT == -1:
+            charge_alarm_bit, charge_prealarm_bit = 8, 4
+            discharge_alarm_bit, discharge_prealarm_bit = 2, 1
+        else:
+            charge_alarm_bit, charge_prealarm_bit = 2, 1
+            discharge_alarm_bit, discharge_prealarm_bit = 8, 4
 
-        # if al_crnt_soc & 8:
-        #    # High discharge current - Alarm
-        #    self.protection.high_charge_current = 2
-        # elif al_crnt_soc & 4:
-        #    # High discharge current - Pre-alarm
-        #    self.protection.high_charge_current = 1
-        # else:
-        #    self.protection.high_charge_current = 0
-
-        if al_crnt_soc & 2 or al_crnt_soc & 8:
-            # High charge/discharge current - Alarm
+        if al_crnt_soc & charge_alarm_bit:
+            # High charge current - Alarm
             self.protection.high_charge_current = 2
-        elif al_crnt_soc & 1 or al_crnt_soc & 4:
-            # High charge/discharge current - Pre-alarm
+        elif al_crnt_soc & charge_prealarm_bit:
+            # High charge current - Pre-alarm
             self.protection.high_charge_current = 1
         else:
             self.protection.high_charge_current = 0
 
-        if al_crnt_soc & 128:
-            # Low SoC - Alarm
-            self.protection.low_soc = 2
-        elif al_crnt_soc & 64:
-            # Low SoC Warning level - Pre-alarm
-            self.protection.low_soc = 1
+        if al_crnt_soc & discharge_alarm_bit:
+            # High discharge current - Alarm
+            self.protection.high_discharge_current = 2
+        elif al_crnt_soc & discharge_prealarm_bit:
+            # High discharge current - Pre-alarm
+            self.protection.high_discharge_current = 1
         else:
-            self.protection.low_soc = 0
+            self.protection.high_discharge_current = 0
+
+        if not SOC_CALCULATION:
+            if al_crnt_soc & 128:
+                # Low SoC - Alarm
+                self.protection.low_soc = 2
+            elif al_crnt_soc & 64:
+                # Low SoC Warning level - Pre-alarm
+                self.protection.low_soc = 1
+            else:
+                self.protection.low_soc = 0
 
         return True
 
@@ -388,7 +391,7 @@ class Daly(Battery):
 
         if cells_volts_data is False and self.cells_volts_data_lastreadbad is True:
             # if this read out and the last one were bad, report error.
-            # (we don't report single errors, as current daly firmware sends corrupted cells volts data occassionally)
+            # (we don't report single errors, as current daly firmware sends corrupted cells volts data occasionally)
             logger.debug("No or invalid data has been received repeatedly in read_cells_volts()")
             return False
         elif cells_volts_data is False:
@@ -500,7 +503,7 @@ class Daly(Battery):
             logger.debug("No data received in read_capacity()")
             return False
 
-        (capacity, cell_volt) = unpack_from(">LL", capa_data)
+        capacity, cell_volt = unpack_from(">LL", capa_data)
 
         if capacity is not None and capacity > 0:
             self.capacity = capacity / 1000
@@ -516,7 +519,7 @@ class Daly(Battery):
             logger.debug("No data received in read_production_date()")
             return False
 
-        (_, _, year, month, day) = unpack_from(">BBBBB", production)
+        _, _, year, month, day = unpack_from(">BBBBB", production)
         self.production = f"{year + 2000}{month:02d}{day:02d}"
         return True
 
@@ -716,7 +719,7 @@ class Daly(Battery):
 
     def read_sentence(self, ser, expected_reply, timeout=0.5):
         """read one 13 byte sentence from daly smart bms.
-        return false if less than 13 bytes received in timeout secs, or frame errors occured
+        return false if less than 13 bytes received in timeout secs, or frame errors occurred
         return received datasection as bytearray else
         """
         time_start = time()

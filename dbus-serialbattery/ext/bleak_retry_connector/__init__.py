@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "4.5.0"
+__version__ = "4.6.0"
 
 
 import asyncio
@@ -201,6 +201,21 @@ class BleakClientWithServiceCache(BleakClient):
             return await super().clear_cache()
         _LOGGER.warning("clear_cache not implemented in bleak version")
         return False
+
+    async def set_connection_params(
+        self,
+        min_interval: int,
+        max_interval: int,
+        latency: int,
+        timeout: int,
+    ) -> None:
+        """Set BLE connection parameters."""
+        if hasattr(super(), "set_connection_params"):
+            await super().set_connection_params(
+                min_interval, max_interval, latency, timeout
+            )
+            return
+        _LOGGER.warning("set_connection_params not implemented in bleak version")
 
 
 def ble_device_has_changed(original: BLEDevice, new: BLEDevice) -> bool:

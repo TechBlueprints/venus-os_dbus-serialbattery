@@ -4,7 +4,7 @@
 # Updated by https://github.com/mr-manuel
 
 from battery import Battery, Cell
-from utils import bytearray_to_string, is_bit_set, read_serial_data, logger, ZERO_CHAR
+from utils import SOC_CALCULATION, bytearray_to_string, is_bit_set, read_serial_data, logger, ZERO_CHAR
 from struct import unpack_from
 from re import sub
 import sys
@@ -215,7 +215,7 @@ class Jkbms(Battery):
             (unpack_from(">24s", self.get_data(status_data, b"\xba", offset, 24))[0].decode().replace("\x00", " ").replace("Input Userda", "").strip()),
         )
 
-        # show wich cells are balancing
+        # show which cells are balancing
         if self.get_min_cell() is not None and self.get_max_cell() is not None:
             for c in range(self.cell_count):
                 if self.balancing and (self.get_min_cell() == c or self.get_max_cell() == c):
@@ -285,7 +285,8 @@ class Jkbms(Battery):
         # logger.debug(tmp)
 
         # low capacity alarm
-        self.protection.low_soc = 2 if is_bit_set(tmp[pos - 0]) else 0
+        if not SOC_CALCULATION:
+            self.protection.low_soc = 2 if is_bit_set(tmp[pos - 0]) else 0
         # MOSFET temperature alarm
         self.protection.high_internal_temperature = 2 if is_bit_set(tmp[pos - 1]) else 0
         # charge over voltage alarm

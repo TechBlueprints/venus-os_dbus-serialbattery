@@ -318,7 +318,7 @@ class Jkbms_Brn:
         self._new_data_callback = callback
 
     def assemble_frame(self, data: bytearray):
-        logger.debug(f"--> assemble_frame() -> self.frame_buffer (before extend) -> lenght:  {len(self.frame_buffer)}")
+        logger.debug(f"--> assemble_frame() -> self.frame_buffer (before extend) -> length:  {len(self.frame_buffer)}")
         logger.debug(self.frame_buffer)
         if len(self.frame_buffer) > MAX_RESPONSE_SIZE:
             logger.debug("data dropped because it alone was longer than max frame length")
@@ -330,7 +330,7 @@ class Jkbms_Brn:
 
         self.frame_buffer.extend(data)
 
-        logger.debug(f"--> assemble_frame() -> self.frame_buffer (after extend) -> lenght:  {len(self.frame_buffer)}")
+        logger.debug(f"--> assemble_frame() -> self.frame_buffer (after extend) -> length:  {len(self.frame_buffer)}")
         logger.debug(self.frame_buffer)
         if len(self.frame_buffer) >= MIN_RESPONSE_SIZE:
             # check crc; always at position 300, independent of
@@ -346,7 +346,7 @@ class Jkbms_Brn:
                     self._new_data_callback()
 
     def ncallback(self, sender: int, data: bytearray):
-        logger.debug(f"--> NEW PACKAGE! lenght:  {len(data)}")
+        logger.debug(f"--> NEW PACKAGE! length:  {len(data)}")
         logger.debug("ncallback(): " + bytearray_to_string(data))
         self.assemble_frame(data)
 

@@ -13,9 +13,8 @@ from typing import List, Any, Callable, Optional, Union
 import serial
 import time
 
-
 # CONSTANTS
-DRIVER_VERSION: str = "2.1.20260209dev"
+DRIVER_VERSION: str = "2.1.20260515dev"
 """
 current version of the driver
 """
@@ -318,6 +317,8 @@ check_config_issue(
 CHARGE_MODE: int = get_int_from_config("DEFAULT", "CHARGE_MODE")
 CVL_RECALCULATION_EVERY: int = get_int_from_config("DEFAULT", "CVL_RECALCULATION_EVERY")
 CVL_RECALCULATION_ON_MAX_PERCENTAGE_CHANGE: int = get_int_from_config("DEFAULT", "CVL_RECALCULATION_ON_MAX_PERCENTAGE_CHANGE")
+CVL_RECOVERY_HOLD_SEC: int = get_int_from_config("DEFAULT", "CVL_RECOVERY_HOLD_SEC")
+CVL_RECOVERY_RATE_V_PER_SEC: float = get_float_from_config("DEFAULT", "CVL_RECOVERY_RATE_V_PER_SEC")
 
 
 # --------- Charge Voltage Limitation (affecting CVL) ---------
@@ -494,6 +495,22 @@ DISCHARGE_CURRENT_RECOVERY_THRESHOLD_PERCENT: float = get_float_from_config("DEF
 """
 Defines the percentage of the maximum discharge current that the battery has to reach to recover from a limitation.
 """
+CCL_RECOVERY_HOLD_SEC: int = get_int_from_config("DEFAULT", "CCL_RECOVERY_HOLD_SEC")
+"""
+Seconds to hold CCL steady after a recovery condition is detected, before ramping begins.
+"""
+CCL_RECOVERY_RATE_A_PER_SEC: float = get_float_from_config("DEFAULT", "CCL_RECOVERY_RATE_A_PER_SEC")
+"""
+Ramp rate in A/s for charge current recovery. Set to 0 for instant recovery (old behavior).
+"""
+DCL_RECOVERY_HOLD_SEC: int = get_int_from_config("DEFAULT", "DCL_RECOVERY_HOLD_SEC")
+"""
+Seconds to hold DCL steady after a recovery condition is detected, before ramping begins.
+"""
+DCL_RECOVERY_RATE_A_PER_SEC: float = get_float_from_config("DEFAULT", "DCL_RECOVERY_RATE_A_PER_SEC")
+"""
+Ramp rate in A/s for discharge current recovery. Set to 0 for instant recovery (old behavior).
+"""
 
 
 # --------- Time-To-Go ---------
@@ -530,6 +547,11 @@ TEMPERATURE_NAMES: dict = {
     3: config["DEFAULT"]["TEMPERATURE_3_NAME"],
     4: config["DEFAULT"]["TEMPERATURE_4_NAME"],
 }
+TEMPERATURE_1_ADJUST: List[float] = get_list_from_config("DEFAULT", "TEMPERATURE_1_ADJUST", float)
+TEMPERATURE_2_ADJUST: List[float] = get_list_from_config("DEFAULT", "TEMPERATURE_2_ADJUST", float)
+TEMPERATURE_3_ADJUST: List[float] = get_list_from_config("DEFAULT", "TEMPERATURE_3_ADJUST", float)
+TEMPERATURE_4_ADJUST: List[float] = get_list_from_config("DEFAULT", "TEMPERATURE_4_ADJUST", float)
+TEMPERATURE_MOS_ADJUST: List[float] = get_list_from_config("DEFAULT", "TEMPERATURE_MOS_ADJUST", float)
 GUI_PARAMETERS_SHOW_ADDITIONAL_INFO: bool = get_bool_from_config("DEFAULT", "GUI_PARAMETERS_SHOW_ADDITIONAL_INFO")
 TELEMETRY: bool = get_bool_from_config("DEFAULT", "TELEMETRY")
 LOG_DBUS_UPDATES: bool = get_bool_from_config("DEFAULT", "LOG_DBUS_UPDATES")
