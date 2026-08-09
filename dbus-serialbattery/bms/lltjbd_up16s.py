@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum, IntFlag
 from struct import pack, Struct, error as StructError
 from typing import ClassVar, Dict, Optional, Type, TypeVar
-from utils import logger, read_serialport_data, AUTO_RESET_SOC, UP16S_REQUIRE_DIRECT_CONNECTION
+from utils import MAX_CELL_VOLTAGE, USE_BMS_DVCC_VALUES, SOC_CALCULATION, logger, read_serialport_data, AUTO_RESET_SOC, UP16S_REQUIRE_DIRECT_CONNECTION
 import serial
 import time
 import termios
@@ -431,25 +431,27 @@ class LltJbd_Up16s(Battery):
                 pack_status.discharge_current_limit = individual_pack_status.discharge_current_limit
 
         # Take the minimum of the aggregated and non-aggregated current, in case master knows something we don't and reduced the aggregated current.
-        self.max_battery_charge_current = self.apply_aggregated_current_limit_from_master(
-            self.from_raw_current_to_amps(pack_status.charge_current_limit),
-            shared_data.master_aggregated_charge_current_limit_amps,
-            shared_data.master_aggregated_last_update_timestamp,
-        )
-        self.max_battery_discharge_current = self.apply_aggregated_current_limit_from_master(
-            self.from_raw_current_to_amps(pack_status.discharge_current_limit),
-            shared_data.master_aggregated_discharge_current_limit_amps,
-            shared_data.master_aggregated_last_update_timestamp,
-        )
-        self.min_battery_voltage = self.from_raw_dvcc_voltage_to_volts(pack_status.minimum_discharge_voltage)
-        self.max_battery_voltage = self.from_raw_dvcc_voltage_to_volts(pack_status.maximum_charge_voltage)
+        if USE_BMS_DVCC_VALUES:
+            self.max_battery_charge_current = self.apply_aggregated_current_limit_from_master(
+                self.from_raw_current_to_amps(pack_status.charge_current_limit),
+                shared_data.master_aggregated_charge_current_limit_amps,
+                shared_data.master_aggregated_last_update_timestamp,
+            )
+            self.max_battery_discharge_current = self.apply_aggregated_current_limit_from_master(
+                self.from_raw_current_to_amps(pack_status.discharge_current_limit),
+                shared_data.master_aggregated_discharge_current_limit_amps,
+                shared_data.master_aggregated_last_update_timestamp,
+            )
+            self.min_battery_voltage = self.from_raw_dvcc_voltage_to_volts(pack_status.minimum_discharge_voltage)
+            self.max_battery_voltage = self.from_raw_dvcc_voltage_to_volts(pack_status.maximum_charge_voltage)
+        elif pack_status.cell_count:
+            self.max_battery_voltage = round(MAX_CELL_VOLTAGE * pack_status.cell_count, 2)
 
         pack_status_soc = self.from_raw_high_resolution_percentage(pack_status.soc)
         if pack_params_2:
             self.soc = self.from_raw_high_resolution_percentage(pack_params_2.high_res_soc)
             self.append_once(self.history.exclude_values_to_calculate, "total_ah_drawn")
-            # total_ah_drawn has to be negative by convention in battery.py
-            self.history.total_ah_drawn = -self.from_raw_total_charge_discharge_to_ah(pack_params_2.total_discharge)
+            self.history.total_ah_drawn = self.from_raw_total_charge_discharge_to_ah(pack_params_2.total_discharge)
         elif shared_data.get_command_availability(self.address_int, PackParams2).status == CommandAvailability.Status.AVAILABLE:
             # If PackParams2 command is available but timed out this time, wait for it to recover. Fall back to using the potentially
             # non-high-res SOC from PackStatus only if it differs more than 1% from the last fetched value. This prevents SOC from changing
@@ -569,7 +571,8 @@ class LltJbd_Up16s(Battery):
         # Since there's no other suitable place, show temp_diff_fault and temp_diff_alarm as cell_imbalance. This is presumably better than hiding the alarm
         # completely.
         self.protection.cell_imbalance = self.from_raw_protection_value(voltage_diff_fault or temp_diff_fault, voltage_diff_alarm or temp_diff_alarm)
-        self.protection.low_soc = self.from_raw_protection_value(soc_too_low_fault, soc_too_low_alarm)
+        if not SOC_CALCULATION:
+            self.protection.low_soc = self.from_raw_protection_value(soc_too_low_fault, soc_too_low_alarm)
         self.protection.internal_failure = self.from_raw_protection_value(
             eep_fault_alarm
             or cell_offline

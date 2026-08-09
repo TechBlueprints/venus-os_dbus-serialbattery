@@ -11,7 +11,7 @@ function versionStringToNumber ()
 	# first character should be 'v' so first awk parameter will be empty and is not prited into the read command
 	#
 	# version number formats: v2.40, v2.40~6, v2.40-large-7, v2.40~6-large-7
-	# so we must adjust how we use paramters read from the version string
+	# so we must adjust how we use parameters read from the version string
 	# and parsed by awk
 	# if no beta make sure release is greater than any beta (i.e., a beta portion of 999)
 

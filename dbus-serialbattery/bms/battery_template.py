@@ -10,6 +10,8 @@ from utils import read_serial_data, logger
 from struct import unpack_from
 import sys
 
+# from utils import SOC_CALCULATION
+
 
 class BatteryTemplate(Battery):
     def __init__(self, port, baud, address):
@@ -227,6 +229,12 @@ class BatteryTemplate(Battery):
         # heater temperature stop in °C (float)
         self.heater_temperature_stop = VALUE_FROM_BMS
 
+        # get DVCC values from BMS if the user wants to use them and they are available
+        if utils.USE_BMS_DVCC_VALUES is True:
+            self.max_battery_voltage = max_battery_voltage_bms
+            self.min_battery_voltage = max_battery_voltage_bms
+            self.max_battery_charge_current = VALUE_FROM_BMS
+            self.max_battery_discharge_current = VALUE_FROM_BMS
 
         # PROTECTION values
         # 2 = alarm, 1 = warningm 0 = ok
@@ -243,7 +251,8 @@ class BatteryTemplate(Battery):
         self.protection.low_cell_voltage = VALUE_FROM_BMS
 
         # low SOC alarm (int)
-        self.protection.low_soc = VALUE_FROM_BMS
+        if not SOC_CALCULATION:
+            self.protection.low_soc = VALUE_FROM_BMS
 
         # high charge current alarm (int)
         self.protection.high_charge_current = VALUE_FROM_BMS

@@ -222,7 +222,7 @@ class Jkbms_Ble(Battery):
             )
             self.balancing_action = st["cell_info"]["balancing_action"]
 
-            # show wich cells are balancing
+            # show which cells are balancing
             for c in range(self.cell_count):
                 if self.balancing and (st["cell_info"]["min_voltage_cell"] == c or st["cell_info"]["max_voltage_cell"] == c):
                     self.cells[c].balance = True

@@ -9,8 +9,8 @@ import Victron.VenusOS
 Page {
 	id: root
 
-	//% "dbus-serialbattery - Settings"
-	title: qsTrId("dbus_serialbattery_settings_title")
+	// "dbus-serialbattery - Settings"
+	title: "dbus-serialbattery - Settings"
 
 	property string bindPrefix
 
@@ -23,8 +23,8 @@ Page {
 		model: VisibleItemModel {
 
 			SettingsListHeader {
-				//% "IO"
-				text: qsTrId("dbus_serialbattery_settings_io")
+				// "IO"
+				text: "IO"
 			}
 
 			ListText {
@@ -42,94 +42,58 @@ Page {
 			}
 
 			ListText {
-				//% "Allow to balance"
-				text: qsTrId("dbus_serialbattery_settings_allow_to_balance")
+				// "Allow to balance"
+				text: "Allow to balance"
 				dataItem.uid: root.bindPrefix + "/Io/AllowToBalance"
 				preferredVisible: dataItem.valid
 				secondaryText: CommonWords.yesOrNo(dataItem.value)
 			}
 
 			ListText {
-				//% "Allow to heat"
-				text: qsTrId("dbus_serialbattery_settings_allow_to_heat")
+				// "Allow to heat"
+				text: "Allow to heat"
 				dataItem.uid: root.bindPrefix + "/Io/AllowToHeat"
 				preferredVisible: dataItem.valid
 				secondaryText: CommonWords.yesOrNo(dataItem.value)
 			}
 
 			SettingsListHeader {
-				//% "Settings"
-				text: qsTrId("dbus_serialbattery_settings_settings")
+				// "Settings"
+				text: "Settings"
 				preferredVisible: hasSettingsItem.valid && hasSettingsItem.value === 1
 			}
 
-			// DEPERATED: will be removed in future versions, use Settings/ForceChargingOff instead
 			ListSwitch {
-				//% "Force charging off"
-				text: qsTrId("dbus_serialbattery_settings_force_charging_off")
-				dataItem.uid: root.bindPrefix + "/Io/ForceChargingOff"
-				preferredVisible: dataItem.valid
-			}
-
-			ListSwitch {
-				//% "Force charging off"
-				text: qsTrId("dbus_serialbattery_settings_force_charging_off")
+				// "Force charging off"
+				text: "Force charging off"
 				dataItem.uid: root.bindPrefix + "/Settings/ForceChargingOff"
 				preferredVisible: dataItem.valid
 			}
 
-			// DEPERATED: will be removed in future versions, use Settings/ForceDischargingOff instead
 			ListSwitch {
-				//% "Force discharging off"
-				text: qsTrId("dbus_serialbattery_settings_force_discharging_off")
-				dataItem.uid: root.bindPrefix + "/Io/ForceDischargingOff"
-				preferredVisible: dataItem.valid
-			}
-
-			ListSwitch {
-				//% "Force discharging off"
-				text: qsTrId("dbus_serialbattery_settings_force_discharging_off")
+				// "Force discharging off"
+				text: "Force discharging off"
 				dataItem.uid: root.bindPrefix + "/Settings/ForceDischargingOff"
 				preferredVisible: dataItem.valid
 			}
 
-			// DEPERATED: will be removed in future versions, use Settings/TurnBalancingOff instead
 			ListSwitch {
-				//% "Turn balancing off"
-				text: qsTrId("dbus_serialbattery_settings_turn_balancing_off")
-				dataItem.uid: root.bindPrefix + "/Io/TurnBalancingOff"
-				preferredVisible: dataItem.valid
-			}
-
-			ListSwitch {
-				//% "Turn balancing off"
-				text: qsTrId("dbus_serialbattery_settings_turn_balancing_off")
+				// "Turn balancing off"
+				text: "Turn balancing off"
 				dataItem.uid: root.bindPrefix + "/Settings/TurnBalancingOff"
 				preferredVisible: dataItem.valid
 			}
 
 			ListSwitch {
-				//% "Turn heating off"
-				text: qsTrId("dbus_serialbattery_settings_turn_heating_off")
+				// "Turn heating off"
+				text: "Turn heating off"
 				dataItem.uid: root.bindPrefix + "/Settings/TurnHeatingOff"
 				preferredVisible: dataItem.valid
 			}
 
-			// DEPERATED: will be removed in future versions, use Settings/ResetSoc instead
-			ListSpinBox {
-				//% "Reset SoC to"
-				text: qsTrId("dbus_serialbattery_settings_reset_soc_to")
-				dataItem.uid: root.bindPrefix + "/Settings/ResetSoc"
-				preferredVisible: dataItem.valid
-				suffix: "%"
-				from: 0
-				to: 100
-				stepSize: 1
-			}
-
 			ListButton {
-				//% "Reset SoC to"
-				text: qsTrId("dbus_serialbattery_settings_reset_soc_to")
+				// "Reset SoC to"
+				text: "Reset SoC to"
 				secondaryText: Units.getCombinedDisplayText(VenusOS.Units_Percentage, resetSocToItem.value)
 				preferredVisible: resetSocToItem.valid
 				onClicked: Global.dialogLayer.open(resetSocToDialogComponent)
@@ -141,10 +105,13 @@ Page {
 
 						property int resetSocTo: resetSocToItem.value
 
-						//% "Reset SoC to"
-						title: qsTrId("dbus_serialbattery_settings_reset_soc_to")
+						// "Reset SoC to"
+						title: "Reset SoC to"
 
-						onAccepted: resetSocToItem.setValue(resetSocTo)
+						onAccepted: {
+							resetSocToItem.setValue(resetSocTo)
+							resetSocToApplyItem.setValue(1)
+						}
 
 						contentItem: ModalDialog.FocusableContentItem {
 							Column {
@@ -173,11 +140,16 @@ Page {
 									focus: true
 									onMoved: resetSocTo = value
 
-									KeyNavigationHighlight.active: resetToSocSlider.activeFocus
-									KeyNavigationHighlight.leftMargin: -Theme.geometry_listItem_flat_content_horizontalMargin
-									KeyNavigationHighlight.rightMargin: -Theme.geometry_listItem_flat_content_horizontalMargin
-									KeyNavigationHighlight.topMargin: -Theme.geometry_listItem_content_verticalMargin
-									KeyNavigationHighlight.bottomMargin: -Theme.geometry_listItem_content_verticalMargin
+									KeyNavigationHighlight {
+										anchors {
+											fill: parent
+											leftMargin: -Theme.geometry_listItem_flat_content_horizontalMargin
+											rightMargin: -Theme.geometry_listItem_flat_content_horizontalMargin
+											topMargin: -Theme.geometry_listItem_content_verticalMargin
+											bottomMargin: -Theme.geometry_listItem_content_verticalMargin
+										}
+										active: parent.activeFocus
+									}
 								}
 							}
 						}
@@ -188,6 +160,11 @@ Page {
 				VeQuickItem {
 					id: resetSocToItem
 					uid: root.bindPrefix + "/Settings/ResetSocTo"
+				}
+
+				VeQuickItem {
+					id: resetSocToApplyItem
+					uid: root.bindPrefix + "/Settings/ResetSocToApply"
 				}
 			}
 		}

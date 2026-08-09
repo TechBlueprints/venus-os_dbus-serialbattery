@@ -18,6 +18,7 @@ import asyncio
 import concurrent.futures
 import importlib
 import threading
+import time
 
 # add ext folder to sys.path
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext"))
@@ -69,6 +70,9 @@ class Generic_AioBmsBle(Battery):
         self._cancel_timeout: int = 1
         # track the currently scheduled Future on the background loop
         self._current_future = None
+        # staleness tracking
+        self._last_successful_update: float | None = None
+        self._max_data_age: int = 5  # seconds before stale cached data causes failure
 
     BATTERYTYPE = "Generic aiobmsble BMS"
 
@@ -451,10 +455,10 @@ class Generic_AioBmsBle(Battery):
         # self.production = VALUE_FROM_BMS
 
         # hardware version of the BMS (str)
-        self.hardware_version = self.aiobmsble_info.get("hw_version", None)
+        self.hardware_version = self.aiobmsble_info.get("hw_version", None) if self.aiobmsble_info else None
 
         # serial number of the battery (str)
-        self.serial_number = self.aiobmsble_info.get("serial_number", None)
+        self.serial_number = self.aiobmsble_info.get("serial_number", None) if self.aiobmsble_info else None
 
         # init the cell array once
         if len(self.cells) == 0:
@@ -500,7 +504,19 @@ class Generic_AioBmsBle(Battery):
         try:
             # perform an async update (keeps connection open on success)
             ok = self._run_coro(_update_async)
-            if not ok and self.aiobmsble_data is None and type(self.aiobmsble_data) is not dict:
+            if ok:
+                self._last_successful_update = time.monotonic()
+            elif self._last_successful_update is not None:
+                data_age = time.monotonic() - self._last_successful_update
+                if data_age > self._max_data_age:
+                    logger.warning(
+                        "aiobmsble: cached data is %ds old, treating as failure (addr=%s)",
+                        int(data_age),
+                        self.address,
+                    )
+                    return False
+                logger.debug("aiobmsble: using cached data (%.1fs old) (addr=%s)", data_age, self.address)
+            elif not isinstance(self.aiobmsble_data, dict):
                 return False
 
             # Integrate a check to be sure, that the received data is from the BMS type you are making this driver for
@@ -516,8 +532,11 @@ class Generic_AioBmsBle(Battery):
             self.soc = self.aiobmsble_data["battery_level"]
 
             # temperature sensors (safe checks)
+            # TODO: upstream, there is no clear separation between mosfet and normal temperatures
+            #       normally index 0 is mosfet, but only for batteries that provide it
+            #       in the meanwhile use full range
             temp_values = self.aiobmsble_data.get("temp_values", [])
-            for i in range(1, 5):
+            for i in range(0, 5):
                 if len(temp_values) >= i + 1 and temp_values[i] is not None:
                     self.to_temperature(i, temp_values[i])
 
@@ -526,7 +545,7 @@ class Generic_AioBmsBle(Battery):
             for idx in range(min(self.cell_count, len(cell_voltages))):
                 self.cells[idx].voltage = cell_voltages[idx]
 
-            # show wich cells are balancing
+            # show which cells are balancing
             self.balancing = self.aiobmsble_data.get("balancer", None)
             if self.balancing is not None and self.get_min_cell() is not None and self.get_max_cell() is not None:
                 for c in range(self.cell_count):
@@ -545,7 +564,7 @@ class Generic_AioBmsBle(Battery):
 
             # remaining capacity of the battery in ampere hours (float)
             # if not available, then it's calculated from the SOC and the capacity
-            capacity_remain = self.aiobmsble_data.get("remaining_capacity", None)
+            capacity_remain = self.aiobmsble_data.get("cycle_charge", None)
             if capacity_remain is not None:
                 self.capacity_remain = capacity_remain
 

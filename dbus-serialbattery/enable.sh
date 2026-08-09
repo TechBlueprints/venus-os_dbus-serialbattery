@@ -60,7 +60,13 @@ cp -rf "/data/apps/dbus-serialbattery/service" "/opt/victronenergy/service-templ
 
 
 # install custom GUI
-bash /data/apps/dbus-serialbattery/custom-gui-install.sh
+# if GUI_INSTALL_CUSTOMIZATIONS in config file is set to True (ignore case and trim spaces), else skip this step
+gui_customizations=$(awk -F "=" '/^GUI_INSTALL_CUSTOMIZATIONS/ {print $2}' /data/apps/dbus-serialbattery/config.ini | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+if [[ "$gui_customizations" != "false" ]]; then
+    bash /data/apps/dbus-serialbattery/custom-gui-install.sh
+else
+    bash /data/apps/dbus-serialbattery/custom-gui-uninstall.sh > /dev/null
+fi
 
 
 
@@ -107,9 +113,12 @@ if [ ! -f "$filename" ]; then
     chmod 755 "$filename"
 fi
 
-# add enable script to rc.local
+# add enable script to rc.local with --boot flag, so the boot run can skip
+# the unconditional kill cycle that would otherwise tear down the freshly-started
+# BMS service ~30 s after it first comes up.
 # log the output to a file and run it in the background to prevent blocking the boot process
-grep -qxF "bash /data/apps/dbus-serialbattery/enable.sh > /data/apps/dbus-serialbattery/startup.log 2>&1 &" $filename || echo "bash /data/apps/dbus-serialbattery/enable.sh > /data/apps/dbus-serialbattery/startup.log 2>&1 &" >> $filename
+rclocal_line="bash /data/apps/dbus-serialbattery/enable.sh --boot > /data/apps/dbus-serialbattery/startup.log 2>&1 &"
+grep -qxF "$rclocal_line" "$filename" || echo "$rclocal_line" >> "$filename"
 
 
 
@@ -133,18 +142,25 @@ fi
 
 
 
-# stop all dbus-serialbattery services, if at least one exists
-echo "Stop all dbus-serialbattery services..."
-for service in /service/dbus-serialbattery.*; do
-    [ -e "$service" ] && svc -d "$service"
-done
+# Stop all dbus-serialbattery services unless we were invoked from rc.local with
+# --boot. Boot-time invocations must not kill the freshly-started driver: that
+# causes a ~30 s outage which breaks downstream consumers like
+# dbus-aggregate-batteries (which polls dbus once at startup).
+if [ "${1:-}" = "--boot" ]; then
+    echo "Boot invocation — leaving any already-supervised dbus-serialbattery alone."
+else
+    echo "Stop all dbus-serialbattery services..."
+    for service in /service/dbus-serialbattery.*; do
+        [ -e "$service" ] && svc -d "$service"
+    done
 
-sleep 1
+    sleep 1
 
-# kill driver, if still running
-pkill -f "supervise dbus-serialbattery.*"
-pkill -f "multilog .* /var/log/dbus-serialbattery.*"
-pkill -f "python .*/dbus-serialbattery.py /dev/tty.*"
+    # kill driver, if still running
+    pkill -f "supervise dbus-serialbattery.*"
+    pkill -f "multilog .* /var/log/dbus-serialbattery.*"
+    pkill -f "python .*/dbus-serialbattery.py /dev/tty.*"
+fi
 
 
 
@@ -155,7 +171,7 @@ bluetooth_bms=$(awk -F "=" '/^BLUETOOTH_BMS/ {print $2}' /data/apps/dbus-serialb
 #echo $bluetooth_bms
 
 # clear whitespaces
-bluetooth_bms_clean=$(echo "$bluetooth_bms" | tr -s ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+bluetooth_bms_clean=$(echo "$bluetooth_bms" | tr -s ' ' | sed 's|^[[:space:]]*||;s|[[:space:]]*$||')
 #echo $bluetooth_bms_clean
 
 # split into array
@@ -209,7 +225,7 @@ if [ "$bluetooth_length" -gt 0 ]; then
                     echo "Build-in Bluetooth is disabled, use external Bluetooth dongle."
                 else
                     # Add 'disable-bt' to the end of an existing dtoverlay line
-                    sed -i '/^dtoverlay=/s/$/,disable-bt/' /u-boot/config.txt
+                    sed -i '\|^dtoverlay=|s|$|,disable-bt|' /u-boot/config.txt
                     echo "NOTICE! Build-in Bluetooth was disabled: 'disable-bt' has been added to the dtoverlay list. THIS NEEDS A MANUAL REBOOT!"
                 fi
             else
@@ -225,9 +241,9 @@ if [ "$bluetooth_length" -gt 0 ]; then
             # Enable built-in Bluetooth
             if grep -q "^dtoverlay=.*disable-bt" "/u-boot/config.txt"; then
                 # Remove 'disable-bt' from an existing dtoverlay line
-                sed -i '/^dtoverlay=/s/disable-bt,//g' /u-boot/config.txt  # Case: disable-bt is not at the end
-                sed -i '/^dtoverlay=/s/,disable-bt//g' /u-boot/config.txt  # Case: disable-bt is at the end
-                sed -i '/^dtoverlay=/s/disable-bt//g' /u-boot/config.txt   # Case: disable-bt is the only entry
+                sed -i '\|^dtoverlay=|s|disable-bt,||g' /u-boot/config.txt  # Case: disable-bt is not at the end
+                sed -i '\|^dtoverlay=|s|,disable-bt||g' /u-boot/config.txt  # Case: disable-bt is at the end
+                sed -i '\|^dtoverlay=|s|disable-bt||g' /u-boot/config.txt   # Case: disable-bt is the only entry
                 echo "NOTICE! Build-in Bluetooth was enabled: 'disable-bt' has been removed from the dtoverlay list. THIS NEEDS A MANUAL REBOOT!"
             else
                 echo "Build-in Bluetooth is used."
@@ -332,7 +348,7 @@ can_port=$(awk -F "=" '/^CAN_PORT/ {print $2}' /data/apps/dbus-serialbattery/con
 #echo $can_port
 
 # clear whitespaces
-can_port_clean="$(echo $can_port | sed 's/\s*,\s*/,/g')"
+can_port_clean="$(echo $can_port | sed 's|\s*,\s*|,|g')"
 #echo $can_port_clean
 
 # split into array
@@ -340,8 +356,8 @@ IFS="," read -r -a can_array <<< "$can_port_clean"
 #declare -p can_array
 # readarray -td, can_array <<< "$can_port_clean,"; unset 'can_array[-1]'; declare -p can_array;
 
-can_lenght=${#can_array[@]}
-# echo $can_lenght
+can_length=${#can_array[@]}
+# echo $can_length
 
 # stop all dbus-canbattery services, if at least one exists
 if ls /service/dbus-canbattery.* 1> /dev/null 2>&1; then
@@ -362,10 +378,10 @@ if ls /service/dbus-canbattery.* 1> /dev/null 2>&1; then
 fi
 
 
-if [ "$can_lenght" -gt 0 ]; then
+if [ "$can_length" -gt 0 ]; then
 
     echo
-    echo "Found $can_lenght CAN port(s) in the config file!"
+    echo "Found $can_length CAN port(s) in the config file!"
     echo
 
     # Required packages, shipped with the driver:
@@ -419,7 +435,7 @@ if [ "$can_lenght" -gt 0 ]; then
     # install_canbattery_service can0
     # install_canbattery_service can9
 
-    for (( i=0; i<can_lenght; i++ ));
+    for (( i=0; i<can_length; i++ ));
     do
         install_canbattery_service "${can_array[$i]}"
     done
@@ -443,7 +459,7 @@ mqtt_topic=$(awk -F "=" '/^MQTT_TOPIC/ {print $2}' /data/apps/dbus-serialbattery
 #echo $mqtt_topic
 
 # clear whitespaces
-mqtt_topic_clean="$(echo $mqtt_topic | sed 's/\s*,\s*/,/g')"
+mqtt_topic_clean="$(echo $mqtt_topic | sed 's|\s*,\s*|,|g')"
 #echo $mqtt_topic_clean
 
 # split into array
@@ -451,8 +467,8 @@ IFS="," read -r -a mqtt_array <<< "$mqtt_topic_clean"
 #declare -p mqtt_array
 # readarray -td, mqtt_array <<< "$mqtt_topic_clean,"; unset 'mqtt_array[-1]'; declare -p mqtt_array;
 
-mqtt_lenght=${#mqtt_array[@]}
-# echo $mqtt_lenght
+mqtt_length=${#mqtt_array[@]}
+# echo $mqtt_length
 
 # stop dbus-mqttbattery service
 if [ -d "/service/dbus-mqttbattery" ]; then
@@ -469,10 +485,10 @@ if [ -d "/service/dbus-mqttbattery" ]; then
 fi
 
 
-if [ "$mqtt_lenght" -gt 0 ]; then
+if [ "$mqtt_length" -gt 0 ]; then
 
     echo
-    echo "Found $mqtt_lenght MQTT topic(s) in the config file!"
+    echo "Found $mqtt_length MQTT topic(s) in the config file!"
     echo
 
     # Required packages, shipped with the driver:
@@ -544,8 +560,11 @@ fi
 # remove old drivers before changing from dbus-blebattery-$1 to dbus-blebattery.$1
 rm -rf /service/dbus-blebattery-*
 # remove old install scripts from rc.local
-sed -i '/^sh \/data\/etc\/dbus-serialbattery\//d' /data/rc.local
-sed -i "/^bash \/data\/etc\/dbus-serialbattery\//d" /data/rc.local
+sed -i \
+    -e '\|^sh /data/etc/dbus-serialbattery/|d' \
+    -e '\|^bash /data/etc/dbus-serialbattery/|d' \
+    -e '\|^bash /data/apps/dbus-serialbattery/enable.sh > /data/apps/dbus-serialbattery/startup.log 2>&1 &$|d' \
+    /data/rc.local
 ### needed for upgrading from older versions | end ###
 
 

@@ -18,10 +18,9 @@ import contextlib
 import logging
 import os
 from collections import defaultdict
-from collections.abc import Callable, Coroutine, MutableMapping
+from collections.abc import Callable, Coroutine
 from functools import partial
 from typing import Any, NamedTuple, Optional, cast
-from weakref import WeakKeyDictionary
 
 from dbus_fast import AuthError, BusType, Message, MessageType, Variant, unpack_variants
 from dbus_fast.aio.message_bus import MessageBus
@@ -503,7 +502,7 @@ class BlueZManager:
                         try:
                             assert_reply(reply)
                         except BleakDBusError as ex:
-                            if ex.dbus_error != "org.bluez.Error.NotReady":
+                            if ex.dbus_error != defs.BLUEZ_ERROR_NOT_READY:
                                 raise
                         else:
                             # remove the filters
@@ -958,6 +957,46 @@ class BlueZManager:
             if not device_callbacks:
                 del condition_callbacks[device_path]
 
+    def get_char_value(self, char_path: str) -> bytes:
+        """
+        Gets the value of the "Value" property for a characteristic.
+
+        Args:
+            char_path: The D-Bus object path of the characteristic.
+        Returns:
+            The current property value.
+        """
+        try:
+            char_props = cast(
+                GattCharacteristic1,
+                self._properties[char_path][defs.GATT_CHARACTERISTIC_INTERFACE],
+            )
+            return char_props["Value"]
+        except KeyError as ex:
+            raise BleakError(
+                f"characteristic at {char_path} not found, device may be disconnected"
+            ) from ex
+
+    def get_desc_value(self, desc_path: str) -> bytes:
+        """
+        Gets the value of the "Value" property for a descriptor.
+
+        Args:
+            desc_path: The D-Bus object path of the descriptor.
+        Returns:
+            The current property value.
+        """
+        try:
+            desc_props = cast(
+                GattDescriptor1,
+                self._properties[desc_path][defs.GATT_DESCRIPTOR_INTERFACE],
+            )
+            return desc_props["Value"]
+        except KeyError as ex:
+            raise BleakError(
+                f"descriptor at {desc_path} not found, device may be disconnected"
+            ) from ex
+
     def _parse_msg(self, message: Message) -> None:
         """
         Handles callbacks from dbus_fast.
@@ -1145,7 +1184,15 @@ class BlueZManager:
             callback(device_path, device.copy())
 
 
-_global_instances: MutableMapping[Any, BlueZManager] = WeakKeyDictionary()
+# Bleak is designed to run in a single event loop for the duration of an
+# application. Starting a new manager is a very expensive operation because it
+# has to read all of the properties of all known Bluetooth devices over the bus.
+# So even though this technically supports more than one run loop, we don't
+# recommend doing that. This dict maps each event loop to its associated
+# BlueZManager instance so that multiple callers in the same loop share one
+# manager. Entries for closed loops are removed lazily when a new manager is
+# requested.
+_global_instances: dict[asyncio.AbstractEventLoop, BlueZManager] = {}
 
 
 async def get_global_bluez_manager() -> BlueZManager:
@@ -1158,6 +1205,15 @@ async def get_global_bluez_manager() -> BlueZManager:
     try:
         instance = _global_instances[loop]
     except KeyError:
+        # Clean up any entries whose event loop has been closed.
+        closed_loops = [
+            event_loop for event_loop in _global_instances if event_loop.is_closed()
+        ]
+        for closed_loop in closed_loops:
+            manager = _global_instances.pop(closed_loop)
+            if manager._bus is not None:  # pyright: ignore[reportPrivateUsage]
+                manager._bus._finalize(None)  # pyright: ignore[reportPrivateUsage]
+
         instance = _global_instances[loop] = BlueZManager()
 
     await instance.async_init()
