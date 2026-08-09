@@ -4,9 +4,11 @@
 # Added by https://github.com/KoljaWindeler
 
 from battery import Battery, Cell
-from utils import bytearray_to_string, read_serial_data, get_connection_error_message, logger, USE_PORT_AS_UNIQUE_ID
+from utils import BATTERY_ADDRESSES, SOC_CALCULATION, logger
 from struct import unpack_from
+import serial
 import sys
+import time
 
 
 class Jkbms_pb(Battery):
@@ -20,11 +22,65 @@ class Jkbms_pb(Battery):
         self.command_settings = b"\x10\x16\x1e\x00\x01\x02\x00\x00"
         self.command_about = b"\x10\x16\x1c\x00\x01\x02\x00\x00"
         self.history.exclude_values_to_calculate = ["charge_cycles"]
+        self.use_async_refresh = True
+        # self.has_settings = True
+        # self.callbacks_available = ["callback_heating_turn_off"]
 
     BATTERYTYPE = "JKBMS PB Model"
     LENGTH_CHECK = 0  # ignored
     LENGTH_POS = 2  # ignored
     LENGTH_SIZE = "H"  # ignored
+
+    _shared_ser = None  # shared serial port, kept open across calls
+
+    # Minimum gap between consecutive commands on the RS485 bus (seconds).
+    # 50ms: stale bytes from CH341 USB FIFO latency.
+    # 75ms: zero errors on 4-battery system.
+    # 100ms: safe margin. BMS bus master uses ~180ms.
+    COMMAND_GAP = 0.12
+
+    _last_command_time = 0.0
+    _timing_logged = False
+    _consecutive_failures = 0
+    # Recycle the shared port after this many consecutive failed reads. pyserial
+    # leaves is_open=True after a USB device disappears, so without this the
+    # driver keeps reusing a stale fd indefinitely.
+    _RECYCLE_THRESHOLD = 8
+
+    @property
+    def addr_str(self):
+        return "0x" + self.address.hex()
+
+    def _get_ser(self):
+        """Return the shared serial port, opening it if needed."""
+        if Jkbms_pb._shared_ser is None or not Jkbms_pb._shared_ser.is_open:
+            Jkbms_pb._shared_ser = serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1)
+        return Jkbms_pb._shared_ser
+
+    def _recycle_port(self):
+        """Force the next _get_ser() to reopen the port (e.g. after USB re-plug)."""
+        logger.warning(f"[{self.addr_str}] recycling serial port after {Jkbms_pb._consecutive_failures} consecutive failures")
+        try:
+            if Jkbms_pb._shared_ser is not None:
+                Jkbms_pb._shared_ser.close()
+        except Exception:
+            pass
+        Jkbms_pb._shared_ser = None
+        Jkbms_pb._consecutive_failures = 0
+
+    def _read_with_retry(self, ser, command, timeout=0.5):
+        """Send command and read response, retry once on failure."""
+        result = self._read_response(ser, command, timeout)
+        if not result:
+            logger.warning(f"[{self.addr_str}] retry: {command[1:5].hex()}")
+            result = self._read_response(ser, command, timeout)
+        if result:
+            Jkbms_pb._consecutive_failures = 0
+        else:
+            Jkbms_pb._consecutive_failures += 1
+            if Jkbms_pb._consecutive_failures >= Jkbms_pb._RECYCLE_THRESHOLD:
+                self._recycle_port()
+        return result
 
     def test_connection(self):
         """
@@ -33,11 +89,9 @@ class Jkbms_pb(Battery):
         Return True if success, False for failure
         """
         result = False
+        t0 = time.monotonic()
         try:
-            # get settings to check if the data is valid and the connection is working
             result = self.get_settings()
-            # get the rest of the data to be sure, that all data is valid and the correct battery type is recognized
-            # only read next data if the first one was successful, this saves time when checking multiple battery types
             result = result and self.refresh_data()
         except Exception:
             (
@@ -50,14 +104,25 @@ class Jkbms_pb(Battery):
             logger.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
             result = False
 
+        addr_str = self.addr_str
+        dt_ms = (time.monotonic() - t0) * 1000
+        logger.info(f"[{addr_str}] test_connection: {'OK' if result else 'FAILED'} in {dt_ms:.0f}ms")
         return result
 
     def get_settings(self):
         # After successful connection get_settings() will be called to set up the battery
         # Set the current limits, populate cell count, etc
         # Return True if success, False for failure
-        status_data = self.read_serial_data_jkbms_pb(self.command_settings, 300)
+        addr_str = self.addr_str
+        try:
+            ser = self._get_ser()
+        except serial.SerialException as e:
+            logger.error(f"[{addr_str}] serial error: {e}")
+            return False
+
+        status_data = self._read_with_retry(ser, self.command_settings, timeout=1.0)
         if not status_data:
+            logger.warning(f"get_settings: command_settings failed for addr {addr_str}")
             return False
 
         VolSmartSleep = unpack_from("<i", status_data, 6)[0] / 1000
@@ -94,9 +159,35 @@ class Jkbms_pb(Battery):
         CapBatCell = unpack_from("<i", status_data, 130)[0] / 1000
         SCPDelay = unpack_from("<i", status_data, 134)[0]
         StartBalVol = unpack_from("<i", status_data, 138)[0] / 1000  # Start Balance Voltage
+        DevAddr = unpack_from("<i", status_data, 270)[0]  # Device Addr
+        TIMPDischarge = unpack_from("<i", status_data, 274)[0]
+        TMPStartHeating = unpack_from("<b", status_data, 284)[0]
+        TMPStopHeating = unpack_from("<b", status_data, 285)[0]
+
+        CtrlBitMask = unpack_from("<H", status_data, 282)[0]  # Controls
+        # Bit0: Heating enabled
+        HeatEN = 0x01 & CtrlBitMask
+        # Bit1: Disable Temp.-Sensor
+        DisTempSens = 0x01 & (CtrlBitMask >> 1)
+        # Bit2: GPS Heartbeat
+        GPSHeartbeat = 0x01 & (CtrlBitMask >> 2)
+        # Bit3: Port Switch 1:RS485 0: CAN
+        PortSwitch = 0x01 & (CtrlBitMask >> 3)
+        # Bit4: LCD Always ON
+        LCDAlwaysOn = 0x1 & (CtrlBitMask >> 4)
+        # Bit5: Special Charger
+        SpecialCharger = 0x1 & (CtrlBitMask >> 5)
+        # Bit6: Smart Sleep
+        SmartSleep = 0x1 & (CtrlBitMask >> 6)
+
+        TIMSmartSleep = unpack_from("<b", status_data, 286)[0]  # uint 8
+        # TMPBatOTA/TMPBatOTAR are the same as TMPStartHeating/TMPStopHeating (offset 284/285)
 
         # balancer enabled
         self.balance_fet = True if BalanEN != 0 else False
+
+        # heating enabled
+        self.heater_fet = True if HeatEN != 0 else False
 
         # count of all cells in pack
         self.cell_count = CellCount
@@ -144,48 +235,134 @@ class Jkbms_pb(Battery):
         logger.debug("CapBatCell: " + str(CapBatCell))
         logger.debug("SCPDelay: " + str(SCPDelay))
         logger.debug("StartBalVol: " + str(StartBalVol))
+        logger.debug("DevAddr: " + str(DevAddr))
+        logger.debug("TIMPDischarge: " + str(TIMPDischarge))
+        logger.debug("CtrlBitMask: " + str(CtrlBitMask))
+        logger.debug("HeatEN: " + str(HeatEN))
+        logger.debug("DisTempSens: " + str(DisTempSens))
+        logger.debug("GPSHeartbeat: " + str(GPSHeartbeat))
+        logger.debug("PortSwitch: " + str(PortSwitch))
+        logger.debug("LCDAlwaysOn: " + str(LCDAlwaysOn))
+        logger.debug("SpecialCharger: " + str(SpecialCharger))
+        logger.debug("SmartSleep: " + str(SmartSleep))
+        logger.debug("TMPBatOTA: " + str(TMPStartHeating))
+        logger.debug("TMPBatOTAR: " + str(TMPStopHeating))
+        logger.debug("TIMSmartSleep: " + str(TIMSmartSleep))
+        logger.debug("TMPStartHeating: " + str(TMPStartHeating))
+        logger.debug("TMPStopHeating: " + str(TMPStopHeating))
 
-        status_data = self.read_serial_data_jkbms_pb(self.command_about, 300)
-        serial_nr = status_data[86:101].decode("utf-8")
-        vendor_id = status_data[6:18].decode("utf-8")
-        hw_version = (status_data[22:26].decode("utf-8") + " / " + status_data[30:35].decode("utf-8")).replace("\x00", "")
-        sw_version = status_data[30:34].decode("utf-8")  # will be overridden
+        status_data = self._read_with_retry(ser, self.command_about, timeout=1.0)
+        # vendor_version start  0: 16 chars
+        # hw_version     start 16:  8 chars
+        # sw_version     start 24:  8 chars
+        # oddruntim      start 32:  1 UINT32
+        # pwr_on_time    start 36:  1 UINT32
 
-        self.unique_identifier_tmp = serial_nr
-        self.version = sw_version
-        self.hardware_version = hw_version
+        if not status_data:
+            # fw >= v15.36 may not respond to command_about in every window;
+            # fall back to safe defaults so get_settings() can still succeed
+            if not self.version:
+                self.version = ""
+                self.hardware_version = ""
+                self.heater_temperature_start = TMPBatCUT
+                self.heater_temperature_stop = TMPBatCUTPR
+            logger.debug("command_about: no response, keeping previous version info")
+        else:
+            vendor_id = status_data[6:21].decode("utf-8").split("\x00", 1)[0]  # 16 chars
+            hw_version = status_data[22:29].decode("utf-8").split("\x00", 1)[0]  # 8 chars
+            sw_version = status_data[30:37].decode("utf-8").split("\x00", 1)[0]  # 8 chars
+            bms_version = hw_version + " / " + sw_version
 
-        logger.debug("Serial Nr: " + str(serial_nr))
-        logger.debug("Vendor ID: " + str(vendor_id))
-        logger.debug("HW Version: " + str(hw_version))
-        logger.debug("SW Version: " + str(sw_version))
+            # if we have an older hardware older as 19A (starting with 19A the FW supports the heating temperature setting)
+            # we use the old behavior by using the Bat Charge Under Temperature and Reset value
+            if hw_version > "15A":
+                self.heater_temperature_start = TMPStartHeating
+                self.heater_temperature_stop = TMPStopHeating
+            else:
+                self.heater_temperature_start = TMPBatCUT
+                self.heater_temperature_stop = TMPBatCUTPR
+
+            logger.debug("TMPStartHeating: " + str(self.heater_temperature_start))
+            logger.debug("TMPStopHeating: " + str(self.heater_temperature_stop))
+
+            ODDRunTime = unpack_from("<I", status_data, 38)[0]  # 1 unit32 # runtime of the system in seconds
+            PWROnTimes = unpack_from("<I", status_data, 42)[0]  # 1 unit32 # how many startups the system has done
+            serial_nr = status_data[46:61].decode("utf-8").split("\x00", 1)[0]  # serialnumber 16 chars max
+            usrData = status_data[102:117].decode("utf-8").split("\x00", 1)[0]  # usrData 16 chars max
+            pin = status_data[118:133].decode("utf-8").split("\x00", 1)[0]  # pin 16 chars max
+            usrData2 = status_data[134:149].decode("utf-8").split("\x00", 1)[0]  # usrData 2 16 chars max
+            ble_id = serial_nr + "-" + str(DevAddr)
+
+            self.unique_identifier_tmp = serial_nr
+            self.version = sw_version
+            self.hardware_version = bms_version
+
+            logger.debug("Serial Nr: " + str(serial_nr))
+            logger.debug("Ble Id: " + str(ble_id))
+            logger.debug("Vendor ID: " + str(vendor_id))
+            logger.debug("HW Version: " + str(hw_version))
+            logger.debug("SW Version: " + str(sw_version))
+            logger.debug("BMS Version: " + str(bms_version))
+            logger.debug("User data: " + str(usrData))
+            logger.debug("User data 2: " + str(usrData2))
+            logger.debug("pin: " + str(pin))
+            logger.debug("PWROnTimes: " + str(PWROnTimes))
+            logger.debug(
+                "ODDRunTime: "
+                + str(ODDRunTime)
+                + "s; "
+                + str(ODDRunTime / 60)
+                + "m; "
+                + str(ODDRunTime / 60 / 60)
+                + "h; "
+                + str(ODDRunTime / 60 / 60 / 24)
+                + "d"
+            )
 
         # init the cell array
         for _ in range(self.cell_count):
             self.cells.append(Cell(False))
 
+        if not Jkbms_pb._timing_logged:
+            Jkbms_pb._timing_logged = True
+            n = max(len(BATTERY_ADDRESSES), 1)
+            per_bat_ms = (self.COMMAND_GAP + 0.04) * 1000  # gap + ~40ms protocol
+            logger.info(
+                f"JKBMS PB timing: gap={self.COMMAND_GAP * 1000:.0f}ms" f" — estimated poll: {n}x {per_bat_ms:.0f}ms = {n * per_bat_ms:.0f}ms for {n} batteries"
+            )
+
         return True
 
     def refresh_data(self):
-        # call all functions that will refresh the battery data.
-        # This will be called for every iteration (1 second)
-        # Return True if success, False for failure
-        return self.read_status_data()
-
-    def read_status_data(self):
-        status_data = self.read_serial_data_jkbms_pb(self.command_status, 299)
-        # check if connection success
-        if not status_data:
+        addr_str = self.addr_str
+        t0 = time.monotonic()
+        try:
+            ser = self._get_ser()
+            status_data = self._read_with_retry(ser, self.command_status)
+        except serial.SerialException as e:
+            logger.error(f"[{addr_str}] serial error: {e}")
             return False
 
-        #        logger.error("sucess we have data")
-        #        be = ''.join(format(x, ' 02X') for x in status_data)
-        #        logger.error(be)
+        if not status_data:
+            logger.warning(f"[{addr_str}] refresh_data: no response")
+            return False
 
-        # cell voltages
+        result = self.read_status_data(status_data)
+        dt_ms = (time.monotonic() - t0) * 1000
+        logger.debug(f"[{addr_str}] refresh_data: {dt_ms:.0f}ms")
+        return result
+
+    def read_status_data(self, status_data):
+        # cell voltages — EMA low-pass filter to suppress 1mV ADC jitter
+        # and reduce dbus write traffic (cache proxy suppresses unchanged values)
         for c in range(self.cell_count):
-            if (unpack_from("<H", status_data, c * 2 + 6)[0] / 1000) != 0:
-                self.cells[c].voltage = unpack_from("<H", status_data, c * 2 + 6)[0] / 1000
+            raw = unpack_from("<H", status_data, c * 2 + 6)[0] / 1000
+            if raw != 0:
+                prev = self.cells[c].voltage
+                if prev is not None:
+                    self.cells[c].voltage = round(0.3 * raw + 0.7 * prev, 3)
+                else:
+                    self.cells[c].voltage = round(raw, 3)
 
         # MOSFET temperature
         temperature_mos = unpack_from("<h", status_data, 144)[0] / 10
@@ -215,6 +392,10 @@ class Jkbms_pb(Battery):
         # SOC
         self.soc = unpack_from("<B", status_data, 173)[0]
 
+        # SOH
+        self.soh = unpack_from("<B", status_data, 190)[0]
+        # precharge = unpack_from("<B", status_data, 191)[0]
+
         # cycles
         self.history.charge_cycles = unpack_from("<i", status_data, 182)[0]
 
@@ -228,11 +409,20 @@ class Jkbms_pb(Battery):
         bal = unpack_from("<B", status_data, 172)[0]
         charge = unpack_from("<B", status_data, 198)[0]
         discharge = unpack_from("<B", status_data, 199)[0]
+        heat = unpack_from("<B", status_data, 215)[0]
+
+        logger.debug("bal: " + str(bal) + " charge: " + str(charge) + " discharge: " + str(discharge) + " heat: " + str(heat))
+
         self.charge_fet = 1 if charge != 0 else 0
         self.discharge_fet = 1 if discharge != 0 else 0
         self.balancing = 1 if bal != 0 else 0
+        self.heating = 1 if heat != 0 else 0
 
-        # show wich cells are balancing
+        # HeatCurrent is provided in mA, convert to A
+        self.heater_current = int(unpack_from("<H", status_data, 236)[0]) / 1000
+        self.heater_power = 0.0 if self.heating != 1 else float(self.heater_current * self.voltage)
+
+        # show which cells are balancing
         if self.get_min_cell() is not None and self.get_max_cell() is not None:
             for c in range(self.cell_count):
                 if self.balancing and (self.get_min_cell() == c or self.get_max_cell() == c):
@@ -240,29 +430,13 @@ class Jkbms_pb(Battery):
                 else:
                     self.cells[c].balance = False
 
-        # logging
-        """
-        for c in range(self.cell_count):
-                logger.error("Cell "+str(c)+" voltage: "+str(self.cells[c].voltage)+"V")
-        logger.error("Temperature 2: "+str(temperature_1))
-        logger.error("Temperature 3: "+str(temperature_2))
-        logger.error("voltage: "+str(self.voltage)+"V")
-        logger.error("Current: "+str(self.current))
-        logger.error("SOC: "+str(self.soc)+"%")
-        logger.error("Mos Temperature: "+str(temperature_mos))
-        """
-
         return True
 
     def unique_identifier(self) -> str:
         """
         Used to identify a BMS when multiple BMS are connected
         """
-        # TODO: Temporary solution, since the serial number is not correctly read
-        if USE_PORT_AS_UNIQUE_ID:
-            return self.port + ("__" + bytearray_to_string(self.address).replace("\\", "0") if self.address is not None else "")
-        else:
-            return self.unique_identifier_tmp
+        return self.unique_identifier_tmp
 
     def get_balancing(self):
         return 1 if self.balancing else 0
@@ -312,64 +486,174 @@ class Jkbms_pb(Battery):
         """
 
         # low capacity alarm
-        self.protection.low_soc = (byte_data & 0x00001000) * 2
+        if not SOC_CALCULATION:
+            self.protection.low_soc = 2 if (byte_data & 0x00001000) else 0
         # MOSFET temperature alarm
-        self.protection.high_internal_temperature = (byte_data & 0x00000002) * 2
+        self.protection.high_internal_temperature = 2 if (byte_data & 0x00000002) else 0
         # charge over voltage alarm
-        self.protection.high_voltage = (byte_data & 0x00000020) * 2
+        self.protection.high_voltage = 2 if (byte_data & 0x00000020) else 0
         # discharge under voltage alarm
-        self.protection.low_voltage = (byte_data & 0x00000800) * 2
+        self.protection.low_voltage = 2 if (byte_data & 0x00000800) else 0
         # charge overcurrent alarm
-        self.protection.high_charge_current = (byte_data & 0x00000040) * 2
+        self.protection.high_charge_current = 2 if (byte_data & 0x00000040) else 0
         # discharge over current alarm
-        self.protection.high_discharge_current = (byte_data & 0x00002000) * 2
+        self.protection.high_discharge_current = 2 if (byte_data & 0x00002000) else 0
         # core differential pressure alarm OR unit overvoltage alarm
         self.protection.cell_imbalance = 0
         # cell overvoltage alarm
-        self.protection.high_cell_voltage = (byte_data & 0x00000010) * 2
+        self.protection.high_cell_voltage = 2 if (byte_data & 0x00000010) else 0
         # cell undervoltage alarm
-        self.protection.low_cell_voltage = (byte_data & 0x00001000) * 2
+        self.protection.low_cell_voltage = 2 if (byte_data & 0x00001000) else 0
         # battery overtemperature alarm OR overtemperature alarm in the battery box
-        self.protection.high_charge_temperature = (byte_data & 0x00000100) * 2
-        self.protection.low_charge_temperature = (byte_data & 0x00000200) * 2
+        self.protection.high_charge_temperature = 2 if (byte_data & 0x00000100) else 0
+        self.protection.low_charge_temperature = 2 if (byte_data & 0x00000200) else 0
         # check if low/high temp alarm arise during discharging
-        self.protection.high_temperature = (byte_data & 0x00008000) * 2
+        self.protection.high_temperature = 2 if (byte_data & 0x00008000) else 0
         self.protection.low_temperature = 0
 
-    def read_serial_data_jkbms_pb(self, command: str, length: int) -> bool:
-        """
-        use the read_serial_data() function to read the data and then do BMS specific checks (crc, start bytes, etc)
-        :param command: the command to be sent to the bms
-        :return: True if everything is fine, else False
-        """
-        modbus_msg = self.address
-        modbus_msg += command
-        modbus_msg += self.modbusCrc(modbus_msg)
+    # Expected frame types per command
+    EXPECTED_FTYPE = {
+        b"\x10\x16\x20\x00\x01\x02\x00\x00": 0x0002,  # status
+        b"\x10\x16\x1e\x00\x01\x02\x00\x00": 0x0001,  # settings
+        b"\x10\x16\x1c\x00\x01\x02\x00\x00": 0x0003,  # about
+    }
 
-        data = read_serial_data(
-            modbus_msg,
-            self.port,
-            self.baud_rate,
-            self.LENGTH_POS,  # ignored
-            self.LENGTH_CHECK,  # ignored
-            length,
-            self.LENGTH_SIZE,  # ignored
-            battery_online=self.online,
-        )
+    def _send_command(self, ser, command):
+        """Enforce bus gap, drain stale bytes, send FC16 command, wait for TX complete."""
+        addr_str = self.addr_str
+
+        elapsed = time.monotonic() - Jkbms_pb._last_command_time
+        if elapsed < self.COMMAND_GAP:
+            time.sleep(self.COMMAND_GAP - elapsed)
+
+        stale = ser.in_waiting
+        if stale:
+            stale_bytes = ser.read(stale)
+            logger.warning(f"[{addr_str}] PRE-SEND stale={stale}: {stale_bytes.hex()}")
+        ser.reset_input_buffer()
+
+        modbus_msg = self.address + command + self.modbusCrc(self.address + command)
+        ser.write(modbus_msg)
+        ser.flush()
+        Jkbms_pb._last_command_time = time.monotonic()
+
+    def _receive_data(self, ser, timeout=0.5):
+        """Read bytes from serial port until complete response or timeout.
+
+        Returns raw bytearray (may include TX echo prefix).
+        Minimum complete = 0x55AA header + 308 bytes (payload + ACK, no padding).
+        Some adapters add 0x00 padding (310 bytes total after header).
+        """
+        PAYLOAD_SIZE = 300
+        ACK_SIZE = 8
+        MIN_AFTER_HEADER = PAYLOAD_SIZE + ACK_SIZE  # 308
+
+        data = bytearray()
+        start = time.monotonic()
+        deadline = start + timeout
+        while time.monotonic() < deadline:
+            n = ser.in_waiting
+            if n > 0:
+                data.extend(ser.read(n))
+                hdr = data.find(b"\x55\xaa")
+                if hdr >= 0 and len(data) >= hdr + MIN_AFTER_HEADER:
+                    # Got enough; settle briefly for trailing padding bytes
+                    time.sleep(0.005)
+                    n = ser.in_waiting
+                    if n > 0:
+                        data.extend(ser.read(n))
+                    break
+            else:
+                if not data:
+                    time.sleep(0.01)
+                else:
+                    time.sleep(0.005)
+
+        return data
+
+    def _validate_response(self, data, command):
+        """Validate a raw response and extract the 300-byte payload.
+
+        Checks: 0x55AA header, 0xEB90 marker, frame type, sum8 checksum,
+        padding bytes, FC16 ACK (address + register + CRC), total byte count.
+
+        Returns payload (bytes) or False on any validation failure.
+        """
+        PAYLOAD_SIZE = 300
+        ACK_SIZE = 8
+        addr_str = self.addr_str
+
         if not data:
+            logger.warning(f"[{addr_str}] no response")
             return False
 
-        # be = ''.join(format(x, ' 02X') for x in data)
-        # logger.error(be)
+        hdr = data.find(b"\x55\xaa")
+        if hdr < 0:
+            logger.warning(f"[{addr_str}] no 0x55AA in {len(data)} bytes: {data[:40].hex()}")
+            return False
 
-        # I never understood the CRC algorithm in the returned message,
-        # so we check the header and the length and that's it
+        if len(data) < hdr + PAYLOAD_SIZE:
+            logger.warning(f"[{addr_str}] truncated: {len(data) - hdr}/{PAYLOAD_SIZE} bytes after 0x55AA")
+            return False
 
-        if data[0] == 0x55 and data[1] == 0xAA:
-            return data
+        payload = bytes(data[hdr : hdr + PAYLOAD_SIZE])
+
+        if payload[2:4] != b"\xeb\x90":
+            logger.warning(f"[{addr_str}] bad frame marker: {payload[2:4].hex()} (expected eb90)")
+            return False
+
+        ftype = payload[4] | payload[5] << 8
+        expected = self.EXPECTED_FTYPE.get(command)
+        if expected is not None and ftype != expected:
+            logger.warning(f"[{addr_str}] wrong frame type: 0x{ftype:04X} (expected 0x{expected:04X})")
+            return False
+
+        if not self._verify_checksum(payload):
+            logger.warning(f"[{addr_str}] checksum fail: computed={sum(payload[:299]) & 0xFF} stored={payload[299]}")
+            return False
+
+        # Scan for FC16 ACK after payload: look for [address][0x10] pattern
+        tail = data[hdr + PAYLOAD_SIZE :]
+        ack_marker = self.address + b"\x10"
+        ack_pos = tail.find(ack_marker)
+        if ack_pos >= 0 and len(tail) >= ack_pos + ACK_SIZE:
+            ack = bytes(tail[ack_pos : ack_pos + ACK_SIZE])
+            if not self._verify_ack(ack, command):
+                logger.warning(f"[{addr_str}] ACK validation failed: {ack.hex()}")
+        elif ack_pos >= 0:
+            logger.warning(f"[{addr_str}] ACK truncated: {len(tail) - ack_pos}/{ACK_SIZE} bytes")
         else:
-            get_connection_error_message(self.online)
+            logger.warning(f"[{addr_str}] no ACK found in {len(tail)} trailing bytes")
+
+        return payload
+
+    def _read_response(self, ser, command, timeout=0.5):
+        """Send FC16 command and return validated 300-byte payload, or False."""
+        self._send_command(ser, command)
+        data = self._receive_data(ser, timeout)
+        return self._validate_response(data, command)
+
+    @staticmethod
+    def _verify_checksum(data):
+        """Verify sum8 checksum at byte 299 of a 300-byte 0x55AA response."""
+        if len(data) != 300:
             return False
+        return sum(data[:299]) & 0xFF == data[299]
+
+    def _verify_ack(self, ack, command):
+        """Verify an 8-byte FC16 write-ACK matches our address and command register."""
+        if len(ack) != 8:
+            return False
+        if ack[0:1] != self.address:
+            return False
+        if ack[1] != 0x10:
+            return False
+        if ack[2:6] != command[1:5]:
+            return False
+        expected_crc = self.modbusCrc(ack[:6])
+        if ack[6:8] != expected_crc:
+            return False
+        return True
 
     def modbusCrc(self, msg: str):
         """
@@ -386,3 +670,6 @@ class Jkbms_pb(Battery):
                 else:
                     crc >>= 1
         return crc.to_bytes(2, "little")
+
+    def callback_heating_turn_off(self, path: str, value: int) -> bool:
+        return False

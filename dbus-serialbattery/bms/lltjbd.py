@@ -11,6 +11,7 @@ from utils import (
     read_serial_data,
     logger,
     ZERO_CHAR,
+    SOC_CALCULATION,
     SOC_LOW_ALARM,
     SOC_LOW_WARNING,
 )
@@ -239,8 +240,8 @@ class LltJbd(Battery):
         self.type = self.BATTERYTYPE
         self.address = address
         self._product_name: str = ""
-        self.has_settings = False
-        self.reset_soc = 100
+        self.has_settings = True
+        self.soc_reset_to = 100
         self.soc_to_set = None
         self.factory_mode = False
         self.writable = False
@@ -249,10 +250,11 @@ class LltJbd(Battery):
         self.trigger_disable_balancer = None
         self.cycle_capacity = None
         # list of available callbacks, in order to display the buttons in the GUI
-        self.available_callbacks = [
-            "force_charging_off_callback",
-            "force_discharging_off_callback",
-            "turn_balancing_off_callback",
+        self.callbacks_available = [
+            "callback_charging_force_off",
+            "callback_discharging_force_off",
+            "callback_balancing_turn_off",
+            "callback_soc_reset_to",
         ]
         self.history.exclude_values_to_calculate = ["charge_cycles"]
 
@@ -325,14 +327,14 @@ class LltJbd(Battery):
 
         return True
 
-    def reset_soc_callback(self, path, value):
+    def callback_soc_reset_to(self, path, value):
         if value is None:
             return False
 
         if value < 0 or value > 100:
             return False
 
-        self.reset_soc = value
+        self.soc_reset_to = value
         self.soc_to_set = value
 
         return True
@@ -350,7 +352,7 @@ class LltJbd(Battery):
             pack_voltage = struct.pack(">H", int(self.voltage * 10))
             self.read_serial_data_llt(writeCmd(REG_CAP_100, pack_voltage))
 
-    def force_charging_off_callback(self, path, value):
+    def callback_charging_force_off(self, path, value):
         if value is None:
             return False
 
@@ -364,7 +366,7 @@ class LltJbd(Battery):
 
         return False
 
-    def force_discharging_off_callback(self, path, value):
+    def callback_discharging_force_off(self, path, value):
         if value is None:
             return False
 
@@ -408,7 +410,7 @@ class LltJbd(Battery):
             logger.error("write force disable charge/discharge failed")
             return False
 
-    def turn_balancing_off_callback(self, path, value):
+    def callback_balancing_turn_off(self, path, value):
         if value is None:
             return False
 
@@ -475,7 +477,8 @@ class LltJbd(Battery):
         self.protection.high_discharge_current = 1 if is_bit_set(tmp[3]) else 0
 
         # Software implementations for low soc
-        self.protection.low_soc = 2 if self.soc < SOC_LOW_ALARM else 1 if self.soc < SOC_LOW_WARNING else 0
+        if not SOC_CALCULATION:
+            self.protection.low_soc = 2 if self.soc < SOC_LOW_ALARM else 1 if self.soc < SOC_LOW_WARNING else 0
 
         # extra protection flags for LltJbd
         self.protection.set_voltage_cell_low = is_bit_set(tmp[11])

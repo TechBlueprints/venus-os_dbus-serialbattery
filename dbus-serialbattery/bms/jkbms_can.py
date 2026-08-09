@@ -11,7 +11,7 @@
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 from battery import Battery, Cell
-from utils import bytearray_to_string, get_connection_error_message, logger
+from utils import SOC_CALCULATION, get_connection_error_message, generate_unique_identifier, logger
 from struct import unpack_from
 from time import sleep, time
 import sys
@@ -80,7 +80,7 @@ class Jkbms_Can(Battery):
         e.g. the serial number
         If there is no such value, please remove this function
         """
-        return self.port + ("__" + bytearray_to_string(self.address).replace("\\", "0") if self.address is not None else "")
+        return generate_unique_identifier(self.port, self.address)
 
     def test_connection(self):
         """
@@ -146,7 +146,8 @@ class Jkbms_Can(Battery):
         self.protection.low_temperature = 2 if int(tmp[pos - 18 : pos - 16], 2) > 0 else 0
         self.protection.high_charge_temperature = 2 if int(tmp[pos - 20 : pos - 18], 2) > 0 else 0
         self.protection.high_temperature = 2 if int(tmp[pos - 20 : pos - 18], 2) > 0 else 0
-        self.protection.low_soc = 2 if int(tmp[pos - 22 : pos - 20], 2) > 0 else 0
+        if not SOC_CALCULATION:
+            self.protection.low_soc = 2 if int(tmp[pos - 22 : pos - 20], 2) > 0 else 0
         self.protection.internal_failure = 2 if int(tmp[pos - 24 : pos - 22], 2) > 0 else 0
         self.protection.internal_failure = 2 if int(tmp[pos - 26 : pos - 24], 2) > 0 else 0
         self.protection.internal_failure = 2 if int(tmp[pos - 28 : pos - 26], 2) > 0 else 0
@@ -168,7 +169,8 @@ class Jkbms_Can(Battery):
         self.protection.low_temperature = 0
         self.protection.high_charge_temperature = 0
         self.protection.high_temperature = 0
-        self.protection.low_soc = 0
+        if not SOC_CALCULATION:
+            self.protection.low_soc = 0
         self.protection.internal_failure = 0
         self.protection.internal_failure = 0
         self.protection.internal_failure = 0

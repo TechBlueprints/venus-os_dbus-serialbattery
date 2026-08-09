@@ -84,6 +84,18 @@ class BlueZScannerArgs(TypedDict, total=False):
     :class:`BleakScanner` args that are specific to the BlueZ backend.
     """
 
+    adapter: str
+    """
+    Bluetooth adapter to use for discovery, e.g. "hci0".
+
+    .. tip:: If you have multiple Bluetooth adapters, they may not always be
+         assigned the same ``hciX`` name across reboots. In that case, you can
+         use udev to look up the name based on other properties like the USB
+         vendor and product ID.
+
+    .. versionadded:: 3.0
+    """
+
     filters: BlueZDiscoveryFilters
     """
     Filters to pass to the adapter SetDiscoveryFilter D-Bus method.
@@ -96,4 +108,43 @@ class BlueZScannerArgs(TypedDict, total=False):
     Or patterns to pass to the AdvertisementMonitor1 D-Bus interface.
 
     Only used for passive scanning.
+    """
+
+
+class BlueZClientArgs(TypedDict, total=False):
+    """
+    :class:`bleak.BleakClient` args that are specific to the BlueZ backend.
+
+    .. versionadded:: 3.0
+    """
+
+    adapter: str
+    """
+    Bluetooth adapter to use for connection, e.g. "hci0".
+
+    .. tip:: If you have multiple Bluetooth adapters, they may not always be
+         assigned the same ``hciX`` name across reboots. In that case, you can
+         use udev to look up the name based on other properties like the USB
+         vendor and product ID.
+    """
+
+
+class BlueZNotifyArgs(TypedDict, total=False):
+    """
+    :meth:`bleak.BleakClient.start_notify` method args that are specific to the
+    BlueZ backend.
+
+    .. versionadded:: 2.1
+    """
+
+    use_start_notify: bool
+    """
+    If false, use the "AcquireNotify" D-Bus method instead of "StartNotify" to
+    subscribe to notifications. The default is to use "StartNotify" for better
+    compatibility with most BLE devices.
+
+    see :ref:`linux-start-notify` for more details.
+
+    .. versionchanged:: 3.0.2
+        The default value was changed from ``False`` to ``True``.
     """

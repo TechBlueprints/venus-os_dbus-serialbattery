@@ -5,7 +5,7 @@
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 from battery import Battery, Cell
-from utils import bytearray_to_string, logger
+from utils import SOC_CALCULATION, USE_BMS_DVCC_VALUES, generate_unique_identifier, logger
 from struct import unpack_from
 from time import sleep, time
 import sys
@@ -53,7 +53,7 @@ class RV_C_Can(Battery):
         e.g. the serial number
         If there is no such value, please remove this function
         """
-        return self.port + ("__" + bytearray_to_string(self.address).replace("\\", "0") if self.address is not None else "")
+        return generate_unique_identifier(self.port, self.address)
 
     def test_connection(self):
         """
@@ -109,7 +109,8 @@ class RV_C_Can(Battery):
         # Low volts D2 bit 5
         self.protection.low_voltage = 2 if int(tmp[12:13]) > 0 else 0
         # Low SOC D3 bit 1
-        self.protection.low_soc = 2 if int(tmp[24:25]) > 0 else 0
+        if not SOC_CALCULATION:
+            self.protection.low_soc = 2 if int(tmp[24:25]) > 0 else 0
         # LowTemp D3 bit 5
         self.protection.low_temperature = 2 if int(tmp[20:21]) > 0 else 0
         # OverTemp D4 bit 1
@@ -134,7 +135,8 @@ class RV_C_Can(Battery):
         self.protection.low_temperature = 0
         self.protection.high_charge_temperature = 0
         self.protection.high_temperature = 0
-        self.protection.low_soc = 0
+        if not SOC_CALCULATION:
+            self.protection.low_soc = 0
         self.protection.internal_failure = 0
         self.protection.internal_failure = 0
         self.protection.internal_failure = 0
@@ -189,8 +191,9 @@ class RV_C_Can(Battery):
 
             # BATT_STAT4 Target charge current and voltage
             elif normalized_arbitration_id in self.CAN_FRAMES[self.BATT_STAT4]:
-                self.max_battery_voltage = unpack_from("<H", bytes([data[3], data[4]]))[0] / 20
-                self.max_battery_charge_current = unpack_from("<H", bytes([data[5], data[6]]))[0] / 100
+                if USE_BMS_DVCC_VALUES:
+                    self.max_battery_voltage = unpack_from("<H", bytes([data[3], data[4]]))[0] / 20
+                    self.max_battery_charge_current = unpack_from("<H", bytes([data[5], data[6]]))[0] / 100
 
                 # check if all needed data is available
                 data_check += 4
@@ -212,8 +215,8 @@ class RV_C_Can(Battery):
             elif normalized_arbitration_id in self.CAN_FRAMES[self.BATT_STAT11]:
                 self.capacity = unpack_from("<H", bytes([data[3], data[4]]))[0]
                 fet = unpack_from("<B", bytes([data[2]]))[0]
-                self.control_allow_discharge = 1 if int(bin(fet | 0x100)[8:9]) > 0 else 0
-                self.control_allow_charge = 1 if int(bin(fet | 0x100)[10:11]) > 0 else 0
+                self.discharge_fet = 1 if int(bin(fet | 0x100)[8:9]) > 0 else 0
+                self.charge_fet = 1 if int(bin(fet | 0x100)[10:11]) > 0 else 0
                 # check if all needed data is available
                 data_check += 2
 

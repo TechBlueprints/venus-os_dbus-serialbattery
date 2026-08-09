@@ -41,7 +41,7 @@ class LiTime_Ble(Battery):
             return False
 
     def unique_identifier(self) -> str:
-        return self.address
+        return self.address.replace(":", "").lower()
 
     def connection_name(self) -> str:
         return "BLE " + self.address
@@ -63,7 +63,7 @@ class LiTime_Ble(Battery):
         for byte_pos in range(16, 48, 2):
             (cell_volt,) = unpack_from("H", data, byte_pos)
             if cell_volt != 0:
-                if len(self.cells) >= nr_of_cells:
+                if len(self.cells) <= nr_of_cells:
                     self.cells.append(Cell(False))
                 cell_volt = cell_volt / 1000
                 self.cells[nr_of_cells].voltage = cell_volt
@@ -138,12 +138,12 @@ class LiTime_Ble(Battery):
             # Using current_based_on_remaning
             self.current = self.current_based_on_remaning
 
-        # status of the battery if charging is enabled (bool)
+        # status of the battery if charging is allowed (bool)
         self.charge_fet = True
         if battery_state == 4:
             self.charge_fet = False
 
-        # status of the battery if discharging is enabled (bool)
+        # status of the battery if discharging is allowed (bool)
         # there might be other values that we dont know of heat or battery_state that could indicate that discharge is disabled
         self.discharge_fet = True
         if heat == 0x80 or protection_state in (0x20, 0x80):

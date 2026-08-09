@@ -60,7 +60,13 @@ cp -rf "/data/apps/dbus-serialbattery/service" "/opt/victronenergy/service-templ
 
 
 # install custom GUI
-bash /data/apps/dbus-serialbattery/custom-gui-install.sh
+# if GUI_INSTALL_CUSTOMIZATIONS in config file is set to True (ignore case and trim spaces), else skip this step
+gui_customizations=$(awk -F "=" '/^GUI_INSTALL_CUSTOMIZATIONS/ {print $2}' /data/apps/dbus-serialbattery/config.ini | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+if [[ "$gui_customizations" != "false" ]]; then
+    bash /data/apps/dbus-serialbattery/custom-gui-install.sh
+else
+    bash /data/apps/dbus-serialbattery/custom-gui-uninstall.sh > /dev/null
+fi
 
 
 
@@ -78,13 +84,24 @@ if [ ! -d "$serialstarter_path" ]; then
     mkdir "$serialstarter_path"
 fi
 
-# check if file exists
-if [ ! -f "$serialstarter_file" ]; then
-    {
-        echo "service   sbattery    dbus-serialbattery"
-        echo "alias     default     gps:vedirect:sbattery"
-        echo "alias     rs485       cgwacs:fzsonick:imt:modbus:sbattery"
-    } > "$serialstarter_file"
+
+# check if DISABLE_SERIAL_STARTER in config file is set to True (ignore case and trim spaces)
+serial_starter_enabled=$(awk -F "=" '/^SERIAL_STARTER_ENABLED/ {print $2}' /data/apps/dbus-serialbattery/config.ini | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+
+if [[ "$serial_starter_enabled" != "false" ]]; then
+    # check if file exists
+    if [ ! -f "$serialstarter_file" ]; then
+        {
+            echo "service   sbattery    dbus-serialbattery"
+            echo "alias     default     gps:vedirect:sbattery"
+            echo "alias     rs485       cgwacs:fzsonick:imt:modbus:sbattery"
+        } > "$serialstarter_file"
+    fi
+else
+    # remove file, if it exists
+    if [ -f "$serialstarter_file" ]; then
+        rm -f "$serialstarter_file"
+    fi
 fi
 
 
@@ -96,9 +113,12 @@ if [ ! -f "$filename" ]; then
     chmod 755 "$filename"
 fi
 
-# add enable script to rc.local
+# add enable script to rc.local with --boot flag, so the boot run can skip
+# the unconditional kill cycle that would otherwise tear down the freshly-started
+# BMS service ~30 s after it first comes up.
 # log the output to a file and run it in the background to prevent blocking the boot process
-grep -qxF "bash /data/apps/dbus-serialbattery/enable.sh > /data/apps/dbus-serialbattery/startup.log 2>&1 &" $filename || echo "bash /data/apps/dbus-serialbattery/enable.sh > /data/apps/dbus-serialbattery/startup.log 2>&1 &" >> $filename
+rclocal_line="bash /data/apps/dbus-serialbattery/enable.sh --boot > /data/apps/dbus-serialbattery/startup.log 2>&1 &"
+grep -qxF "$rclocal_line" "$filename" || echo "$rclocal_line" >> "$filename"
 
 
 
@@ -122,18 +142,25 @@ fi
 
 
 
-# stop all dbus-serialbattery services, if at least one exists
-echo "Stop all dbus-serialbattery services..."
-for service in /service/dbus-serialbattery.*; do
-    [ -e "$service" ] && svc -d "$service"
-done
+# Stop all dbus-serialbattery services unless we were invoked from rc.local with
+# --boot. Boot-time invocations must not kill the freshly-started driver: that
+# causes a ~30 s outage which breaks downstream consumers like
+# dbus-aggregate-batteries (which polls dbus once at startup).
+if [ "${1:-}" = "--boot" ]; then
+    echo "Boot invocation — leaving any already-supervised dbus-serialbattery alone."
+else
+    echo "Stop all dbus-serialbattery services..."
+    for service in /service/dbus-serialbattery.*; do
+        [ -e "$service" ] && svc -d "$service"
+    done
 
-sleep 1
+    sleep 1
 
-# kill driver, if still running
-pkill -f "supervise dbus-serialbattery.*"
-pkill -f "multilog .* /var/log/dbus-serialbattery.*"
-pkill -f "python .*/dbus-serialbattery.py /dev/tty.*"
+    # kill driver, if still running
+    pkill -f "supervise dbus-serialbattery.*"
+    pkill -f "multilog .* /var/log/dbus-serialbattery.*"
+    pkill -f "python .*/dbus-serialbattery.py /dev/tty.*"
+fi
 
 
 
@@ -144,7 +171,7 @@ bluetooth_bms=$(awk -F "=" '/^BLUETOOTH_BMS/ {print $2}' /data/apps/dbus-serialb
 #echo $bluetooth_bms
 
 # clear whitespaces
-bluetooth_bms_clean=$(echo "$bluetooth_bms" | tr -s ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+bluetooth_bms_clean=$(echo "$bluetooth_bms" | tr -s ' ' | sed 's|^[[:space:]]*||;s|[[:space:]]*$||')
 #echo $bluetooth_bms_clean
 
 # split into array
@@ -198,7 +225,7 @@ if [ "$bluetooth_length" -gt 0 ]; then
                     echo "Build-in Bluetooth is disabled, use external Bluetooth dongle."
                 else
                     # Add 'disable-bt' to the end of an existing dtoverlay line
-                    sed -i '/^dtoverlay=/s/$/,disable-bt/' /u-boot/config.txt
+                    sed -i '\|^dtoverlay=|s|$|,disable-bt|' /u-boot/config.txt
                     echo "NOTICE! Build-in Bluetooth was disabled: 'disable-bt' has been added to the dtoverlay list. THIS NEEDS A MANUAL REBOOT!"
                 fi
             else
@@ -214,9 +241,9 @@ if [ "$bluetooth_length" -gt 0 ]; then
             # Enable built-in Bluetooth
             if grep -q "^dtoverlay=.*disable-bt" "/u-boot/config.txt"; then
                 # Remove 'disable-bt' from an existing dtoverlay line
-                sed -i '/^dtoverlay=/s/disable-bt,//g' /u-boot/config.txt  # Case: disable-bt is not at the end
-                sed -i '/^dtoverlay=/s/,disable-bt//g' /u-boot/config.txt  # Case: disable-bt is at the end
-                sed -i '/^dtoverlay=/s/disable-bt//g' /u-boot/config.txt   # Case: disable-bt is the only entry
+                sed -i '\|^dtoverlay=|s|disable-bt,||g' /u-boot/config.txt  # Case: disable-bt is not at the end
+                sed -i '\|^dtoverlay=|s|,disable-bt||g' /u-boot/config.txt  # Case: disable-bt is at the end
+                sed -i '\|^dtoverlay=|s|disable-bt||g' /u-boot/config.txt   # Case: disable-bt is the only entry
                 echo "NOTICE! Build-in Bluetooth was enabled: 'disable-bt' has been removed from the dtoverlay list. THIS NEEDS A MANUAL REBOOT!"
             else
                 echo "Build-in Bluetooth is used."
@@ -321,7 +348,7 @@ can_port=$(awk -F "=" '/^CAN_PORT/ {print $2}' /data/apps/dbus-serialbattery/con
 #echo $can_port
 
 # clear whitespaces
-can_port_clean="$(echo $can_port | sed 's/\s*,\s*/,/g')"
+can_port_clean="$(echo $can_port | sed 's|\s*,\s*|,|g')"
 #echo $can_port_clean
 
 # split into array
@@ -329,12 +356,12 @@ IFS="," read -r -a can_array <<< "$can_port_clean"
 #declare -p can_array
 # readarray -td, can_array <<< "$can_port_clean,"; unset 'can_array[-1]'; declare -p can_array;
 
-can_lenght=${#can_array[@]}
-# echo $can_lenght
+can_length=${#can_array[@]}
+# echo $can_length
 
 # stop all dbus-canbattery services, if at least one exists
 if ls /service/dbus-canbattery.* 1> /dev/null 2>&1; then
-    echo "Stop all dbus-serialbattery services..."
+    echo "Stop all dbus-canbattery services..."
     for service in /service/dbus-canbattery.*; do
         [ -e "$service" ] && svc -d "$service"
     done
@@ -351,10 +378,10 @@ if ls /service/dbus-canbattery.* 1> /dev/null 2>&1; then
 fi
 
 
-if [ "$can_lenght" -gt 0 ]; then
+if [ "$can_length" -gt 0 ]; then
 
     echo
-    echo "Found $can_lenght CAN port(s) in the config file!"
+    echo "Found $can_length CAN port(s) in the config file!"
     echo
 
     # Required packages, shipped with the driver:
@@ -408,7 +435,7 @@ if [ "$can_lenght" -gt 0 ]; then
     # install_canbattery_service can0
     # install_canbattery_service can9
 
-    for (( i=0; i<can_lenght; i++ ));
+    for (( i=0; i<can_length; i++ ));
     do
         install_canbattery_service "${can_array[$i]}"
     done
@@ -425,12 +452,119 @@ fi
 
 
 
+### MQTT PART | START ###
+
+# get MQTT topic(s) from config file
+mqtt_topic=$(awk -F "=" '/^MQTT_TOPIC/ {print $2}' /data/apps/dbus-serialbattery/config.ini)
+#echo $mqtt_topic
+
+# clear whitespaces
+mqtt_topic_clean="$(echo $mqtt_topic | sed 's|\s*,\s*|,|g')"
+#echo $mqtt_topic_clean
+
+# split into array
+IFS="," read -r -a mqtt_array <<< "$mqtt_topic_clean"
+#declare -p mqtt_array
+# readarray -td, mqtt_array <<< "$mqtt_topic_clean,"; unset 'mqtt_array[-1]'; declare -p mqtt_array;
+
+mqtt_length=${#mqtt_array[@]}
+# echo $mqtt_length
+
+# stop dbus-mqttbattery service
+if [ -d "/service/dbus-mqttbattery" ]; then
+    echo "Stop dbus-mqttbattery service..."
+    svc -d "/service/dbus-mqttbattery"
+
+    # always remove existing mqttbattery service to cleanup
+    rm -rf /service/dbus-mqttbattery
+
+    # kill all mqttbattery processes that remain
+    pkill -f "supervise dbus-mqttbattery.*"
+    pkill -f "multilog .* /var/log/dbus-mqttbattery.*"
+    pkill -f "python .*/dbus-serialbattery.py mqtt.*"
+fi
+
+
+if [ "$mqtt_length" -gt 0 ]; then
+
+    echo
+    echo "Found $mqtt_length MQTT topic(s) in the config file!"
+    echo
+
+    # Required packages, shipped with the driver:
+    # - opkg install python3-misc
+    # - opkg install python3-pip
+    # - pip3 install paho-mqtt
+
+    # function to install MQTT battery
+    install_mqttbattery_service() {
+        if [ -z "$1" ]; then
+            echo "ERROR: MQTT topic is empty. Aborting installation."
+            echo
+            exit 1
+        fi
+
+        echo "Installing MQTT topic \"$1\" as dbus-mqttbattery"
+
+        mkdir -p "/service/dbus-mqttbattery/log"
+        {
+            echo "#!/bin/sh"
+            echo "exec multilog t s500000 n4 /var/log/dbus-mqttbattery"
+        } > "/service/dbus-mqttbattery/log/run"
+        chmod 755 "/service/dbus-mqttbattery/log/run"
+
+        {
+            echo "#!/bin/sh"
+            echo
+            echo "# Forward signals to the child process"
+            echo "trap 'kill -TERM \$PID' TERM INT"
+            echo
+            echo "# Start the main process"
+            echo "exec 2>&1"
+            echo "python /data/apps/dbus-serialbattery/dbus-serialbattery.py mqtt \"$1\" &"
+            echo
+            echo "# Capture the PID of the child process"
+            echo "PID=\$!"
+            echo
+            echo "# Wait for the child process to exit"
+            echo "wait \$PID"
+            echo
+            echo "# Capture the exit status"
+            echo "EXIT_STATUS=\$?"
+            echo
+            echo "# Exit with the same status"
+            echo "exit \$EXIT_STATUS"
+        } > "/service/dbus-mqttbattery/run"
+        chmod 755 "/service/dbus-mqttbattery/run"
+    }
+
+    # Example
+    # install_mqttbattery_service dbus-serialbattery/battery-1
+    # install_mqttbattery_service dbus-serialbattery/battery-1,dbus-serialbattery/battery-2
+
+    install_mqttbattery_service "$mqtt_topic_clean"
+
+else
+
+    echo
+    echo "No MQTT topic configuration found in \"/data/apps/dbus-serialbattery/config.ini\"."
+    echo "You can ignore this, if you are using only a serial connection."
+    echo
+
+fi
+### MQTT PART | END ###
+
+
+
 ### needed for upgrading from older versions | start ###
 # remove old drivers before changing from dbus-blebattery-$1 to dbus-blebattery.$1
 rm -rf /service/dbus-blebattery-*
 # remove old install scripts from rc.local
-sed -i '/^sh \/data\/etc\/dbus-serialbattery\//d' /data/rc.local
-sed -i "/^bash \/data\/etc\/dbus-serialbattery\//d" /data/rc.local
+sed -i \
+    -e '\|^sh /data/etc/dbus-serialbattery/|d' \
+    -e '\|^bash /data/etc/dbus-serialbattery/|d' \
+    -e '\|^bash /data/apps/dbus-serialbattery/enable.sh > /data/apps/dbus-serialbattery/startup.log 2>&1 &$|d' \
+    /data/rc.local
 ### needed for upgrading from older versions | end ###
 
 
@@ -440,7 +574,11 @@ echo "#################################"
 echo "# First activation instructions #"
 echo "#################################"
 echo
-echo "SERIAL battery connection: The activation is complete. You don't have to do anything more."
+if [[ "$serial_starter_enabled" != "false" ]]; then
+    echo "SERIAL battery connection: The activation is complete. You don't have to do anything more."
+else
+    echo "SERIAL battery connection: Serial connection was disabled in \"/data/apps/dbus-serialbattery/config.ini\"."
+fi
 echo
 echo "BLUETOOTH battery connection: There are a few more steps to complete activation."
 echo
@@ -465,6 +603,15 @@ echo "    2. In the remote console/GUI, go to 'Settings -> Services -> VE.Can po
 echo "       matches your BMS."
 echo
 echo "    3. Re-run \"/data/apps/dbus-serialbattery/enable.sh\", if the CAN port was not added to the \"config.ini\" before."
+echo
+echo "MQTT battery connection: There are a few more steps to complete activation."
+echo
+echo "    1. Add your MQTT topic to the config file \"/data/apps/dbus-serialbattery/config.ini\"."
+echo "       Check the default config file \"/data/apps/dbus-serialbattery/config.default.ini\" for more informations."
+echo
+echo "    2. Make sure that your MQTT client settings in the config file are correct."
+echo
+echo "    3. Re-run \"/data/apps/dbus-serialbattery/enable.sh\", if the MQTT topic was not added to the \"config.ini\" before."
 echo
 echo "CUSTOM SETTINGS: If you want to add custom settings, then check the settings you want to change in \"/data/apps/dbus-serialbattery/config.default.ini\""
 echo "                 and add them to \"/data/apps/dbus-serialbattery/config.ini\" to persist future driver updates."

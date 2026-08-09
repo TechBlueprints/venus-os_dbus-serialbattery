@@ -10,20 +10,12 @@ import logging
 import warnings
 from typing import Literal, Optional
 
-if sys.version_info < (3, 11):
-    from async_timeout import timeout as async_timeout
-else:
-    from asyncio import timeout as async_timeout
-
-if sys.version_info < (3, 12):
-    from typing_extensions import override
-else:
-    from typing import override
-
 from android.broadcast import BroadcastReceiver
 from android.permissions import Permission, request_permissions
 from jnius import cast, java_method
 
+from bleak._compat import override
+from bleak._compat import timeout as async_timeout
 from bleak.backends.p4android import defs, utils
 from bleak.backends.scanner import (
     AdvertisementData,
@@ -60,14 +52,13 @@ class BleakScannerP4Android(BaseBleakScanner):
         scanning_mode: Literal["active", "passive"],
         **kwargs,
     ):
-        super(BleakScannerP4Android, self).__init__(detection_callback, service_uuids)
+        super().__init__(detection_callback, service_uuids)
 
         if scanning_mode == "passive":
             self.__scan_mode = defs.ScanSettings.SCAN_MODE_OPPORTUNISTIC
         else:
             self.__scan_mode = defs.ScanSettings.SCAN_MODE_LOW_LATENCY
 
-        self.__adapter = None
         self.__javascanner = None
         self.__callback = None
 
@@ -108,13 +99,13 @@ class BleakScannerP4Android(BaseBleakScanner):
             )
             await permission_acknowledged
 
-            self.__adapter = defs.BluetoothAdapter.getDefaultAdapter()
-            if self.__adapter is None:
+            adapter = defs.BluetoothAdapter.getDefaultAdapter()
+            if adapter is None:
                 raise BleakError("Bluetooth is not supported on this hardware platform")
-            if self.__adapter.getState() != defs.BluetoothAdapter.STATE_ON:
+            if adapter.getState() != defs.BluetoothAdapter.STATE_ON:
                 raise BleakError("Bluetooth is not turned on")
 
-            self.__javascanner = self.__adapter.getBluetoothLeScanner()
+            self.__javascanner = adapter.getBluetoothLeScanner()
 
         BleakScannerP4Android.__scanner = self
 
@@ -196,7 +187,7 @@ class BleakScannerP4Android(BaseBleakScanner):
                 )
                 receiver.start()
                 try:
-                    self.__adapter.disable()
+                    adapter.disable()
                     await stateOffFuture
                 finally:
                     receiver.stop()
@@ -211,7 +202,7 @@ class BleakScannerP4Android(BaseBleakScanner):
                 )
                 receiver.start()
                 try:
-                    self.__adapter.enable()
+                    adapter.enable()
                     await stateOnFuture
                 finally:
                     receiver.stop()

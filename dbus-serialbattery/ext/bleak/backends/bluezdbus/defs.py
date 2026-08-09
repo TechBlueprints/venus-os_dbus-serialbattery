@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 from typing import Literal, TypedDict
 
 from bleak.assigned_numbers import CharacteristicPropertyName
@@ -23,6 +21,18 @@ GATT_SERVICE_INTERFACE = "org.bluez.GattService1"
 GATT_CHARACTERISTIC_INTERFACE = "org.bluez.GattCharacteristic1"
 GATT_DESCRIPTOR_INTERFACE = "org.bluez.GattDescriptor1"
 
+# BlueZ error names
+BLUEZ_ERROR_DOES_NOT_EXIST = "org.bluez.Error.DoesNotExist"
+BLUEZ_ERROR_FAILED = "org.bluez.Error.Failed"
+BLUEZ_ERROR_IMPROPERLY_CONFIGURED = "org.bluez.Error.ImproperlyConfigured"
+BLUEZ_ERROR_IN_PROGRESS = "org.bluez.Error.InProgress"
+BLUEZ_ERROR_INVALID_ARGUMENT = "org.bluez.Error.InvalidArguments"
+BLUEZ_ERROR_INVALID_OFFSET = "org.bluez.Error.InvalidOffset"
+BLUEZ_ERROR_INVALID_VALUE_LENGTH = "org.bluez.Error.InvalidValueLength"
+BLUEZ_ERROR_NOT_AUTHORIZED = "org.bluez.Error.NotAuthorized"
+BLUEZ_ERROR_NOT_PERMITTED = "org.bluez.Error.NotPermitted"
+BLUEZ_ERROR_NOT_READY = "org.bluez.Error.NotReady"
+BLUEZ_ERROR_NOT_SUPPORTED = "org.bluez.Error.NotSupported"
 
 # D-Bus properties for interfaces
 # https://github.com/bluez/bluez/blob/master/doc/org.bluez.Adapter.rst
@@ -123,6 +133,8 @@ class GattCharacteristic1(TypedDict):
     NotifyAcquired: bool
     Notifying: bool
     Flags: list[CharacteristicPropertyName]
+    # "MTU" property was added in BlueZ 5.62.
+    # It may missing when operating with an older stack.
     MTU: int
     # Handle is server-only and not available in Bleak
 
