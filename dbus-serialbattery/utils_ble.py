@@ -3,6 +3,7 @@ import asyncio
 import subprocess
 import sys
 from bleak import BleakClient
+from bleak.exc import BleakCharacteristicNotFoundError
 from time import sleep
 from utils import logger, BLUETOOTH_FORCE_RESET_BLE_STACK
 
@@ -70,7 +71,23 @@ class Syncron_Ble:
             logger.info("initiating BLE connection to: " + address)
             await self.client.connect()
             logger.info("connected to bluetooh device" + address)
-            await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
+            # On some devices GATT characteristics become available only after connect()
+            # has already returned, so the first start_notify() can raise
+            # BleakCharacteristicNotFoundError for a characteristic that does exist.
+            # Re-run service discovery and retry before giving up.
+            for attempt in range(3):
+                try:
+                    await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
+                    break
+                except BleakCharacteristicNotFoundError:
+                    if attempt == 2:
+                        raise
+                    logger.warning(f"characteristic {self.read_characteristic} not found yet, re-running service discovery")
+                    # bleak has no public API to re-run service discovery on a connected
+                    # client; clear the cached services so _get_services() fetches again
+                    self.client._backend.services = None
+                    await self.client._backend._get_services()
+                    await asyncio.sleep(0.5)
 
         except Exception as e:
             logger.error("Failed when trying to connect", e)
