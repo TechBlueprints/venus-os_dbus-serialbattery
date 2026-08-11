@@ -1322,8 +1322,17 @@ class DbusHelper:
         if self.battery.control_discharge_current is not None:
             self._dbusservice["/Info/MaxDischargeCurrent"] = self.battery.control_discharge_current
 
+        # While serving stale data, block charging but keep discharging allowed:
+        # without live cell-level data the driver must not request further charging,
+        # while discharging is still safely monitored by the fallback sensor and
+        # the BMS's own cell-level protection.
+        if self.stale_serving:
+            self._dbusservice["/Info/MaxChargeCurrent"] = 0
+            self._dbusservice["/Io/AllowToCharge"] = 0
+            self._dbusservice["/System/NrOfModulesBlockingCharge"] = 1
+
         # Voltage and charge control info (custom dbus paths)
-        self._dbusservice["/Info/ChargeMode"] = self.battery.charge_mode
+        self._dbusservice["/Info/ChargeMode"] = "Stale data - charging blocked" if self.stale_serving else self.battery.charge_mode
         self._dbusservice["/Info/ChargeModeDebug"] = self.battery.charge_mode_debug
         self._dbusservice["/Info/ChargeModeDebugFloat"] = self.battery.charge_mode_debug_float
         self._dbusservice["/Info/ChargeModeDebugBulk"] = self.battery.charge_mode_debug_bulk

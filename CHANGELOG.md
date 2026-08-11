@@ -30,7 +30,7 @@
 * Added: dbus caching to reduce writes and therefore CPU consumption with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/397 by @cgoudie
 * Added: Device state and mode values by @mr-manuel
 * Added: `EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE` and `EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE` to use an external sensor, e.g. a SmartShunt, for the published battery voltage, power and temperature. Together with the existing `EXTERNAL_SENSOR_DBUS_PATH_CURRENT` this allows overriding the BMS values with the more precise shunt measurements by @cgoudie
-* Added: `FALLBACK_SENSOR_DBUS_DEVICE` and `FALLBACK_SERVE_STALE_MINUTES` to serve data from a fallback device, e.g. a SmartShunt, while the connection to the BMS is lost: voltage, current and temperature are read live from the fallback device and all other values are served stale (frozen at the last BMS read) instead of resetting them and going into an error state by @cgoudie
+* Added: `FALLBACK_SENSOR_DBUS_DEVICE` and `FALLBACK_SERVE_STALE_MINUTES` to serve data from a fallback device, e.g. a SmartShunt, while the connection to the BMS is lost: voltage, current and temperature are read live from the fallback device, all other values are served stale (frozen at the last BMS read) instead of resetting them and going into an error state, and charging is blocked while discharging stays allowed by @cgoudie
 * Added: Disable serial starter if not needed by @mr-manuel
 * Added: Generic MQTT BMS by @mr-manuel
 * Added: Health check for batteries which are using the callback by @mr-manuel
