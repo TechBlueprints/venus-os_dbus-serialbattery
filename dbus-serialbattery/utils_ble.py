@@ -5,7 +5,84 @@ import sys
 from bleak import BleakClient
 from bleak.exc import BleakCharacteristicNotFoundError
 from time import sleep
-from utils import logger, BLUETOOTH_FORCE_RESET_BLE_STACK, capture_raw_data
+from utils import logger, BLUETOOTH_CONNECTION_BACKEND, BLUETOOTH_FORCE_RESET_BLE_STACK, capture_raw_data
+
+
+class BleConnectionBackend:
+    """
+    Interface for establishing and releasing BLE connections.
+
+    Separates how a connection is established/torn down (the backend) from how
+    Syncron_Ble supervises it and exchanges data with the BMS drivers. This allows
+    alternative connection strategies to be plugged in without touching the drivers.
+    """
+
+    def create_client(self, address, disconnected_callback):
+        """
+        Create the BleakClient for the given address, or None if the backend
+        creates its own client during establish().
+        """
+        raise NotImplementedError
+
+    async def establish(self, client, address, notify_char, notify_callback):
+        """
+        Connect and start notifications. Returns the connected client
+        (may differ from the one passed in). Raises on failure.
+        """
+        raise NotImplementedError
+
+    async def release(self, client):
+        """Disconnect the client."""
+        raise NotImplementedError
+
+
+class BleakBackend(BleConnectionBackend):
+    """
+    Default backend: connects directly with bleak, matching the historical
+    behavior of this driver.
+    """
+
+    def create_client(self, address, disconnected_callback):
+        return BleakClient(address, disconnected_callback=disconnected_callback)
+
+    async def establish(self, client, address, notify_char, notify_callback):
+        logger.info("initiating BLE connection to: " + address)
+        await client.connect()
+        logger.info("connected to bluetooh device" + address)
+        # On some devices GATT characteristics become available only after connect()
+        # has already returned, so the first start_notify() can raise
+        # BleakCharacteristicNotFoundError for a characteristic that does exist.
+        # Re-run service discovery and retry before giving up.
+        for attempt in range(3):
+            try:
+                await client.start_notify(notify_char, notify_callback)
+                break
+            except BleakCharacteristicNotFoundError:
+                if attempt == 2:
+                    raise
+                logger.warning(f"characteristic {notify_char} not found yet, re-running service discovery")
+                # bleak has no public API to re-run service discovery on a connected
+                # client; clear the cached services so _get_services() fetches again
+                client._backend.services = None
+                await client._backend._get_services()
+                await asyncio.sleep(0.5)
+        return client
+
+    async def release(self, client):
+        await client.disconnect()
+
+
+# Available connection backends, selected by class name via BLUETOOTH_CONNECTION_BACKEND
+supported_ble_backends = [BleakBackend]
+
+
+def get_ble_backend():
+    """Return the connection backend selected by BLUETOOTH_CONNECTION_BACKEND."""
+    for backend in supported_ble_backends:
+        if backend.__name__ == BLUETOOTH_CONNECTION_BACKEND:
+            return backend()
+    logger.warning(f"Unknown BLUETOOTH_CONNECTION_BACKEND '{BLUETOOTH_CONNECTION_BACKEND}', using 'BleakBackend'")
+    return BleakBackend()
 
 
 # Class that enables synchronous writing and reading to a bluetooh device
@@ -35,6 +112,7 @@ class Syncron_Ble:
         self.write_characteristic = write_characteristic
         self.read_characteristic = read_characteristic
         self.address = address
+        self.backend = get_ble_backend()
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
@@ -66,37 +144,19 @@ class Syncron_Ble:
         logger.error(f"bluetooh device with address: {self.address} disconnected")
 
     async def connect_to_bms(self, address):
-        self.client = BleakClient(address, disconnected_callback=self.client_disconnected)
+        self.client = self.backend.create_client(address, self.client_disconnected)
         try:
-            logger.info("initiating BLE connection to: " + address)
-            await self.client.connect()
-            logger.info("connected to bluetooh device" + address)
-            # On some devices GATT characteristics become available only after connect()
-            # has already returned, so the first start_notify() can raise
-            # BleakCharacteristicNotFoundError for a characteristic that does exist.
-            # Re-run service discovery and retry before giving up.
-            for attempt in range(3):
-                try:
-                    await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
-                    break
-                except BleakCharacteristicNotFoundError:
-                    if attempt == 2:
-                        raise
-                    logger.warning(f"characteristic {self.read_characteristic} not found yet, re-running service discovery")
-                    # bleak has no public API to re-run service discovery on a connected
-                    # client; clear the cached services so _get_services() fetches again
-                    self.client._backend.services = None
-                    await self.client._backend._get_services()
-                    await asyncio.sleep(0.5)
+            self.client = await self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback)
 
         except Exception as e:
             logger.error("Failed when trying to connect", e)
             return False
         finally:
             self.ble_connection_ready.set()
-            while self.client.is_connected and self.main_thread.is_alive():
-                await asyncio.sleep(0.1)
-            await self.client.disconnect()
+            if self.client:
+                while self.client.is_connected and self.main_thread.is_alive():
+                    await asyncio.sleep(0.1)
+                await self.backend.release(self.client)
 
     # saves response and tells the command sender that the response has arived
     def notify_read_callback(self, sender, data: bytearray):
