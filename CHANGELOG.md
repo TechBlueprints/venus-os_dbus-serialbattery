@@ -29,6 +29,7 @@
 * Added: Daren 485 BMS - Read SoH with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/344 by @kopierschnitte
 * Added: dbus caching to reduce writes and therefore CPU consumption with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/397 by @cgoudie
 * Added: Device state and mode values by @mr-manuel
+* Added: `EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE` to use an external sensor, e.g. a SmartShunt, for the published battery voltage and power. Together with the existing `EXTERNAL_SENSOR_DBUS_PATH_CURRENT` this allows overriding the BMS values with the more precise shunt measurements for current, voltage or both by @cgoudie
 * Added: Disable serial starter if not needed by @mr-manuel
 * Added: Generic MQTT BMS by @mr-manuel
 * Added: Health check for batteries which are using the callback by @mr-manuel

@@ -437,6 +437,7 @@ class Battery(ABC):
         :return: None
         """
         self.voltage: float = None
+        self.voltage_calc: float = None
         self.current: float = None
         self.current_calc: float = None
         self.current_corrected: float = None
@@ -2125,6 +2126,14 @@ class Battery(ABC):
 
             if is_present_in_vebus:
 
+                if utils.EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE is not None:
+                    logger.info(f"Using external sensor for voltage: {utils.EXTERNAL_SENSOR_DBUS_DEVICE}{utils.EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE}")
+                    dbus_objects["Voltage"] = VeDbusItemImport(
+                        dbus_connection,
+                        utils.EXTERNAL_SENSOR_DBUS_DEVICE,
+                        utils.EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE,
+                    )
+
                 if utils.EXTERNAL_SENSOR_DBUS_PATH_CURRENT is not None:
                     logger.info(f"Using external sensor for current: {utils.EXTERNAL_SENSOR_DBUS_DEVICE}{utils.EXTERNAL_SENSOR_DBUS_PATH_CURRENT}")
                     dbus_objects["Current"] = VeDbusItemImport(
@@ -2146,6 +2155,7 @@ class Battery(ABC):
         except Exception:
             # set to None to avoid crashing, fallback to battery current
             utils.EXTERNAL_SENSOR_DBUS_DEVICE = None
+            utils.EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE = None
             utils.EXTERNAL_SENSOR_DBUS_PATH_CURRENT = None
             utils.EXTERNAL_SENSOR_DBUS_PATH_SOC = None
             self.dbus_external_objects = None
@@ -2158,6 +2168,24 @@ class Battery(ABC):
             line = exception_traceback.tb_lineno
             logger.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
             logger.error("External current sensor setup failed, fallback to internal sensor")
+
+    def get_voltage(self) -> Union[float, None]:
+        """
+        Get the voltage, either from:
+        - the external sensor
+        - the battery
+
+        :return: The voltage
+        """
+        # get external sensor value
+        if self.dbus_external_objects is not None and "Voltage" in self.dbus_external_objects and self.dbus_external_objects["Voltage"] is not None:
+            voltage_external = self.dbus_external_objects["Voltage"].get_value()
+            logger.debug(f"voltage: {self.voltage} - voltage_external: {voltage_external}")
+            if voltage_external is not None:
+                return round(voltage_external, 3)
+
+        # fall back to the value from the battery
+        return self.voltage
 
     def get_current(self) -> Union[float, None]:
         """
@@ -2235,7 +2263,7 @@ class Battery(ABC):
             # Coloumb count discharged energy
             self.energy_discharged += energy * -1 if energy < 0 else 0
 
-        power = self.voltage * self.current_calc if self.current_calc is not None and self.voltage is not None else None
+        power = self.voltage_calc * self.current_calc if self.current_calc is not None and self.voltage_calc is not None else None
 
         self.power_calc_last_time = current_time
         return power
@@ -2267,6 +2295,7 @@ class Battery(ABC):
 
         :return: None
         """
+        self.voltage_calc = self.get_voltage()
         self.current_calc = self.get_current()
         self.power_calc = self.get_power()
         self.soc_calc = self.get_soc()

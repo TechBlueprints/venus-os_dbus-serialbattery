@@ -300,8 +300,9 @@ if not BLOCK_ON_DISCONNECT:
 BMS_CABLE_ALARM: bool = get_bool_from_config("DEFAULT", "BMS_CABLE_ALARM")
 
 
-# --------- External Sensor for Current and/or SoC ---------
+# --------- External Sensor for Voltage, Current and/or SoC ---------
 EXTERNAL_SENSOR_DBUS_DEVICE: Union[str, None] = config["DEFAULT"]["EXTERNAL_SENSOR_DBUS_DEVICE"] or None
+EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE: Union[str, None] = config["DEFAULT"]["EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE"] or None
 EXTERNAL_SENSOR_DBUS_PATH_CURRENT: Union[str, None] = config["DEFAULT"]["EXTERNAL_SENSOR_DBUS_PATH_CURRENT"] or None
 EXTERNAL_SENSOR_DBUS_PATH_SOC: Union[str, None] = config["DEFAULT"]["EXTERNAL_SENSOR_DBUS_PATH_SOC"] or None
 
