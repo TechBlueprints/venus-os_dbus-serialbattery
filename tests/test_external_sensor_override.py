@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tests for the external voltage sensor override (EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE)."""
+"""Tests for the external sensor override (EXTERNAL_SENSOR_DBUS_PATH_*) and fallback sensor (FALLBACK_SENSOR_DBUS_*)."""
 
 import os
 import sys
@@ -27,6 +27,8 @@ def _make_battery():
     battery.voltage = 26.0
     battery.voltage_calc = None
     battery.dbus_external_objects = None
+    battery.dbus_fallback_objects = None
+    battery.online = True
     return battery
 
 
@@ -59,6 +61,55 @@ class TestGetVoltage:
         battery = _make_battery()
         battery.voltage = None
         assert battery.get_voltage() is None
+
+
+class TestFallbackSensor:
+    def test_fallback_not_used_while_bms_online(self):
+        battery = _make_battery()
+        battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(25.5)}
+        assert battery.get_voltage() == 26.0
+
+    def test_fallback_used_while_bms_offline(self):
+        battery = _make_battery()
+        battery.online = False
+        battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(25.5)}
+        assert battery.get_voltage() == 25.5
+
+    def test_stale_bms_value_served_when_no_fallback_path(self):
+        battery = _make_battery()
+        battery.online = False
+        battery.dbus_fallback_objects = {"Current": _FakeDbusItem(-0.2)}
+        assert battery.get_voltage() == 26.0
+
+    def test_fallback_none_value_falls_back_to_stale_bms_value(self):
+        battery = _make_battery()
+        battery.online = False
+        battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(None)}
+        assert battery.get_voltage() == 26.0
+
+    def test_external_override_wins_over_fallback(self):
+        battery = _make_battery()
+        battery.online = False
+        battery.dbus_external_objects = {"Voltage": _FakeDbusItem(26.437)}
+        battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(25.5)}
+        assert battery.get_voltage() == 26.437
+
+    def test_fallback_temperature_used_while_bms_offline(self):
+        battery = _make_battery()
+        battery.online = False
+        battery.temperature_1 = 20.0
+        battery.temperature_2 = 22.0
+        battery.temperature_3 = None
+        battery.temperature_4 = None
+        battery.dbus_fallback_objects = {"Temperature": _FakeDbusItem(18.73)}
+        assert battery.get_temperature() == 18.7
+
+    def test_get_value_from_fallback_sensor_requires_offline(self):
+        battery = _make_battery()
+        battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(25.5)}
+        assert battery.get_value_from_fallback_sensor("Voltage") is None
+        battery.online = False
+        assert battery.get_value_from_fallback_sensor("Voltage") == 25.5
 
 
 class TestGetTemperature:

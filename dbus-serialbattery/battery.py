@@ -297,6 +297,7 @@ class Battery(ABC):
         self.type: str = "Generic"
         self.poll_interval: int = 1000
         self.dbus_external_objects: dict = None
+        self.dbus_fallback_objects: dict = None
         self.online: bool = None
         self.connection_info: str = "Initializing..."
         self.hardware_version: str = None
@@ -2020,6 +2021,11 @@ class Battery(ABC):
             if temperature_external is not None:
                 return round(temperature_external, 1)
 
+        # get fallback sensor value, if the BMS is offline
+        temperature_fallback = self.get_value_from_fallback_sensor("Temperature")
+        if temperature_fallback is not None:
+            return round(temperature_fallback, 1)
+
         try:
             temperature_map = self.get_filtered_temperature_map()
 
@@ -2184,6 +2190,92 @@ class Battery(ABC):
             logger.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
             logger.error("External current sensor setup failed, fallback to internal sensor")
 
+    def setup_fallback_sensor(self) -> None:
+        """
+        Setup fallback sensor and it's dbus items.
+
+        Unlike the external sensor, which always overrides the BMS values, the fallback
+        sensor is only read while the connection to the BMS is lost (stale data serving).
+        """
+        import dbus
+        import os
+        from dbus.mainloop.glib import DBusGMainLoop
+        from vedbus import VeDbusItemImport
+
+        # setup fallback dbus paths
+        try:
+            DBusGMainLoop(set_as_default=True)
+
+            # connect to the sessionbus, on a CC GX the systembus is used
+            dbus_connection = dbus.SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ else dbus.SystemBus()
+
+            # dictionary containing the different items
+            dbus_objects = {}
+
+            # check if the dbus service is available
+            is_present_in_vebus = utils.FALLBACK_SENSOR_DBUS_DEVICE in dbus_connection.list_names()
+
+            if is_present_in_vebus:
+
+                if utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is not None:
+                    logger.info(f"Using fallback sensor for voltage: {utils.FALLBACK_SENSOR_DBUS_DEVICE}{utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE}")
+                    dbus_objects["Voltage"] = VeDbusItemImport(
+                        dbus_connection,
+                        utils.FALLBACK_SENSOR_DBUS_DEVICE,
+                        utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE,
+                    )
+
+                if utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT is not None:
+                    logger.info(f"Using fallback sensor for current: {utils.FALLBACK_SENSOR_DBUS_DEVICE}{utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT}")
+                    dbus_objects["Current"] = VeDbusItemImport(
+                        dbus_connection,
+                        utils.FALLBACK_SENSOR_DBUS_DEVICE,
+                        utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT,
+                    )
+
+                if utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE is not None:
+                    logger.info(f"Using fallback sensor for temperature: {utils.FALLBACK_SENSOR_DBUS_DEVICE}{utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE}")
+                    dbus_objects["Temperature"] = VeDbusItemImport(
+                        dbus_connection,
+                        utils.FALLBACK_SENSOR_DBUS_DEVICE,
+                        utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE,
+                    )
+
+                self.dbus_fallback_objects = dbus_objects
+
+        except Exception:
+            # set to None to avoid crashing, no stale serving without fallback sensor
+            utils.FALLBACK_SENSOR_DBUS_DEVICE = None
+            utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE = None
+            utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT = None
+            utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE = None
+            self.dbus_fallback_objects = None
+            (
+                exception_type,
+                exception_object,
+                exception_traceback,
+            ) = sys.exc_info()
+            file = exception_traceback.tb_frame.f_code.co_filename
+            line = exception_traceback.tb_lineno
+            logger.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
+            logger.error("Fallback sensor setup failed, stale data serving not available")
+
+    def get_value_from_fallback_sensor(self, key: str) -> Union[float, None]:
+        """
+        Read a value from the fallback sensor while the BMS is offline.
+
+        :param key: The item key ("Voltage", "Current" or "Temperature")
+        :return: The value from the fallback sensor, or None if not available
+        """
+        if self.online is not False:
+            return None
+        if self.dbus_fallback_objects is None or key not in self.dbus_fallback_objects or self.dbus_fallback_objects[key] is None:
+            return None
+        try:
+            return self.dbus_fallback_objects[key].get_value()
+        except Exception:
+            return None
+
     def get_voltage(self) -> Union[float, None]:
         """
         Get the voltage, either from:
@@ -2198,6 +2290,11 @@ class Battery(ABC):
             logger.debug(f"voltage: {self.voltage} - voltage_external: {voltage_external}")
             if voltage_external is not None:
                 return round(voltage_external, 3)
+
+        # get fallback sensor value, if the BMS is offline
+        voltage_fallback = self.get_value_from_fallback_sensor("Voltage")
+        if voltage_fallback is not None:
+            return round(voltage_fallback, 3)
 
         # fall back to the value from the battery
         return self.voltage
@@ -2224,11 +2321,16 @@ class Battery(ABC):
             self.charge_discharged += charge * -1 if charge < 0 else 0
             self.charge_discharged_last += charge * -1 if charge < 0 else 0
 
+        # get fallback sensor value, if the BMS is offline
+        current_fallback = self.get_value_from_fallback_sensor("Current")
+
         # get external sensor value
         if self.dbus_external_objects is not None and "Current" in self.dbus_external_objects and self.dbus_external_objects["Current"] is not None:
             current_external = round(self.dbus_external_objects["Current"].get_value(), 3)
             logger.debug(f"current: {self.current} - current_external: {current_external}")
             current = current_external
+        elif current_fallback is not None:
+            current = round(current_fallback, 3)
         else:
             # calculate current only, if lists are different
             if utils.CURRENT_CORRECTION:

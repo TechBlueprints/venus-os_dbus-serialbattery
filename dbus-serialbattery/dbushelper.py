@@ -129,6 +129,7 @@ class DbusHelper:
         self.cell_voltages_good: bool = None
         self.disconnect_threshold: int = None
         self.bms_cable_alarm: int = 0
+        self.stale_serving: bool = False
         self._dbusname: str = (
             "com.victronenergy.battery."
             + self.battery.port[self.battery.port.rfind("/") + 1 :]
@@ -919,6 +920,23 @@ class DbusHelper:
 
         return True
 
+    def stale_serving_eligible(self) -> bool:
+        """
+        Check if stale data serving can be entered/continued after the BMS disconnected.
+
+        Requires FALLBACK_SERVE_STALE_MINUTES to be set, BLOCK_ON_DISCONNECT to be disabled,
+        a connected fallback sensor and cell voltages that were within the safe thresholds
+        at the moment of disconnection.
+
+        :return: True if stale data serving is allowed
+        """
+        return (
+            utils.FALLBACK_SERVE_STALE_MINUTES > 0
+            and not utils.BLOCK_ON_DISCONNECT
+            and self.battery.dbus_fallback_objects is not None
+            and self.cell_voltages_good is True
+        )
+
     def publish_battery(self, loop) -> None:
         """
         Publishes the battery data to dbus.
@@ -954,6 +972,22 @@ class DbusHelper:
                     logger.info("External current sensor was connected, switching to external sensor")
                     self.battery.setup_external_sensor()
 
+            # Check if fallback sensor is still connected
+            if utils.FALLBACK_SENSOR_DBUS_DEVICE is not None and (
+                utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is not None
+                or utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT is not None
+                or utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE is not None
+            ):
+                # Check if fallback sensor was and is still connected
+                if self.battery.dbus_fallback_objects is not None and utils.FALLBACK_SENSOR_DBUS_DEVICE not in get_bus(self._dbusname).list_names():
+                    logger.error("Fallback sensor was disconnected, stale data serving not available")
+                    self.battery.dbus_fallback_objects = None
+
+                # Check if fallback sensor was not connected and is now connected
+                elif self.battery.dbus_fallback_objects is None and utils.FALLBACK_SENSOR_DBUS_DEVICE in get_bus(self._dbusname).list_names():
+                    logger.info("Fallback sensor was connected")
+                    self.battery.setup_fallback_sensor()
+
             if result:
                 # reset error count, if last error was more than 60 seconds ago
                 if self.error["count"] > 0 and self.error["timestamp_last"] < int(time()) - 60:
@@ -969,6 +1003,12 @@ class DbusHelper:
                     logger.info(">>> Battery reconnected <<<")
 
                 self.battery.online = True
+
+                # stop serving stale data, live values are available again
+                if self.stale_serving:
+                    self.stale_serving = False
+                    logger.info(">>> Battery responds again, stop serving stale data <<<")
+
                 if self.error["count"] > 0:
                     seconds_since_first_error = int(time()) - self.error["timestamp_first"]
                     self.battery.connection_info = (
@@ -1057,6 +1097,9 @@ class DbusHelper:
                     # set disconnect threshold time
                     if self.disconnect_threshold is None:
                         self.disconnect_threshold = RETRY_CYCLE_LONG_COUNT if utils.BLOCK_ON_DISCONNECT else utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES * 60
+                        # keep the driver alive at least as long as stale data serving is allowed
+                        if self.stale_serving_eligible():
+                            self.disconnect_threshold = max(self.disconnect_threshold, int(utils.FALLBACK_SERVE_STALE_MINUTES * 60))
 
                     # if the battery did not update in 10 second, it's assumed to be offline
                     if time_since_first_error >= RETRY_CYCLE_SHORT_COUNT:
@@ -1092,7 +1135,15 @@ class DbusHelper:
                                     + ("OK" if self.battery.get_max_cell_voltage() < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX else "NOT OK")
                                 )
 
-                            self.battery.init_values()
+                            if self.stale_serving_eligible():
+                                # keep the last read values and serve V/I/T from the fallback sensor
+                                self.stale_serving = True
+                                logger.warning(
+                                    "    Serving stale data instead of resetting values: voltage/current/temperature live from the "
+                                    + f"fallback sensor, other values frozen for up to {utils.FALLBACK_SERVE_STALE_MINUTES:.0f} minutes."
+                                )
+                            else:
+                                self.battery.init_values()
 
                     # set connection info
                     remaining = self.disconnect_threshold - time_since_first_error
@@ -1119,6 +1170,11 @@ class DbusHelper:
                     # This is only possible if cell voltages are good and BLOCK_ON_DISCONNECT is disabled else it would have exited earlier
                     elif time_since_first_error >= self.disconnect_threshold:
                         recovery_failed = True
+
+            # while serving stale data, refresh the calculated values so that
+            # voltage/current/power/temperature update live from the fallback sensor
+            if not result and self.stale_serving:
+                self.battery.set_calculated_data()
 
             # publish all the data from the battery object to dbus
             self.publish_dbus()

@@ -308,10 +308,28 @@ EXTERNAL_SENSOR_DBUS_PATH_SOC: Union[str, None] = config["DEFAULT"]["EXTERNAL_SE
 EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE: Union[str, None] = config["DEFAULT"]["EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE"] or None
 
 
+# --------- Fallback Sensor and Stale Data Serving ---------
+FALLBACK_SENSOR_DBUS_DEVICE: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_DEVICE"] or None
+FALLBACK_SENSOR_DBUS_PATH_VOLTAGE: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_PATH_VOLTAGE"] or None
+FALLBACK_SENSOR_DBUS_PATH_CURRENT: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_PATH_CURRENT"] or None
+FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE"] or None
+FALLBACK_SERVE_STALE_MINUTES: float = get_float_from_config("DEFAULT", "FALLBACK_SERVE_STALE_MINUTES")
+
+
 # Common configuration checks
 check_config_issue(
     SOC_CALCULATION and EXTERNAL_SENSOR_DBUS_PATH_SOC is not None,
     "SOC_CALCULATION and EXTERNAL_SENSOR_DBUS_PATH_SOC are both enabled. This will lead to a conflict. Please disable one of them in the configuration.",
+)
+
+check_config_issue(
+    FALLBACK_SERVE_STALE_MINUTES > 0 and FALLBACK_SENSOR_DBUS_DEVICE is None,
+    "FALLBACK_SERVE_STALE_MINUTES is set but FALLBACK_SENSOR_DBUS_DEVICE is empty. Stale serving requires a fallback device. Please check the configuration.",
+)
+
+check_config_issue(
+    FALLBACK_SERVE_STALE_MINUTES > 0 and BLOCK_ON_DISCONNECT,
+    "FALLBACK_SERVE_STALE_MINUTES and BLOCK_ON_DISCONNECT are both enabled. Stale serving is not entered when BLOCK_ON_DISCONNECT is active. Please disable one of them in the configuration.",
 )
 
 
