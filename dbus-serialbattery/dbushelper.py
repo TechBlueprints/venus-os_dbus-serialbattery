@@ -939,7 +939,10 @@ class DbusHelper:
 
             # Check if external sensor is still connected
             if utils.EXTERNAL_SENSOR_DBUS_DEVICE is not None and (
-                utils.EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE is not None or utils.EXTERNAL_SENSOR_DBUS_PATH_CURRENT is not None or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None
+                utils.EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE is not None
+                or utils.EXTERNAL_SENSOR_DBUS_PATH_CURRENT is not None
+                or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None
+                or utils.EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE is not None
             ):
                 # Check if external sensor was and is still connected
                 if self.battery.dbus_external_objects is not None and utils.EXTERNAL_SENSOR_DBUS_DEVICE not in get_bus(self._dbusname).list_names():

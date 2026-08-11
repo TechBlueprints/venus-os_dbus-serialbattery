@@ -2014,6 +2014,12 @@ class Battery(ABC):
         return {sensor: temperature_map[sensor] for sensor in utils.TEMPERATURE_SOURCE_BATTERY if temperature_map.get(sensor) is not None}
 
     def get_temperature(self) -> Union[float, None]:
+        # get external sensor value
+        if self.dbus_external_objects is not None and "Temperature" in self.dbus_external_objects and self.dbus_external_objects["Temperature"] is not None:
+            temperature_external = self.dbus_external_objects["Temperature"].get_value()
+            if temperature_external is not None:
+                return round(temperature_external, 1)
+
         try:
             temperature_map = self.get_filtered_temperature_map()
 
@@ -2150,6 +2156,14 @@ class Battery(ABC):
                         utils.EXTERNAL_SENSOR_DBUS_PATH_SOC,
                     )
 
+                if utils.EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE is not None:
+                    logger.info(f"Using external sensor for temperature: {utils.EXTERNAL_SENSOR_DBUS_DEVICE}{utils.EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE}")
+                    dbus_objects["Temperature"] = VeDbusItemImport(
+                        dbus_connection,
+                        utils.EXTERNAL_SENSOR_DBUS_DEVICE,
+                        utils.EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE,
+                    )
+
                 self.dbus_external_objects = dbus_objects
 
         except Exception:
@@ -2158,6 +2172,7 @@ class Battery(ABC):
             utils.EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE = None
             utils.EXTERNAL_SENSOR_DBUS_PATH_CURRENT = None
             utils.EXTERNAL_SENSOR_DBUS_PATH_SOC = None
+            utils.EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE = None
             self.dbus_external_objects = None
             (
                 exception_type,
