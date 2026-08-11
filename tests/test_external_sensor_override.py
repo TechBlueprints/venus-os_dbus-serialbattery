@@ -61,6 +61,35 @@ class TestGetVoltage:
         assert battery.get_voltage() is None
 
 
+class TestGetTemperature:
+    def _make_battery_with_temperatures(self):
+        battery = _make_battery()
+        battery.temperature_1 = 20.0
+        battery.temperature_2 = 22.0
+        battery.temperature_3 = None
+        battery.temperature_4 = None
+        return battery
+
+    def test_no_external_sensor_returns_bms_temperature_average(self):
+        battery = self._make_battery_with_temperatures()
+        assert battery.get_temperature() == 21.0
+
+    def test_external_sensor_overrides_bms_temperature(self):
+        battery = self._make_battery_with_temperatures()
+        battery.dbus_external_objects = {"Temperature": _FakeDbusItem(18.73)}
+        assert battery.get_temperature() == 18.7
+
+    def test_external_sensor_none_value_falls_back_to_bms(self):
+        battery = self._make_battery_with_temperatures()
+        battery.dbus_external_objects = {"Temperature": _FakeDbusItem(None)}
+        assert battery.get_temperature() == 21.0
+
+    def test_external_objects_without_temperature_key_falls_back_to_bms(self):
+        battery = self._make_battery_with_temperatures()
+        battery.dbus_external_objects = {"Voltage": _FakeDbusItem(26.4)}
+        assert battery.get_temperature() == 21.0
+
+
 class TestGetPower:
     def test_power_uses_calculated_voltage(self):
         battery = _make_battery()
