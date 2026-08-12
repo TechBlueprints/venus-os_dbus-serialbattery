@@ -27,10 +27,8 @@ import time
 import json
 import os
 from collections import deque
-from bleak import BleakClient
-from bleak.exc import BleakCharacteristicNotFoundError
 from utils_ble import Syncron_Ble
-from utils import logger, BATTERY_CAPACITY, BLUETOOTH_PREFERRED_ADAPTERS, MAX_BATTERY_CHARGE_CURRENT, MAX_BATTERY_DISCHARGE_CURRENT
+from utils import logger, BATTERY_CAPACITY, MAX_BATTERY_CHARGE_CURRENT, MAX_BATTERY_DISCHARGE_CURRENT
 
 
 class HumsiENK_Syncron_Ble(Syncron_Ble):
@@ -44,17 +42,18 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
 
       - _notification_queue: every notification chunk is queued so the
         polling loop can drain and reassemble frames without losing data
-      - live `connected` tracking: set True after start_notify succeeds
-        (however long the connect took), False when the link drops
+      - live `connected` tracking: set True after the backend establishes
+        the connection (however long that took), False when the link drops
       - a notification watchdog: feed_watchdog() is called by the driver
         on every checksum-verified frame; if the link looks up but no
         data has arrived for WATCHDOG_TIMEOUT, the connection is dropped
         so the daemon thread's retry loop can rebuild it (zombie links
         otherwise stay "connected" forever without notifications)
-      - a start_notify retry: BlueZ can report ServicesResolved before
-        every GATT characteristic is exported, so the first start_notify
-        can raise BleakCharacteristicNotFoundError on a snapshot that is
-        simply incomplete — refresh the service cache and retry
+
+    Connection mechanics (device resolution, adapter selection/rotation,
+    scan coordination, retries, escalation) are delegated to the configured
+    BLE connection backend (BLUETOOTH_CONNECTION_BACKEND) — use BCMBackend
+    on hosts where multiple BLE services contend for adapters.
     """
 
     WATCHDOG_TIMEOUT = 180.0
@@ -62,8 +61,6 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
     def __init__(self, *args, **kwargs):
         self._notification_queue = deque(maxlen=256)
         self._watchdog_last_fed = time.time()
-        self._scan_busy_count = 0  # consecutive org.bluez.Error.InProgress failures
-        self._adapter_idx = 0  # rotates through adapters when the default one is contended
         super().__init__(*args, **kwargs)
 
     def feed_watchdog(self):
@@ -76,109 +73,31 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
             self.response_data = data
             self.response_event.set()
 
-    async def _find_cached_device(self, address, adapter=None):
-        """Locate the device in BlueZ's cache so we can connect without scanning.
-
-        bleak's address-based connect first runs a discovery scan to resolve
-        the device, but on a GX device other services (dbus-ble-sensors etc.)
-        often occupy the adapter's scan slot, making StartDiscovery fail with
-        org.bluez.Error.InProgress indefinitely.  BlueZ keeps device objects
-        cached after first sight, and BleakClient accepts a BLEDevice carrying
-        the cached D-Bus path directly — no scan needed.
-        """
-        try:
-            from bleak.backends.bluezdbus.manager import get_global_bluez_manager
-            from bleak.backends.device import BLEDevice
-
-            manager = await get_global_bluez_manager()
-            suffix = "/dev_" + address.replace(":", "_").upper()
-            for path, interfaces in manager._properties.items():
-                if path.endswith(suffix) and "org.bluez.Device1" in interfaces:
-                    if adapter is not None and f"/{adapter}/" not in path:
-                        continue
-                    props = interfaces["org.bluez.Device1"]
-                    return BLEDevice(address, props.get("Name"), {"path": path, "props": props})
-        except Exception as e:
-            logger.debug(f"HumsiENK: cached-device lookup failed: {e}")
-        return None
-
-    async def _list_adapters(self):
-        """Return the hciX names of all BlueZ adapters, sorted."""
-        try:
-            from bleak.backends.bluezdbus.manager import get_global_bluez_manager
-
-            manager = await get_global_bluez_manager()
-            return sorted(path.rsplit("/", 1)[-1] for path, interfaces in manager._properties.items() if "org.bluez.Adapter1" in interfaces)
-        except Exception as e:
-            logger.debug(f"HumsiENK: adapter enumeration failed: {e}")
-            return []
-
     async def connect_to_bms(self, address):
-        # Adapter selection, in priority order:
-        # 1. BLUETOOTH_PREFERRED_ADAPTERS (config): always connect via one of
-        #    these, rotating to the next entry after a failed attempt.  Lets
-        #    installations keep BMS links off an adapter that other services
-        #    keep busy or that shows controller-level instability.
-        # 2. No preference configured: system default adapter, but after 3
-        #    consecutive org.bluez.Error.InProgress scan failures rotate
-        #    through all adapters — multi-dongle setups are common on GX
-        #    devices precisely because of scan contention.
-        adapter = None
-        preferred = [a.strip() for a in BLUETOOTH_PREFERRED_ADAPTERS if a.strip()]
-        if preferred:
-            adapter = preferred[self._adapter_idx % len(preferred)]
-        elif self._scan_busy_count >= 3:
-            adapters = await self._list_adapters()
-            if adapters:
-                adapter = adapters[self._adapter_idx % len(adapters)]
-                self._adapter_idx += 1
-        target = await self._find_cached_device(address, adapter) or address
-        kwargs = {}
-        adapter_note = ""
-        if adapter is not None and isinstance(target, str):
-            kwargs["adapter"] = adapter
-            adapter_note = f" (adapter {adapter})"
-        self.client = BleakClient(target, disconnected_callback=self.client_disconnected, **kwargs)
+        self.client = self.backend.create_client(address, self.client_disconnected)
         try:
-            if target is not address:
-                adapter_note = f" (via cached BlueZ device on {adapter or 'default adapter'}, no scan)"
-            logger.info("initiating BLE connection to: " + address + adapter_note)
-            await self.client.connect()
-            logger.info("connected to bluetooth device " + address)
-            for attempt in range(3):
-                try:
-                    await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
-                    break
-                except BleakCharacteristicNotFoundError:
-                    if attempt == 2:
-                        raise
-                    self.client._backend.services = None
-                    await self.client._backend._get_services()
-                    await asyncio.sleep(0.5)
+            self.client = await self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback)
             self.feed_watchdog()
-            self._scan_busy_count = 0
             self.connected = True
         except Exception as e:
-            if "InProgress" in str(e):
-                self._scan_busy_count += 1
-            else:
-                self._scan_busy_count = 0
-            if preferred:
-                # try the next preferred adapter on the next attempt
-                self._adapter_idx += 1
             logger.error(f"Failed when trying to connect: {e}")
             return False
         finally:
             self.ble_connection_ready.set()
             try:
-                while self.client.is_connected and self.main_thread.is_alive():
-                    if self.connected and (time.time() - self._watchdog_last_fed) > self.WATCHDOG_TIMEOUT:
-                        logger.error(f"HumsiENK: no BLE data for {self.WATCHDOG_TIMEOUT:.0f}s despite active link — dropping connection to force a reconnect")
-                        break
-                    await asyncio.sleep(0.1)
+                if self.client:
+                    while self.client.is_connected and self.main_thread.is_alive():
+                        if self.connected and (time.time() - self._watchdog_last_fed) > self.WATCHDOG_TIMEOUT:
+                            logger.error(f"HumsiENK: no BLE data for {self.WATCHDOG_TIMEOUT:.0f}s despite active link — dropping to force a reconnect")
+                            break
+                        await asyncio.sleep(0.1)
             finally:
                 self.connected = False
-                await self.client.disconnect()
+                if self.client:
+                    try:
+                        await self.backend.release(self.client)
+                    except Exception:
+                        pass
 
 
 class HumsiENK_Ble(Battery):
