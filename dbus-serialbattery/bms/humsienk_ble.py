@@ -23,6 +23,7 @@ being worked through separately.
 
 from battery import Battery, Cell
 import asyncio
+import threading
 import time
 import json
 import os
@@ -61,6 +62,9 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
 
     def __init__(self, *args, **kwargs):
         self._notification_queue = deque(maxlen=256)
+        # Signaled on every queued notification so consumers can block
+        # instead of polling the queue (see _pop_next_notification)
+        self._notification_signal = threading.Condition()
         self._watchdog_last_fed = time.time()
         self._scan_busy_count = 0  # consecutive org.bluez.Error.InProgress failures
         self._adapter_idx = 0  # rotates through adapters when the default one is contended
@@ -71,6 +75,8 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
 
     def notify_read_callback(self, sender, data: bytearray):
         self._notification_queue.append(bytes(data))
+        with self._notification_signal:
+            self._notification_signal.notify_all()
         # Preserve the stock request/response contract used by send_data()
         if self.response_event:
             self.response_data = data
@@ -1405,21 +1411,31 @@ class HumsiENK_Ble(Battery):
             self.ble_handle.send_data(cmd)
 
     def _pop_next_notification(self, timeout: float = 0.3):
-        # Pop a single notification chunk from the BLE notify queue, waiting up to timeout
+        # Pop a single notification chunk from the BLE notify queue.
+        # Event-driven: blocks on a Condition signaled by the notify
+        # callback rather than polling the queue every 20 ms (the old
+        # busy-wait accounted for a measurable share of driver CPU).
         if not self.ble_handle:
             return None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                if getattr(self.ble_handle, "_notification_queue", None) and len(self.ble_handle._notification_queue) > 0:
-                    return self.ble_handle._notification_queue.popleft()
-            except Exception:
-                return None
-            time.sleep(0.02)
-        # Final attempt after timeout
+        queue = getattr(self.ble_handle, "_notification_queue", None)
+        if queue is None:
+            return None
         try:
-            if getattr(self.ble_handle, "_notification_queue", None) and len(self.ble_handle._notification_queue) > 0:
-                return self.ble_handle._notification_queue.popleft()
+            if queue:
+                return queue.popleft()
+            signal = getattr(self.ble_handle, "_notification_signal", None)
+            if signal is None:
+                # Fallback for a handle without the Condition: single sleep
+                time.sleep(timeout)
+            else:
+                with signal:
+                    if not queue:
+                        signal.wait(timeout)
+            if queue:
+                return queue.popleft()
+        except IndexError:
+            # queue drained by a concurrent pop between check and popleft
+            pass
         except Exception:
             pass
         return None
