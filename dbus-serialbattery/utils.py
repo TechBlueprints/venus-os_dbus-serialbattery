@@ -315,7 +315,7 @@ FALLBACK_SENSOR_DBUS_PATH_CURRENT: Union[str, None] = config["DEFAULT"]["FALLBAC
 FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE"] or None
 FALLBACK_SERVE_STALE_MINUTES: float = get_float_from_config("DEFAULT", "FALLBACK_SERVE_STALE_MINUTES")
 FALLBACK_BMS_CABLE_WARN_MINUTES: float = get_float_from_config("DEFAULT", "FALLBACK_BMS_CABLE_WARN_MINUTES", 10)
-FALLBACK_DISCHARGE_BLOCK_VOLTAGE: float = get_float_from_config("DEFAULT", "FALLBACK_DISCHARGE_BLOCK_VOLTAGE")
+FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE: float = get_float_from_config("DEFAULT", "FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE")
 
 
 # Common configuration checks
@@ -332,6 +332,12 @@ check_config_issue(
 check_config_issue(
     FALLBACK_SERVE_STALE_MINUTES > 0 and BLOCK_ON_DISCONNECT,
     "FALLBACK_SERVE_STALE_MINUTES and BLOCK_ON_DISCONNECT are both enabled. Stale serving is not entered when BLOCK_ON_DISCONNECT is active. Please disable one of them in the configuration.",
+)
+
+check_config_issue(
+    FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE > 0 and (FALLBACK_SENSOR_DBUS_DEVICE is None or FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is None),
+    "FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE is set but there is no fallback shunt voltage to compare against. "
+    "It requires FALLBACK_SENSOR_DBUS_DEVICE and FALLBACK_SENSOR_DBUS_PATH_VOLTAGE. Please check the configuration.",
 )
 
 
