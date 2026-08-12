@@ -113,14 +113,18 @@ class Syncron_Ble:
         self.response_event = False
         return self.response_data
 
-    async def send_coroutine_to_ble_thread_and_wait_for_result(self, coroutine):
-        bt_task = asyncio.run_coroutine_threadsafe(coroutine, self.ble_async_thread_event_loop)
-        result = await asyncio.wait_for(asyncio.wrap_future(bt_task), timeout=1.5)
-        return result
-
     def send_data(self, data):
-        data = asyncio.run(self.send_coroutine_to_ble_thread_and_wait_for_result(self.ble_thread_send_com(data)))
-        return data
+        # Schedule the write on the BLE thread's existing event loop and wait
+        # for the result directly. The previous implementation wrapped this in
+        # asyncio.run(), constructing and tearing down a whole event loop for
+        # every command sent — measurable CPU overhead on GX hardware for
+        # drivers that poll several commands every few seconds.
+        future = asyncio.run_coroutine_threadsafe(self.ble_thread_send_com(data), self.ble_async_thread_event_loop)
+        try:
+            return future.result(timeout=1.5)
+        except Exception:
+            future.cancel()
+            raise
 
 
 def restart_ble_hardware_and_bluez_driver():
