@@ -128,24 +128,46 @@ class BCMBackend(BleConnectionBackend):
         escalation = EscalationPolicy(adapters or [], config=PROFILE_BATTERY)
 
         # Cache-first device resolution; scan only if the cache misses and
-        # the scan lock can be acquired.
+        # the scan lock can be acquired.  If the configured adapters cannot
+        # resolve the device (their scan slots are frequently held by other
+        # services on GX hardware), widen the search to every adapter — a
+        # BLE device object can only be connected on the adapter whose scan
+        # actually saw it, so finding it anywhere beats not connecting.
         device = None
         try:
-            device = await bcm_find_device(address, timeout=15.0, max_attempts=3, adapters=adapters)
+            device = await bcm_find_device(address, timeout=15.0, max_attempts=2, adapters=adapters)
         except Exception as e:
             logger.warning(f"BLE [{address}] managed scan failed: {repr(e)}")
+        if device is None and adapters:
+            logger.info(f"BLE [{address}] not seen on {adapters}, widening scan to all adapters")
+            try:
+                device = await bcm_find_device(address, timeout=15.0, max_attempts=2, adapters=None)
+            except Exception as e:
+                logger.warning(f"BLE [{address}] wide scan failed: {repr(e)}")
 
+        connect_adapters = adapters
         if device is None:
-            # Not in cache and not seen advertising — construct a device
-            # with a concrete D-Bus path on the first candidate adapter so
-            # BlueZ can attempt a direct connect without a scan (a details-
-            # less BLEDevice cannot connect on the BlueZ backend).
+            # Not seen advertising anywhere — last resort: direct connect
+            # against the expected BlueZ path on the first candidate adapter
+            # (works when the device object survives in the BlueZ cache).
             from bleak.backends.device import BLEDevice
 
             first_adapter = (adapters or ["hci0"])[0]
-            logger.info(f"BLE [{address}] not resolved by scan, trying direct connect via {first_adapter}")
+            logger.info(f"BLE [{address}] not resolved by any scan, trying cached path on {first_adapter}")
             path = f"/org/bluez/{first_adapter}/dev_" + address.replace(":", "_").upper()
             device = BLEDevice(address=address, name=None, details={"path": path, "props": {}})
+            connect_adapters = [first_adapter]
+        else:
+            # Pin the connection to the adapter that actually resolved the
+            # device: its Device1 object only exists on that adapter, so
+            # rotating to others would fail with 'device not found'.
+            try:
+                found_adapter = device.details["path"].split("/")[3]
+                if not adapters or found_adapter not in adapters:
+                    logger.info(f"BLE [{address}] resolved on {found_adapter}, connecting there")
+                connect_adapters = [found_adapter]
+            except Exception:
+                pass
 
         client = await establish_connection(
             BleakClient,
@@ -153,7 +175,7 @@ class BCMBackend(BleConnectionBackend):
             f"serialbattery {address}",
             disconnected_callback=self._disconnected_callback,
             max_attempts=5,
-            adapters=adapters,
+            adapters=connect_adapters,
             close_inactive_connections=True,
             escalation_policy=escalation,
             overall_timeout=240.0,
