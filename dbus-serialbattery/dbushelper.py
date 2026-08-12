@@ -973,18 +973,19 @@ class DbusHelper:
                     self.battery.setup_external_sensor()
 
             # Check if fallback sensor is still connected
-            if utils.FALLBACK_SENSOR_DBUS_DEVICE is not None and (
+            fallback_device = self.battery.get_fallback_sensor_device()
+            if fallback_device is not None and (
                 utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is not None
                 or utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT is not None
                 or utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE is not None
             ):
                 # Check if fallback sensor was and is still connected
-                if self.battery.dbus_fallback_objects is not None and utils.FALLBACK_SENSOR_DBUS_DEVICE not in get_bus(self._dbusname).list_names():
+                if self.battery.dbus_fallback_objects is not None and fallback_device not in get_bus(self._dbusname).list_names():
                     logger.error("Fallback sensor was disconnected, stale data serving not available")
                     self.battery.dbus_fallback_objects = None
 
                 # Check if fallback sensor was not connected and is now connected
-                elif self.battery.dbus_fallback_objects is None and utils.FALLBACK_SENSOR_DBUS_DEVICE in get_bus(self._dbusname).list_names():
+                elif self.battery.dbus_fallback_objects is None and fallback_device in get_bus(self._dbusname).list_names():
                     logger.info("Fallback sensor was connected")
                     self.battery.setup_fallback_sensor()
 

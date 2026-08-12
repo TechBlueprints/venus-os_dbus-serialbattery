@@ -2190,6 +2190,31 @@ class Battery(ABC):
             logger.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
             logger.error("External current sensor setup failed, fallback to internal sensor")
 
+    def get_fallback_sensor_device(self) -> Union[str, None]:
+        """
+        Resolve the fallback sensor dbus device for this battery instance.
+
+        FALLBACK_SENSOR_DBUS_DEVICE is either a single dbus service name, which applies
+        to every battery instance, or a comma-separated list of IDENTIFIER:SERVICE pairs
+        for setups where each battery has its own fallback device. The identifier is the
+        battery specific suffix of the driver's own dbus service name, e.g.
+        "ble_5320b7d7f9e7" for com.victronenergy.battery.ble_5320b7d7f9e7.
+
+        :return: The dbus service name of the fallback device, or None if not configured
+        """
+        raw = utils.FALLBACK_SENSOR_DBUS_DEVICE
+        if raw is None:
+            return None
+        # dbus service names cannot contain ":", so a colon means the mapping syntax is used
+        if ":" not in raw:
+            return raw
+        identifier = self.port[self.port.rfind("/") + 1 :]
+        for item in raw.split(","):
+            key, _, value = item.strip().partition(":")
+            if key.strip() == identifier and value.strip():
+                return value.strip()
+        return None
+
     def setup_fallback_sensor(self) -> None:
         """
         Setup fallback sensor and it's dbus items.
@@ -2204,6 +2229,11 @@ class Battery(ABC):
 
         # setup fallback dbus paths
         try:
+            device = self.get_fallback_sensor_device()
+            if device is None:
+                logger.warning("No fallback sensor device configured for this battery, stale data serving not available")
+                return
+
             DBusGMainLoop(set_as_default=True)
 
             # connect to the sessionbus, on a CC GX the systembus is used
@@ -2213,31 +2243,31 @@ class Battery(ABC):
             dbus_objects = {}
 
             # check if the dbus service is available
-            is_present_in_vebus = utils.FALLBACK_SENSOR_DBUS_DEVICE in dbus_connection.list_names()
+            is_present_in_vebus = device in dbus_connection.list_names()
 
             if is_present_in_vebus:
 
                 if utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is not None:
-                    logger.info(f"Using fallback sensor for voltage: {utils.FALLBACK_SENSOR_DBUS_DEVICE}{utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE}")
+                    logger.info(f"Using fallback sensor for voltage: {device}{utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE}")
                     dbus_objects["Voltage"] = VeDbusItemImport(
                         dbus_connection,
-                        utils.FALLBACK_SENSOR_DBUS_DEVICE,
+                        device,
                         utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE,
                     )
 
                 if utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT is not None:
-                    logger.info(f"Using fallback sensor for current: {utils.FALLBACK_SENSOR_DBUS_DEVICE}{utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT}")
+                    logger.info(f"Using fallback sensor for current: {device}{utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT}")
                     dbus_objects["Current"] = VeDbusItemImport(
                         dbus_connection,
-                        utils.FALLBACK_SENSOR_DBUS_DEVICE,
+                        device,
                         utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT,
                     )
 
                 if utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE is not None:
-                    logger.info(f"Using fallback sensor for temperature: {utils.FALLBACK_SENSOR_DBUS_DEVICE}{utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE}")
+                    logger.info(f"Using fallback sensor for temperature: {device}{utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE}")
                     dbus_objects["Temperature"] = VeDbusItemImport(
                         dbus_connection,
-                        utils.FALLBACK_SENSOR_DBUS_DEVICE,
+                        device,
                         utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE,
                     )
 

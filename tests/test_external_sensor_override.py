@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery", "ext", "velib_python"))
 
+import utils  # noqa: E402
 from battery import Battery  # noqa: E402
 
 
@@ -110,6 +111,33 @@ class TestFallbackSensor:
         assert battery.get_value_from_fallback_sensor("Voltage") is None
         battery.online = False
         assert battery.get_value_from_fallback_sensor("Voltage") == 25.5
+
+
+class TestGetFallbackSensorDevice:
+    def _resolve(self, config_value, port="/ble_5320b7d7f9e7"):
+        battery = _make_battery()
+        battery.port = port
+        saved = utils.FALLBACK_SENSOR_DBUS_DEVICE
+        utils.FALLBACK_SENSOR_DBUS_DEVICE = config_value
+        try:
+            return battery.get_fallback_sensor_device()
+        finally:
+            utils.FALLBACK_SENSOR_DBUS_DEVICE = saved
+
+    def test_not_configured_returns_none(self):
+        assert self._resolve(None) is None
+
+    def test_single_service_applies_to_any_battery(self):
+        assert self._resolve("com.victronenergy.battery.ttyS2") == "com.victronenergy.battery.ttyS2"
+
+    def test_mapping_resolves_matching_battery(self):
+        mapping = "ble_5320b7d7f9e7:com.victronenergy.battery.ttyS5, ble_ab807254e0b4:com.victronenergy.battery.ttyS6"
+        assert self._resolve(mapping, port="/ble_5320b7d7f9e7") == "com.victronenergy.battery.ttyS5"
+        assert self._resolve(mapping, port="/ble_ab807254e0b4") == "com.victronenergy.battery.ttyS6"
+
+    def test_mapping_without_match_returns_none(self):
+        mapping = "ble_5320b7d7f9e7:com.victronenergy.battery.ttyS5"
+        assert self._resolve(mapping, port="/ble_ab807254e0b4") is None
 
 
 class TestGetTemperature:
