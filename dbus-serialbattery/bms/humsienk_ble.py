@@ -759,19 +759,20 @@ class HumsiENK_Ble(Battery):
                 ble_connected = self.ble_handle and hasattr(self.ble_handle, "connected") and self.ble_handle.connected
 
                 # If no data for >10s, re-send handshake (0x00) to re-initialize
-                # BMS notification stream after a daemon-thread auto-reconnection.
+                # the BMS notification stream after a daemon-thread
+                # auto-reconnection.  Retry every 30 s while starved: a single
+                # resend can be lost if it lands while the BMS is still
+                # settling after the reconnect (observed live — link up, one
+                # handshake sent, stream never resumed).
                 stale_seconds = now - self._last_frame_time
-                if ble_connected and stale_seconds > 10.0 and not getattr(self, "_handshake_resent", False):
+                if ble_connected and stale_seconds > 10.0 and (now - getattr(self, "_last_handshake_resend", 0.0)) > 30.0:
                     try:
                         logger.info(f"HumsiENK: Re-sending handshake (0x00) after {stale_seconds:.0f}s stale")
                         handshake_cmd = self._build_command(self.CMD_HANDSHAKE, [])
                         self.ble_handle.send_data(handshake_cmd)
-                        self._handshake_resent = True
+                        self._last_handshake_resend = now
                     except Exception as e:
                         logger.warning(f"HumsiENK: Handshake resend failed: {e}")
-                elif stale_seconds <= 5.0:
-                    # Reset flag once fresh data is flowing
-                    self._handshake_resent = False
 
                 # Full data poll every 3 seconds (matches app's setInterval 3000-3500ms).
                 # The app staggers commands with setTimeout (non-blocking), but we
