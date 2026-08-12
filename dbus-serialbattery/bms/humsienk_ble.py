@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 
-<<<<<<< HEAD
 """HumsiENK BLE battery driver.
 
 Read-only driver for HumsiENK BLE batteries, using the existing
@@ -29,17 +28,10 @@ import time
 import json
 import os
 from collections import deque
-=======
-from battery import Battery, Cell
-import time
-import json
-import os
->>>>>>> origin/feat/external-sensor-voltage
 from utils_ble import Syncron_Ble
 from utils import logger, BATTERY_CAPACITY, MAX_BATTERY_CHARGE_CURRENT, MAX_BATTERY_DISCHARGE_CURRENT
 
 
-<<<<<<< HEAD
 class HumsiENK_Syncron_Ble(Syncron_Ble):
     """Syncron_Ble with the extras this driver needs, kept driver-local.
 
@@ -114,8 +106,6 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
                         pass
 
 
-=======
->>>>>>> origin/feat/external-sensor-voltage
 class HumsiENK_Ble(Battery):
     BATTERYTYPE = "HumsiENK BLE"
 
@@ -126,7 +116,6 @@ class HumsiENK_Ble(Battery):
     BLE_TX_UUID = "00000002-0000-1000-8000-00805f9b34fb"  # We write commands here (write property)
 
     # Protocol command constants
-<<<<<<< HEAD
     CMD_HANDSHAKE = 0x00  # Initial handshake/connection
     CMD_STATUS = 0x20  # Operating status (FETs, temps, runtime)
     CMD_BATTERY_INFO = 0x21  # Battery info (voltage, current, SOC, SOH, capacity, cycles)
@@ -141,22 +130,6 @@ class HumsiENK_Ble(Battery):
     # Protocol framing bytes
     FRAME_START = 0xAA  # Command frame start byte
     FRAME_RESPONSE = 0xAA  # Response frame start byte (same as command, confirmed from live device)
-=======
-    CMD_HANDSHAKE = 0x00          # Initial handshake/connection
-    CMD_STATUS = 0x20             # Operating status (FETs, temps, runtime)
-    CMD_BATTERY_INFO = 0x21       # Battery info (voltage, current, SOC, SOH, capacity, cycles)
-    CMD_CELL_VOLTAGES = 0x22      # Individual cell voltages
-    CMD_FET_CHARGE = 0x50         # Charge FET control (data: [0]=off, [1]=on)
-    CMD_FET_DISCHARGE = 0x51      # Discharge FET control (data: [0]=off, [1]=on)
-    CMD_BALANCE = 0x52            # Balance control (data: [0]=off, [1]=on)
-    CMD_CLEAR_STATUS = 0x53       # Clear error status
-    CMD_CONFIG = 0x58             # Configuration parameters
-    CMD_VERSION = 0xF5            # Firmware version (ASCII string)
-    
-    # Protocol framing bytes
-    FRAME_START = 0xAA            # Command frame start byte
-    FRAME_RESPONSE = 0xAA         # Response frame start byte (same as command, confirmed from live device)
->>>>>>> origin/feat/external-sensor-voltage
 
     def __init__(self, port, baud, address):
         super(HumsiENK_Ble, self).__init__(port, baud, address)
@@ -169,10 +142,7 @@ class HumsiENK_Ble(Battery):
         self._last_frame_time = 0.0
         self._last_trigger_time = 0.0  # Unified polling timer (all cmds every 3s)
         self._last_heartbeat_log = 0.0
-<<<<<<< HEAD
         self._last_stale_log = 0.0
-=======
->>>>>>> origin/feat/external-sensor-voltage
         self._last_update_log_time = 0.0
         # Wake-up trigger backoff tracking
         self._wake_trigger_attempt = 0  # Track which wake-up attempt we're on
@@ -211,10 +181,7 @@ class HumsiENK_Ble(Battery):
         self._max_reconnect_attempts = 3  # Max consecutive attempts before longer backoff
         self._load_cached_state()  # Load previous state on init (any age)
         import atexit
-<<<<<<< HEAD
 
-=======
->>>>>>> origin/feat/external-sensor-voltage
         atexit.register(self._flush_state_to_disk)
         logger.info("Init of HumsiENK_Ble at " + address)
 
@@ -229,11 +196,7 @@ class HumsiENK_Ble(Battery):
 
     def _load_cached_state(self):
         """Load previously saved battery state from /data/.
-<<<<<<< HEAD
 
-=======
-        
->>>>>>> origin/feat/external-sensor-voltage
         Always load regardless of age — old real data is better than
         hardcoded defaults.  Defaults (3.4 V/cell, 50 % SOC) are only
         used on the very first start when no state file exists.
@@ -242,15 +205,9 @@ class HumsiENK_Ble(Battery):
             if not os.path.exists(self._state_file):
                 logger.info("HumsiENK: No saved state file, using startup defaults")
                 return
-<<<<<<< HEAD
             with open(self._state_file, "r") as f:
                 self._ram_state = json.load(f)
             age = time.time() - self._ram_state.get("timestamp", 0)
-=======
-            with open(self._state_file, 'r') as f:
-                self._ram_state = json.load(f)
-            age = time.time() - self._ram_state.get('timestamp', 0)
->>>>>>> origin/feat/external-sensor-voltage
             logger.info(f"HumsiENK: Loaded saved state ({age:.0f}s old)")
             self._restore_from_ram_state()
         except Exception as e:
@@ -259,7 +216,6 @@ class HumsiENK_Ble(Battery):
     def _restore_from_ram_state(self):
         """Apply values from _ram_state onto self."""
         try:
-<<<<<<< HEAD
             if "voltage" in self._ram_state:
                 self.voltage = self._ram_state["voltage"]
             if "current" in self._ram_state:
@@ -270,18 +226,6 @@ class HumsiENK_Ble(Battery):
                 self.capacity = self._ram_state["capacity"]
             if "cells" in self._ram_state and len(self._ram_state["cells"]) > 0:
                 for idx, cell_v in enumerate(self._ram_state["cells"]):
-=======
-            if 'voltage' in self._ram_state:
-                self.voltage = self._ram_state['voltage']
-            if 'current' in self._ram_state:
-                self.current = self._ram_state['current']
-            if 'soc' in self._ram_state:
-                self.soc = self._ram_state['soc']
-            if 'capacity' in self._ram_state:
-                self.capacity = self._ram_state['capacity']
-            if 'cells' in self._ram_state and len(self._ram_state['cells']) > 0:
-                for idx, cell_v in enumerate(self._ram_state['cells']):
->>>>>>> origin/feat/external-sensor-voltage
                     if idx < len(self.cells):
                         self.cells[idx].voltage = cell_v
         except Exception as e:
@@ -290,21 +234,12 @@ class HumsiENK_Ble(Battery):
     def _update_ram_state(self):
         """Snapshot current values into RAM (called every refresh cycle)."""
         self._ram_state = {
-<<<<<<< HEAD
             "timestamp": time.time(),
             "voltage": self.voltage if self.voltage is not None else 0.0,
             "current": self.current if self.current is not None else 0.0,
             "soc": self.soc if self.soc is not None else 50.0,
             "capacity": self.capacity if self.capacity is not None else 0.0,
             "cells": [c.voltage for c in self.cells if c.voltage is not None],
-=======
-            'timestamp': time.time(),
-            'voltage': self.voltage if self.voltage is not None else 0.0,
-            'current': self.current if self.current is not None else 0.0,
-            'soc': self.soc if self.soc is not None else 50.0,
-            'capacity': self.capacity if self.capacity is not None else 0.0,
-            'cells': [c.voltage for c in self.cells if c.voltage is not None],
->>>>>>> origin/feat/external-sensor-voltage
         }
         # Periodic flush to persistent storage
         now = time.time()
@@ -316,11 +251,7 @@ class HumsiENK_Ble(Battery):
         if not self._ram_state:
             return
         try:
-<<<<<<< HEAD
             with open(self._state_file, "w") as f:
-=======
-            with open(self._state_file, 'w') as f:
->>>>>>> origin/feat/external-sensor-voltage
                 json.dump(self._ram_state, f)
             self._last_disk_flush = time.time()
             logger.debug("HumsiENK: State flushed to disk")
@@ -330,29 +261,20 @@ class HumsiENK_Ble(Battery):
     def _build_command(self, command: int, data: list = None) -> bytes:
         """
         Build a binary command packet according to protocol spec.
-<<<<<<< HEAD
 
-=======
-        
->>>>>>> origin/feat/external-sensor-voltage
         Format: [0xAA, CMD, LEN, DATA..., CHK_LO, CHK_HI]
         - Start byte: 0xAA
         - Command: 1 byte
         - Length: 1 byte - length of DATA only
         - Data: 0-N bytes (optional)
         - Checksum: 16-bit LE sum of CMD + LEN + DATA bytes
-<<<<<<< HEAD
 
-=======
-        
->>>>>>> origin/feat/external-sensor-voltage
         Examples:
             _build_command(0x21, []) → [0xAA, 0x21, 0x00, 0x21, 0x00]
             _build_command(0x50, [0x01]) → [0xAA, 0x50, 0x01, 0x01, 0x52, 0x00]
         """
         if data is None:
             data = []
-<<<<<<< HEAD
 
         # Build packet structure
         packet = [self.FRAME_START, command]
@@ -364,30 +286,13 @@ class HumsiENK_Ble(Battery):
         # Add data payload
         packet.extend(data)
 
-=======
-        
-        # Build packet structure
-        packet = [self.FRAME_START, command]
-        
-        # Add length field (single byte for data length)
-        data_len = len(data)
-        packet.append(data_len & 0xFF)
-        
-        # Add data payload
-        packet.extend(data)
-        
->>>>>>> origin/feat/external-sensor-voltage
         # Checksum: 16-bit LE sum of bytes from CMD through end of DATA
         checksum = command + data_len
         for b in data:
             checksum += b
         packet.append(checksum & 0xFF)
         packet.append((checksum >> 8) & 0xFF)
-<<<<<<< HEAD
 
-=======
-        
->>>>>>> origin/feat/external-sensor-voltage
         return bytes(packet)
 
     def _use_cached_data(self) -> bool:
@@ -396,7 +301,6 @@ class HumsiENK_Ble(Battery):
         Thresholds:
             <15 s   — DEBUG, internal_failure = 0
             15-60 s — INFO,  internal_failure = 0
-<<<<<<< HEAD
             1-10 m  — WARN,  internal_failure = 0
             10-30 m — WARN,  internal_failure = 1 (warning)
             >30 m   — ERROR, internal_failure = 2 (alarm)
@@ -406,22 +310,10 @@ class HumsiENK_Ble(Battery):
             return False
 
         age = time.time() - self._ram_state["timestamp"]
-=======
-            1-5 m   — WARN,  internal_failure = 0
-            5-15 m  — WARN,  internal_failure = 1 (warning)
-            >15 m   — ERROR, internal_failure = 2 (alarm)
-        Fresh data resets internal_failure to 0.
-        """
-        if not self._ram_state or 'timestamp' not in self._ram_state:
-            return False
-
-        age = time.time() - self._ram_state['timestamp']
->>>>>>> origin/feat/external-sensor-voltage
 
         # Restore values from RAM snapshot
         self._restore_from_ram_state()
 
-<<<<<<< HEAD
         now = time.time()
         stale_throttle = (now - self._last_stale_log) >= 60.0
 
@@ -446,30 +338,10 @@ class HumsiENK_Ble(Battery):
                 logger.error(f"HumsiENK: Stale data ({age:.0f}s since last), D-Bus alarm")
                 self._last_stale_log = now
             if hasattr(self, "protection") and self.protection is not None:
-=======
-        # Escalating log levels and D-Bus alarms
-        if age < 15:
-            logger.debug(f"HumsiENK: No new data this cycle ({age:.0f}s since last)")
-        elif age < 60:
-            logger.info(f"HumsiENK: No new data ({age:.0f}s since last)")
-        elif age < 300:
-            logger.warning(f"HumsiENK: Stale data ({age:.0f}s since last)")
-        elif age < 900:
-            logger.warning(f"HumsiENK: Stale data ({age:.0f}s since last), D-Bus warning")
-            if hasattr(self, 'protection') and self.protection is not None:
-                self.protection.internal_failure = 1
-        else:
-            logger.error(f"HumsiENK: Stale data ({age:.0f}s since last), D-Bus alarm")
-            if hasattr(self, 'protection') and self.protection is not None:
->>>>>>> origin/feat/external-sensor-voltage
                 self.protection.internal_failure = 2
 
         return True
 
-<<<<<<< HEAD
-=======
-
->>>>>>> origin/feat/external-sensor-voltage
     def test_connection(self):
         """Create the BLE handle and return True so the framework registers us.
 
@@ -484,11 +356,7 @@ class HumsiENK_Ble(Battery):
              in the meantime.
         """
         try:
-<<<<<<< HEAD
             self.ble_handle = HumsiENK_Syncron_Ble(self.address, read_characteristic=self.BLE_RX_UUID, write_characteristic=self.BLE_TX_UUID)
-=======
-            self.ble_handle = Syncron_Ble(self.address, read_characteristic=self.BLE_RX_UUID, write_characteristic=self.BLE_TX_UUID)
->>>>>>> origin/feat/external-sensor-voltage
             # Initialize frame time so the 9-minute emergency reconnect doesn't fire immediately
             self._last_frame_time = time.time()
             self._connection_start_time = time.time()
@@ -549,22 +417,13 @@ class HumsiENK_Ble(Battery):
                         total_len = 3 + data_len + 2  # header(3) + data + checksum(2)
 
                         if len(self._rx_buffer) >= start_idx + total_len:
-<<<<<<< HEAD
                             frame = bytes(self._rx_buffer[start_idx : start_idx + total_len])
                             data = frame[3 : 3 + data_len]
-=======
-                            frame = bytes(self._rx_buffer[start_idx:start_idx + total_len])
-                            data = frame[3:3+data_len]
->>>>>>> origin/feat/external-sensor-voltage
 
                             cell_count_detected = 0
                             for i in range(0, min(len(data), 48), 2):
                                 if i + 1 < len(data):
-<<<<<<< HEAD
                                     cell_mv = int.from_bytes(data[i : i + 2], byteorder="little", signed=False)
-=======
-                                    cell_mv = int.from_bytes(data[i:i+2], byteorder='little', signed=False)
->>>>>>> origin/feat/external-sensor-voltage
                                     if 1000 <= cell_mv <= 5000:
                                         cell_count_detected += 1
                                     elif cell_count_detected > 0:
@@ -584,11 +443,7 @@ class HumsiENK_Ble(Battery):
                 for _ in range(self.cell_count - len(self.cells)):
                     self.cells.append(Cell(False))
             elif len(self.cells) > self.cell_count:
-<<<<<<< HEAD
                 self.cells = self.cells[: self.cell_count]
-=======
-                self.cells = self.cells[:self.cell_count]
->>>>>>> origin/feat/external-sensor-voltage
 
         # Clear buffer after detection
         self._rx_buffer.clear()
@@ -611,11 +466,7 @@ class HumsiENK_Ble(Battery):
             self.max_battery_charge_current = MAX_BATTERY_CHARGE_CURRENT
         if getattr(self, "max_battery_discharge_current", None) is None:
             self.max_battery_discharge_current = MAX_BATTERY_DISCHARGE_CURRENT
-<<<<<<< HEAD
 
-=======
-        
->>>>>>> origin/feat/external-sensor-voltage
         # Request configuration data from BMS (protection limits, capacity, etc.)
         # This is called once at startup to get BMS settings
         if self.ble_handle and self.ble_handle.connected:
@@ -623,27 +474,16 @@ class HumsiENK_Ble(Battery):
                 logger.debug("HumsiENK: Requesting configuration data (0x58)...")
                 config_cmd = self._build_command(self.CMD_CONFIG, [])
                 self.ble_handle.send_data(config_cmd)
-<<<<<<< HEAD
 
                 # Wait for and process response
                 time.sleep(0.5)
 
-=======
-                
-                # Wait for and process response
-                time.sleep(0.5)
-                
->>>>>>> origin/feat/external-sensor-voltage
                 # Try to get the config response
                 for _ in range(10):  # Try up to 10 times (3 seconds total)
                     chunk = self._pop_next_notification(timeout=0.3)
                     if chunk and isinstance(chunk, (bytes, bytearray)):
                         self._rx_buffer.extend(chunk)
-<<<<<<< HEAD
 
-=======
-                        
->>>>>>> origin/feat/external-sensor-voltage
                         # Look for config response (0x58)
                         start_idx = self._rx_buffer.find(self.FRAME_RESPONSE)
                         if start_idx >= 0 and len(self._rx_buffer) >= start_idx + 5:
@@ -652,52 +492,30 @@ class HumsiENK_Ble(Battery):
                                 # Parse length (1 byte)
                                 data_len = self._rx_buffer[start_idx + 2]
                                 total_len = 3 + data_len + 2  # header(3) + data + checksum(2)
-<<<<<<< HEAD
 
                                 if len(self._rx_buffer) >= start_idx + total_len:
                                     # Extract and parse frame
                                     frame = bytes(self._rx_buffer[start_idx : start_idx + total_len])
-=======
-                                
-                                if len(self._rx_buffer) >= start_idx + total_len:
-                                    # Extract and parse frame
-                                    frame = bytes(self._rx_buffer[start_idx:start_idx + total_len])
->>>>>>> origin/feat/external-sensor-voltage
                                     self._parse_and_update(frame)
                                     # Clear buffer after successful parse
                                     self._rx_buffer.clear()
                                     logger.info("HumsiENK: Configuration loaded successfully")
                                     break
-<<<<<<< HEAD
 
-=======
-                
->>>>>>> origin/feat/external-sensor-voltage
                 # Request firmware version (0xF5)
                 logger.debug("HumsiENK: Requesting firmware version (0xF5)...")
                 version_cmd = self._build_command(self.CMD_VERSION, [])
                 self.ble_handle.send_data(version_cmd)
-<<<<<<< HEAD
 
                 # Wait for and process response
                 time.sleep(0.5)
 
-=======
-                
-                # Wait for and process response
-                time.sleep(0.5)
-                
->>>>>>> origin/feat/external-sensor-voltage
                 # Try to get the version response
                 for _ in range(10):  # Try up to 10 times (3 seconds total)
                     chunk = self._pop_next_notification(timeout=0.3)
                     if chunk and isinstance(chunk, (bytes, bytearray)):
                         self._rx_buffer.extend(chunk)
-<<<<<<< HEAD
 
-=======
-                        
->>>>>>> origin/feat/external-sensor-voltage
                         # Look for version response (0xF5)
                         start_idx = self._rx_buffer.find(self.FRAME_RESPONSE)
                         if start_idx >= 0 and len(self._rx_buffer) >= start_idx + 5:
@@ -706,38 +524,23 @@ class HumsiENK_Ble(Battery):
                                 # Parse length (1 byte)
                                 data_len = self._rx_buffer[start_idx + 2]
                                 total_len = 3 + data_len + 2  # header(3) + data + checksum(2)
-<<<<<<< HEAD
 
                                 if len(self._rx_buffer) >= start_idx + total_len:
                                     # Extract and parse frame
                                     frame = bytes(self._rx_buffer[start_idx : start_idx + total_len])
-=======
-                                
-                                if len(self._rx_buffer) >= start_idx + total_len:
-                                    # Extract and parse frame
-                                    frame = bytes(self._rx_buffer[start_idx:start_idx + total_len])
->>>>>>> origin/feat/external-sensor-voltage
                                     self._parse_and_update(frame)
                                     # Clear buffer after successful parse
                                     self._rx_buffer.clear()
                                     logger.info("HumsiENK: Firmware version loaded successfully")
                                     break
-<<<<<<< HEAD
 
             except Exception as e:
                 logger.warning(f"HumsiENK: Failed to request configuration: {e}")
 
-=======
-                
-            except Exception as e:
-                logger.warning(f"HumsiENK: Failed to request configuration: {e}")
-        
->>>>>>> origin/feat/external-sensor-voltage
         return True
 
     def refresh_data(self):
         logger.debug("HumsiENK: >>> refresh_data START")
-<<<<<<< HEAD
 
         # Collect binary response frames and parse commands 0x21, 0x22, 0x20
         data_refreshed = False
@@ -754,29 +557,13 @@ class HumsiENK_Ble(Battery):
                 )
                 self._last_heartbeat_log = now_tick
 
-=======
-        
-        # Collect binary response frames and parse commands 0x21, 0x22, 0x20
-        data_refreshed = False
-        try:
-            now_tick = time.time()
-            if (now_tick - self._last_heartbeat_log) > 10.0:
-                logger.debug("HumsiENK refresh tick")
-                self._last_heartbeat_log = now_tick
-            
->>>>>>> origin/feat/external-sensor-voltage
             # No manual reconnection logic here.  The Syncron_Ble daemon
             # thread handles reconnection automatically: its async_main loop
             # re-enters connect_to_bms whenever the connection drops, and the
             # 3-minute notification watchdog catches zombie connections.
             # Spawning a new Syncron_Ble from refresh_data caused multiple
             # daemon threads fighting BlueZ, corrupting the adapter state.
-<<<<<<< HEAD
 
-=======
-            
-            
->>>>>>> origin/feat/external-sensor-voltage
             if self.ble_handle:
                 # Drain ALL available notification chunks from the queue
                 # (the app accumulates all chunks then parses; we should too)
@@ -787,11 +574,7 @@ class HumsiENK_Ble(Battery):
                         break
                     chunks_read += 1
                     logger.debug(f"HumsiENK got chunk: {len(chunk)} bytes (#{chunks_read})")
-<<<<<<< HEAD
 
-=======
-                    
->>>>>>> origin/feat/external-sensor-voltage
                     # Buffer overflow protection: if buffer is already too large and has no valid frame start,
                     # clear it before adding new data
                     if len(self._rx_buffer) > 512:
@@ -811,26 +594,16 @@ class HumsiENK_Ble(Battery):
                         if not has_valid_frame:
                             logger.debug(f"HumsiENK: Clearing oversized buffer ({len(self._rx_buffer)} bytes) with no valid frame")
                             self._rx_buffer.clear()
-<<<<<<< HEAD
 
                     self._rx_buffer.extend(chunk)
 
-=======
-                    
-                    self._rx_buffer.extend(chunk)
-                
->>>>>>> origin/feat/external-sensor-voltage
                 # Process as many complete binary frames as present
                 # Frame format: [0xAA, CMD, LEN, DATA..., CHK_LO, CHK_HI]
                 while True:
                     # Need at least 5 bytes: [0xAA, CMD, LEN] + 2-byte checksum
                     if len(self._rx_buffer) < 5:
                         break
-<<<<<<< HEAD
 
-=======
-                    
->>>>>>> origin/feat/external-sensor-voltage
                     # Look for frame start byte 0xAA
                     start_idx = self._rx_buffer.find(self.FRAME_RESPONSE)
                     if start_idx == -1:
@@ -838,41 +611,25 @@ class HumsiENK_Ble(Battery):
                         if len(self._rx_buffer) > 512:
                             self._rx_buffer.clear()
                         break
-<<<<<<< HEAD
 
                     # Discard bytes before frame start
                     if start_idx > 0:
                         del self._rx_buffer[:start_idx]
 
-=======
-                    
-                    # Discard bytes before frame start
-                    if start_idx > 0:
-                        del self._rx_buffer[:start_idx]
-                    
->>>>>>> origin/feat/external-sensor-voltage
                     # Now buffer starts with 0xAA
                     # Need at least 5 bytes: [0xAA, CMD, LEN, CHK_LO, CHK_HI]
                     if len(self._rx_buffer) < 5:
                         break
-<<<<<<< HEAD
 
                     # Parse length field (1 byte at position 2)
                     data_len = self._rx_buffer[2]
 
-=======
-                    
-                    # Parse length field (1 byte at position 2)
-                    data_len = self._rx_buffer[2]
-                    
->>>>>>> origin/feat/external-sensor-voltage
                     # Sanity check: reasonable data length (0-255 bytes)
                     if data_len > 200:
                         # Invalid length, discard this start byte and resync
                         logger.debug(f"HumsiENK: Invalid data_len={data_len}, resyncing")
                         del self._rx_buffer[0:1]
                         continue
-<<<<<<< HEAD
 
                     # Calculate total frame length: header(3) + data + checksum(2)
                     total_len = 3 + data_len + 2
@@ -884,35 +641,17 @@ class HumsiENK_Ble(Battery):
                     # Extract complete frame
                     frame = bytes(self._rx_buffer[:total_len])
 
-=======
-                    
-                    # Calculate total frame length: header(3) + data + checksum(2)
-                    total_len = 3 + data_len + 2
-                    
-                    # Wait for complete frame
-                    if len(self._rx_buffer) < total_len:
-                        break
-                    
-                    # Extract complete frame
-                    frame = bytes(self._rx_buffer[:total_len])
-                    
->>>>>>> origin/feat/external-sensor-voltage
                     # Validate checksum: 16-bit LE sum of bytes from CMD to end of DATA
                     # (excludes start byte 0xAA and the checksum itself)
                     payload = frame[1:-2]  # CMD through end of data
                     calculated_checksum = sum(payload) & 0xFFFF
                     received_checksum = frame[-2] | (frame[-1] << 8)  # Little-endian
-<<<<<<< HEAD
 
-=======
-                    
->>>>>>> origin/feat/external-sensor-voltage
                     if calculated_checksum != received_checksum:
                         logger.warning(f"HumsiENK: Checksum mismatch! Calculated: {calculated_checksum:04X}, Received: {received_checksum:04X}")
                         # Discard this start byte and try to resync
                         del self._rx_buffer[0:1]
                         continue
-<<<<<<< HEAD
 
                     # Valid frame - consume it and parse
                     del self._rx_buffer[:total_len]
@@ -920,38 +659,24 @@ class HumsiENK_Ble(Battery):
                         frame[1], f"0x{frame[1]:02X}"
                     )
                     if (time.time() - self._last_frame_time) > 60.0:
-=======
-                    
-                    # Valid frame - consume it and parse
-                    del self._rx_buffer[:total_len]
-                    cmd_name = {0x00: "handshake", 0x20: "status", 0x21: "battery_info",
-                                0x22: "cell_voltages", 0x58: "config", 0xF5: "version"}.get(frame[1], f"0x{frame[1]:02X}")
-                    # Log at INFO on first frame after stale period; DEBUG otherwise
-                    if (time.time() - self._last_frame_time) > 5.0:
->>>>>>> origin/feat/external-sensor-voltage
                         logger.info(f"HumsiENK: Data resumed — RX {cmd_name} ({data_len}B)")
                     else:
                         logger.debug(f"HumsiENK: RX {cmd_name} ({data_len}B)")
                     self._parse_and_update(frame)
                     self._last_frame_time = time.time()
                     data_refreshed = True
-<<<<<<< HEAD
                     # Feed the connection watchdog — this is the ONLY
                     # place it gets fed, proving the BMS is sending
                     # real, checksum-verified data.
                     if self.ble_handle:
                         self.ble_handle.feed_watchdog()
 
-=======
-                
->>>>>>> origin/feat/external-sensor-voltage
                 # ── Polling: match the app's pattern ──────────────────────
                 # The official app sends ALL THREE data commands every 3-3.5s
                 # with 500 ms spacing:  0x21 (+500 ms), 0x20 (+1000 ms), 0x22 (+1500 ms).
                 # Matching this cadence is critical — the BMS expects staggered
                 # commands, not rapid-fire bursts.
                 now = time.time()
-<<<<<<< HEAD
 
                 # Guard: only send BLE commands if the connection is up.
                 # During daemon-thread reconnection, send_data would fail with
@@ -966,38 +691,14 @@ class HumsiENK_Ble(Battery):
                 # handshake sent, stream never resumed).
                 stale_seconds = now - self._last_frame_time
                 if ble_connected and stale_seconds > 10.0 and (now - getattr(self, "_last_handshake_resend", 0.0)) > 30.0:
-=======
-                
-                # Guard: only send BLE commands if the connection is up.
-                # During daemon-thread reconnection, send_data would fail with
-                # "Service Discovery has not been performed yet" — skip silently.
-                ble_connected = (self.ble_handle and
-                                 hasattr(self.ble_handle, 'connected') and
-                                 self.ble_handle.connected)
-                
-                # If no data for >10s, re-send handshake (0x00) to re-initialize
-                # BMS notification stream after a daemon-thread auto-reconnection.
-                stale_seconds = now - self._last_frame_time
-                if ble_connected and stale_seconds > 10.0 and not getattr(self, '_handshake_resent', False):
->>>>>>> origin/feat/external-sensor-voltage
                     try:
                         logger.info(f"HumsiENK: Re-sending handshake (0x00) after {stale_seconds:.0f}s stale")
                         handshake_cmd = self._build_command(self.CMD_HANDSHAKE, [])
                         self.ble_handle.send_data(handshake_cmd)
-<<<<<<< HEAD
                         self._last_handshake_resend = now
                     except Exception as e:
                         logger.warning(f"HumsiENK: Handshake resend failed: {e}")
 
-=======
-                        self._handshake_resent = True
-                    except Exception as e:
-                        logger.warning(f"HumsiENK: Handshake resend failed: {e}")
-                elif stale_seconds <= 5.0:
-                    # Reset flag once fresh data is flowing
-                    self._handshake_resent = False
-                
->>>>>>> origin/feat/external-sensor-voltage
                 # Full data poll every 3 seconds (matches app's setInterval 3000-3500ms).
                 # The app staggers commands with setTimeout (non-blocking), but we
                 # can't block the GLib main loop with time.sleep().  Instead, send
@@ -1026,7 +727,6 @@ class HumsiENK_Ble(Battery):
                         self.ble_handle.send_data(cmd)
                     except Exception as e:
                         logger.warning(f"HumsiENK: Failed to send cell voltages command: {e}")
-<<<<<<< HEAD
 
             # On fresh data: update RAM state and clear any stale-data alarm
             if data_refreshed:
@@ -1048,18 +748,6 @@ class HumsiENK_Ble(Battery):
                 # logic above recovers the data stream
                 self._use_cached_data()
 
-=======
-            
-            # On fresh data: update RAM state and clear any stale-data alarm
-            if data_refreshed:
-                self._update_ram_state()
-                if hasattr(self, 'protection') and self.protection is not None:
-                    self.protection.internal_failure = 0
-            else:
-                # No fresh data — serve stale RAM values with escalating warnings
-                self._use_cached_data()
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Provide placeholder values to avoid empty readings
             if getattr(self, "voltage", None) is None:
                 self.voltage = 0.0
@@ -1087,11 +775,7 @@ class HumsiENK_Ble(Battery):
     def _parse_and_update(self, frame: bytes):
         """
         Parse binary response frame and update battery state.
-<<<<<<< HEAD
 
-=======
-        
->>>>>>> origin/feat/external-sensor-voltage
         Frame format: [0xAA, CMD, LEN, DATA..., CHK_LO, CHK_HI]
         - Header: 3 bytes (start byte, command, data length)
         - Data: LEN bytes
@@ -1100,7 +784,6 @@ class HumsiENK_Ble(Battery):
         try:
             if len(frame) < 5:
                 return
-<<<<<<< HEAD
 
             cmd = frame[1]
             data_len = frame[2]
@@ -1108,15 +791,6 @@ class HumsiENK_Ble(Battery):
 
             logger.debug(f"HumsiENK: Parsing response CMD={cmd:02X}, data_len={data_len}")
 
-=======
-            
-            cmd = frame[1]
-            data_len = frame[2]
-            data = frame[3:3+data_len]
-            
-            logger.debug(f"HumsiENK: Parsing response CMD={cmd:02X}, data_len={data_len}")
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Route to appropriate parser based on command
             if cmd == self.CMD_BATTERY_INFO:
                 self._parse_battery_info(data)
@@ -1130,7 +804,6 @@ class HumsiENK_Ble(Battery):
                 self._parse_version(data)
             else:
                 logger.debug(f"HumsiENK: Unknown command response {cmd:02X}")
-<<<<<<< HEAD
 
         except Exception as e:
             logger.warning(f"HumsiENK: Parse error: {e}")
@@ -1139,16 +812,6 @@ class HumsiENK_Ble(Battery):
         """
         Parse command 0x21 response (Battery Info) - 26 bytes.
 
-=======
-                
-        except Exception as e:
-            logger.warning(f"HumsiENK: Parse error: {e}")
-    
-    def _parse_battery_info(self, data: bytes):
-        """
-        Parse command 0x21 response (Battery Info) - 26 bytes.
-        
->>>>>>> origin/feat/external-sensor-voltage
         Field layout confirmed from vendor protocol references and live device data:
             vol (4 bytes): Battery voltage in mV (millivolts)
             ele (4 bytes): Current in mA (milliamps), signed 32-bit
@@ -1163,11 +826,7 @@ class HumsiENK_Ble(Battery):
             t4 (1 byte): Cell temperature 4 in °C (direct)
             MOS (1 byte): MOSFET temperature in °C (direct)
             environment (1 byte): Environment temperature in °C (direct)
-<<<<<<< HEAD
 
-=======
-        
->>>>>>> origin/feat/external-sensor-voltage
         Note: Charge/discharge FET status is NOT in this response.
         FET status comes from the 0x20 status command (operation_status bits 7/23).
         """
@@ -1175,7 +834,6 @@ class HumsiENK_Ble(Battery):
             if len(data) < 26:
                 logger.warning(f"HumsiENK: Battery info data too short: {len(data)} bytes")
                 return
-<<<<<<< HEAD
 
             idx = 0
 
@@ -1215,57 +873,12 @@ class HumsiENK_Ble(Battery):
             self.cycles = int.from_bytes(data[idx : idx + 2], byteorder="little", signed=False)
             idx += 2
 
-=======
-            
-            idx = 0
-            
-            # Voltage (4 bytes, millivolts → divide by 1000 for V)
-            voltage_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=False)
-            self.voltage = voltage_raw / 1000.0
-            idx += 4
-            
-            # Current (4 bytes, milliamps signed → divide by 1000 for A)
-            # Vendor formula: e.ele > 2147483647 && (e.ele = -(4294967296 - e.ele))
-            current_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=True)
-            self.current = current_raw / 1000.0
-            idx += 4
-            
-            # SOC (1 byte, %)
-            self.soc = data[idx]
-            idx += 1
-            
-            # SOH (1 byte, %)
-            self.soh = data[idx] if 0 <= data[idx] <= 100 else None
-            idx += 1
-            
-            # Remaining capacity (4 bytes, mAh → divide by 1000 for Ah)
-            # Vendor formula: r.info.capacity1 = (r.info.capacity / 1e3).toFixed(2)
-            capacity_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=False)
-            self.capacity_remain = capacity_raw / 1000.0
-            idx += 4
-            
-            # Total capacity (4 bytes, mAh → divide by 1000 for Ah)
-            # Vendor formula: r.info.allCapacity1 = (r.info.allCapacity / 1e3).toFixed(2)
-            total_capacity_raw = int.from_bytes(data[idx:idx+4], byteorder='little', signed=False)
-            if total_capacity_raw > 0:
-                self.capacity = total_capacity_raw / 1000.0
-            idx += 4
-            
-            # Cycles (2 bytes)
-            self.cycles = int.from_bytes(data[idx:idx+2], byteorder='little', signed=False)
-            idx += 2
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Temperatures (6 × 1 byte, direct °C, signed byte)
             # Vendor field names: t1, t2, t3, t4, MOS, environment (each 1 byte)
             # Vendor display: raw > 127 ? raw - 256 : raw (signed byte for sub-zero temps)
             def _signed_byte(b):
                 return b if b < 128 else b - 256
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             if idx < len(data):
                 self.temperature_1 = float(_signed_byte(data[idx]))
                 idx += 1
@@ -1286,7 +899,6 @@ class HumsiENK_Ble(Battery):
                 # Battery class, but stored for logging/diagnostics.
                 self.temperature_env = float(_signed_byte(data[idx]))
                 idx += 1
-<<<<<<< HEAD
 
             logger.debug(
                 f"HumsiENK: Battery info: {self.voltage:.2f}V, {self.current:.2f}A, {self.soc}%, "
@@ -1300,19 +912,6 @@ class HumsiENK_Ble(Battery):
         """
         Parse command 0x22 response (Cell Voltages) - up to 48 bytes.
 
-=======
-            
-            logger.debug(f"HumsiENK: Battery info: {self.voltage:.2f}V, {self.current:.2f}A, {self.soc}%, "
-                        f"{self.capacity_remain:.1f}/{self.capacity:.1f}Ah, {self.cycles} cycles")
-            
-        except Exception as e:
-            logger.warning(f"HumsiENK: Error parsing battery info: {e}")
-    
-    def _parse_cell_voltages(self, data: bytes):
-        """
-        Parse command 0x22 response (Cell Voltages) - up to 48 bytes.
-        
->>>>>>> origin/feat/external-sensor-voltage
         Each cell voltage is 2 bytes (little-endian):
         - 24 cell slots maximum
         - Value in millivolts (e.g., 3300 = 3.300V)
@@ -1321,24 +920,14 @@ class HumsiENK_Ble(Battery):
         try:
             if len(data) < 2:
                 return
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Determine number of cells from non-zero values
             cell_voltages_mv = []
             for i in range(0, min(len(data), 48), 2):
                 if i + 1 < len(data):
-<<<<<<< HEAD
                     cell_mv = int.from_bytes(data[i : i + 2], byteorder="little", signed=False)
                     cell_voltages_mv.append(cell_mv)
 
-=======
-                    cell_mv = int.from_bytes(data[i:i+2], byteorder='little', signed=False)
-                    cell_voltages_mv.append(cell_mv)
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Count non-zero cells (assuming they're contiguous from start)
             detected_cell_count = 0
             for mv in cell_voltages_mv:
@@ -1347,38 +936,24 @@ class HumsiENK_Ble(Battery):
                 elif detected_cell_count > 0:
                     # Stop at first zero after non-zero cells
                     break
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Update cell count if different (auto-detection)
             if detected_cell_count > 0 and detected_cell_count != self.cell_count:
                 logger.info(f"HumsiENK: Detected {detected_cell_count} cells (was {self.cell_count})")
                 self.cell_count = detected_cell_count
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Ensure cells list is properly sized
             if len(self.cells) < self.cell_count:
                 for _ in range(self.cell_count - len(self.cells)):
                     self.cells.append(Cell(False))
             elif len(self.cells) > self.cell_count:
-<<<<<<< HEAD
                 self.cells = self.cells[: self.cell_count]
 
-=======
-                self.cells = self.cells[:self.cell_count]
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Update cell voltages
             for idx in range(min(self.cell_count, len(cell_voltages_mv))):
                 mv = cell_voltages_mv[idx]
                 if 1000 <= mv <= 5000:  # Sanity check
                     self.cells[idx].voltage = mv / 1000.0
-<<<<<<< HEAD
 
             # NOTE: Do NOT overwrite self.voltage here — the BMS-reported pack
             # voltage from 0x21 is more accurate than the sum of individual
@@ -1393,36 +968,14 @@ class HumsiENK_Ble(Battery):
         """
         Parse command 0x20 response (Operating Status) - 14 bytes.
 
-=======
-            
-            # NOTE: Do NOT overwrite self.voltage here — the BMS-reported pack
-            # voltage from 0x21 is more accurate than the sum of individual
-            # cell voltages (which accumulate rounding errors).
-            
-            logger.debug(f"HumsiENK: Cell voltages: {[c.voltage for c in self.cells[:min(4, self.cell_count)]]}")
-            
-        except Exception as e:
-            logger.warning(f"HumsiENK: Error parsing cell voltages: {e}")
-    
-    def _parse_status(self, data: bytes):
-        """
-        Parse command 0x20 response (Operating Status) - 14 bytes.
-        
->>>>>>> origin/feat/external-sensor-voltage
         Data map:
             Bytes 0-3: Runtime (days:2, hours:1, minutes:1)
             Bytes 4-7: Operation status flags (32-bit) - See alarm bit mapping below
             Bytes 8-10: Cell balance status (24-bit bitmap)
             Bytes 11-13: Cell disconnect status (24-bit bitmap)
-<<<<<<< HEAD
 
         Operation Status Alarm/Protection Bits (from vendor protocol analysis):
 
-=======
-        
-        Operation Status Alarm/Protection Bits (from vendor protocol analysis):
-        
->>>>>>> origin/feat/external-sensor-voltage
         CHARGE SECTION (Bits 0-15):
           Bit 0:  Charge overcurrent protection
           Bit 1:  Charge over-temperature protection
@@ -1434,11 +987,7 @@ class HumsiENK_Ble(Battery):
           Bit 10: Charge under-temperature warning
           Bit 12: Pack overvoltage warning
           Bit 15: Balance active (1=yes, 0=no)
-<<<<<<< HEAD
 
-=======
-        
->>>>>>> origin/feat/external-sensor-voltage
         DISCHARGE SECTION (Bits 16-31):
           Bit 16: Discharge overcurrent protection
           Bit 17: Discharge over-temperature protection
@@ -1458,45 +1007,25 @@ class HumsiENK_Ble(Battery):
             if len(data) < 14:
                 logger.debug(f"HumsiENK: Status data too short: {len(data)} bytes")
                 return
-<<<<<<< HEAD
 
             # Runtime (bytes 0-3)
             runtime_days = int.from_bytes(data[0:2], byteorder="little", signed=False)
-=======
-            
-            # Runtime (bytes 0-3)
-            runtime_days = int.from_bytes(data[0:2], byteorder='little', signed=False)
->>>>>>> origin/feat/external-sensor-voltage
             runtime_hours = data[2]
             runtime_minutes = data[3]
             runtime_seconds = ((runtime_days * 24 + runtime_hours) * 60 + runtime_minutes) * 60
             self.runtime_seconds = runtime_seconds
-<<<<<<< HEAD
 
             # Operation status (bytes 4-7) - 32-bit field
             operation_status = int.from_bytes(data[4:8], byteorder="little", signed=False)
 
-=======
-            
-            # Operation status (bytes 4-7) - 32-bit field
-            operation_status = int.from_bytes(data[4:8], byteorder='little', signed=False)
-            
->>>>>>> origin/feat/external-sensor-voltage
             # FET Status (bits 7, 23)
             self.charge_fet = bool(operation_status & (1 << 7))
             self.discharge_fet = bool(operation_status & (1 << 23))
             self.balance_active = bool(operation_status & (1 << 15))
-<<<<<<< HEAD
 
             # Parse alarm/protection bits
             # Victron uses: 0=OK, 1=Warning, 2=Alarm/Protection
 
-=======
-            
-            # Parse alarm/protection bits
-            # Victron uses: 0=OK, 1=Warning, 2=Alarm/Protection
-            
->>>>>>> origin/feat/external-sensor-voltage
             # High Voltage (Overvoltage)
             if operation_status & (1 << 4):  # Bit 4: Pack OVP protection
                 self.protection.high_voltage = 2
@@ -1504,11 +1033,7 @@ class HumsiENK_Ble(Battery):
                 self.protection.high_voltage = 1
             else:
                 self.protection.high_voltage = 0
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Low Voltage (Undervoltage)
             if operation_status & (1 << 21):  # Bit 21: Pack UVP protection
                 self.protection.low_voltage = 2
@@ -1516,11 +1041,7 @@ class HumsiENK_Ble(Battery):
                 self.protection.low_voltage = 1
             else:
                 self.protection.low_voltage = 0
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # High Charge Current
             if operation_status & (1 << 0):  # Bit 0: Charge OCP protection
                 self.protection.high_charge_current = 2
@@ -1528,11 +1049,7 @@ class HumsiENK_Ble(Battery):
                 self.protection.high_charge_current = 1
             else:
                 self.protection.high_charge_current = 0
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # High Discharge Current
             if operation_status & (1 << 16):  # Bit 16: Discharge OCP protection
                 self.protection.high_discharge_current = 2
@@ -1540,11 +1057,7 @@ class HumsiENK_Ble(Battery):
                 self.protection.high_discharge_current = 1
             else:
                 self.protection.high_discharge_current = 0
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # High Charge Temperature
             if operation_status & (1 << 1):  # Bit 1: Charge high temp protection
                 self.protection.high_charge_temp = 2
@@ -1552,11 +1065,7 @@ class HumsiENK_Ble(Battery):
                 self.protection.high_charge_temp = 1
             else:
                 self.protection.high_charge_temp = 0
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Low Charge Temperature
             if operation_status & (1 << 2):  # Bit 2: Charge low temp protection
                 self.protection.low_charge_temp = 2
@@ -1564,11 +1073,7 @@ class HumsiENK_Ble(Battery):
                 self.protection.low_charge_temp = 1
             else:
                 self.protection.low_charge_temp = 0
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # High Discharge Temperature
             if operation_status & (1 << 17):  # Bit 17: Discharge high temp protection
                 self.protection.high_discharge_temp = 2
@@ -1576,11 +1081,7 @@ class HumsiENK_Ble(Battery):
                 self.protection.high_discharge_temp = 1
             else:
                 self.protection.high_discharge_temp = 0
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Low Discharge Temperature
             if operation_status & (1 << 18):  # Bit 18: Discharge low temp protection
                 self.protection.low_discharge_temp = 2
@@ -1588,21 +1089,13 @@ class HumsiENK_Ble(Battery):
                 self.protection.low_discharge_temp = 1
             else:
                 self.protection.low_discharge_temp = 0
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Short Circuit (no warning level, only protection)
             if operation_status & (1 << 20):  # Bit 20: Short circuit protection
                 self.protection.short_circuit = 2
             else:
                 self.protection.short_circuit = 0
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # MOS Over-Temperature (additional protection)
             if operation_status & (1 << 30):  # Bit 30: MOS over-temp protection
                 self.protection.internal_failure = 2  # Use internal_failure for MOS protection
@@ -1610,11 +1103,7 @@ class HumsiENK_Ble(Battery):
                 self.protection.internal_failure = 1
             else:
                 self.protection.internal_failure = 0
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Log active alarms
             active_alarms = []
             if self.protection.high_voltage == 2:
@@ -1637,7 +1126,6 @@ class HumsiENK_Ble(Battery):
                 active_alarms.append("Short-Circuit")
             if self.protection.internal_failure == 2:
                 active_alarms.append("MOS-OTP")
-<<<<<<< HEAD
 
             if active_alarms:
                 logger.warning(f"HumsiENK: Active protections: {', '.join(active_alarms)}")
@@ -1646,48 +1134,25 @@ class HumsiENK_Ble(Battery):
             if len(data) >= 11:
                 cell_balance = int.from_bytes(data[8:11], "little", signed=False)
 
-=======
-            
-            if active_alarms:
-                logger.warning(f"HumsiENK: Active protections: {', '.join(active_alarms)}")
-            
-            # Cell balance status (bytes 8-10) - 24-bit bitmap
-            if len(data) >= 11:
-                cell_balance = int.from_bytes(data[8:11], 'little', signed=False)
-                
->>>>>>> origin/feat/external-sensor-voltage
                 # Update each cell's balance status
                 for i in range(min(self.cell_count, 24)):
                     if i < len(self.cells):
                         self.cells[i].balance = bool((cell_balance >> i) & 1)
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Cell disconnect status (bytes 11-13) - 24-bit bitmap
             # This indicates if any cells are physically disconnected (faulty connections, broken wires)
             # NOTE: The official vendor app parses this field but never displays it!
             # We implement it anyway for critical safety monitoring.
             if len(data) >= 14:
-<<<<<<< HEAD
                 cell_disconnect = int.from_bytes(data[11:14], "little", signed=False)
 
-=======
-                cell_disconnect = int.from_bytes(data[11:14], 'little', signed=False)
-                
->>>>>>> origin/feat/external-sensor-voltage
                 # Check if any cells are disconnected
                 if cell_disconnect != 0:
                     disconnected_cells = []
                     for i in range(min(self.cell_count, 24)):
                         if (cell_disconnect >> i) & 1:
                             disconnected_cells.append(i + 1)  # 1-indexed for user display
-<<<<<<< HEAD
 
-=======
-                    
->>>>>>> origin/feat/external-sensor-voltage
                     if disconnected_cells:
                         logger.error(f"HumsiENK: CRITICAL - Cells physically disconnected: {disconnected_cells}")
                         # Set critical alarm - this is a serious hardware issue
@@ -1696,7 +1161,6 @@ class HumsiENK_Ble(Battery):
                         # Also log as internal failure since this shouldn't happen in normal operation
                         if self.protection.internal_failure < 2:  # Don't downgrade existing MOS temp alarm
                             self.protection.internal_failure = max(self.protection.internal_failure, 1)
-<<<<<<< HEAD
 
             logger.debug(f"HumsiENK: Status: CHG_FET={self.charge_fet}, DSG_FET={self.discharge_fet}, BAL={self.balance_active}, runtime={runtime_seconds}s")
 
@@ -1707,18 +1171,6 @@ class HumsiENK_Ble(Battery):
         """
         Parse command 0x58 response (Configuration) - 44 bytes.
 
-=======
-            
-            logger.debug(f"HumsiENK: Status: CHG_FET={self.charge_fet}, DSG_FET={self.discharge_fet}, BAL={self.balance_active}, runtime={runtime_seconds}s")
-            
-        except Exception as e:
-            logger.warning(f"HumsiENK: Error parsing status: {e}")
-    
-    def _parse_config(self, data: bytes):
-        """
-        Parse command 0x58 response (Configuration) - 44 bytes.
-        
->>>>>>> origin/feat/external-sensor-voltage
         Configuration parameters (all 2-byte little-endian values):
             battery_count (cells in series)
             battery_capacity (rated capacity in 0.01Ah)
@@ -1747,7 +1199,6 @@ class HumsiENK_Ble(Battery):
             if len(data) < 44:
                 logger.warning(f"HumsiENK: Config data too short: {len(data)} bytes")
                 return
-<<<<<<< HEAD
 
             idx = 0
 
@@ -1789,68 +1240,11 @@ class HumsiENK_Ble(Battery):
             idx += 2  # discharge OCP2 (0.1A) - not used
             idx += 2  # discharge OCP2 delay - not used
 
-=======
-            
-            idx = 0
-            
-            # Battery configuration
-            battery_count = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            idx += 2
-            
-            battery_capacity_raw = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            battery_capacity = battery_capacity_raw / 100.0  # Convert from 0.01Ah to Ah
-            idx += 2
-            
-            # Voltage protection limits (mV)
-            cell_ovp_mv = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            cell_ovp = cell_ovp_mv / 1000.0  # Convert to volts
-            idx += 2
-            
-            cell_ovp_recovery_mv = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            idx += 2
-            
-            ovp_delay = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            idx += 2
-            
-            cell_uvp_mv = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            cell_uvp = cell_uvp_mv / 1000.0  # Convert to volts
-            idx += 2
-            
-            cell_uvp_recovery_mv = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            idx += 2
-            
-            uvp_delay = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            idx += 2
-            
-            # Current protection limits (0.1A units)
-            charge_ocp_raw = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            charge_ocp = charge_ocp_raw / 10.0  # Convert to amps
-            idx += 2
-            
-            charge_ocp_delay = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            idx += 2
-            
-            discharge_ocp1_raw = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            discharge_ocp1 = discharge_ocp1_raw / 10.0  # Convert to amps
-            idx += 2
-            
-            discharge_ocp1_delay = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            idx += 2
-            
-            discharge_ocp2_raw = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            discharge_ocp2 = discharge_ocp2_raw / 10.0  # Convert to amps
-            idx += 2
-            
-            discharge_ocp2_delay = int.from_bytes(data[idx:idx+2], 'little', signed=False)
-            idx += 2
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Temperature protection limits (raw values in deciKelvin)
             # Vendor formula: (raw - 2731) / 10 → °C
             # (confirmed at app-service-pretty.js line 7870)
             def _dk_to_c(raw):
                 return (raw - 2731) / 10.0
-<<<<<<< HEAD
 
             charge_high_temp = _dk_to_c(int.from_bytes(data[idx : idx + 2], "little", signed=False))
             idx += 2
@@ -1872,89 +1266,41 @@ class HumsiENK_Ble(Battery):
 
             idx += 2  # discharge low temp recovery - not used
 
-=======
-            
-            charge_high_temp = _dk_to_c(int.from_bytes(data[idx:idx+2], 'little', signed=False))
-            idx += 2
-            
-            charge_high_temp_recovery = _dk_to_c(int.from_bytes(data[idx:idx+2], 'little', signed=False))
-            idx += 2
-            
-            charge_low_temp = _dk_to_c(int.from_bytes(data[idx:idx+2], 'little', signed=False))
-            idx += 2
-            
-            charge_low_temp_recovery = _dk_to_c(int.from_bytes(data[idx:idx+2], 'little', signed=False))
-            idx += 2
-            
-            discharge_high_temp = _dk_to_c(int.from_bytes(data[idx:idx+2], 'little', signed=False))
-            idx += 2
-            
-            discharge_high_temp_recovery = _dk_to_c(int.from_bytes(data[idx:idx+2], 'little', signed=False))
-            idx += 2
-            
-            discharge_low_temp = _dk_to_c(int.from_bytes(data[idx:idx+2], 'little', signed=False))
-            idx += 2
-            
-            discharge_low_temp_recovery = _dk_to_c(int.from_bytes(data[idx:idx+2], 'little', signed=False))
-            idx += 2
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Set battery parameters for Victron to use
             if battery_count > 0 and battery_count <= 24:
                 # Update cell count if different (but don't override auto-detection if already set correctly)
                 if self.cell_count != battery_count:
                     logger.info(f"HumsiENK: Config reports {battery_count} cells (current: {self.cell_count})")
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             if battery_capacity > 0:
                 if self.capacity != battery_capacity:
                     logger.info(f"HumsiENK: Config capacity: {battery_capacity}Ah (current: {self.capacity}Ah)")
                     # Only update if not already set from config.ini
                     if self.capacity == 0 or BATTERY_CAPACITY is None:
                         self.capacity = battery_capacity
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Set voltage limits for Victron
             if cell_ovp > 0 and battery_count > 0:
                 self.max_battery_voltage = cell_ovp * battery_count
                 logger.debug(f"HumsiENK: Max pack voltage: {self.max_battery_voltage}V ({cell_ovp}V/cell)")
-<<<<<<< HEAD
 
             if cell_uvp > 0 and battery_count > 0:
                 self.min_battery_voltage = cell_uvp * battery_count
                 logger.debug(f"HumsiENK: Min pack voltage: {self.min_battery_voltage}V ({cell_uvp}V/cell)")
 
-=======
-            
-            if cell_uvp > 0 and battery_count > 0:
-                self.min_battery_voltage = cell_uvp * battery_count
-                logger.debug(f"HumsiENK: Min pack voltage: {self.min_battery_voltage}V ({cell_uvp}V/cell)")
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Set current limits for Victron
             if charge_ocp > 0:
                 # Only override if not set in config.ini
                 if MAX_BATTERY_CHARGE_CURRENT is None or self.max_battery_charge_current == MAX_BATTERY_CHARGE_CURRENT:
                     self.max_battery_charge_current = charge_ocp
                     logger.debug(f"HumsiENK: Max charge current: {charge_ocp}A")
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             if discharge_ocp1 > 0:
                 # Use discharge_ocp1 as the primary discharge limit
                 # Only override if not set in config.ini
                 if MAX_BATTERY_DISCHARGE_CURRENT is None or self.max_battery_discharge_current == MAX_BATTERY_DISCHARGE_CURRENT:
                     self.max_battery_discharge_current = discharge_ocp1
                     logger.debug(f"HumsiENK: Max discharge current: {discharge_ocp1}A")
-<<<<<<< HEAD
 
             logger.info(
                 f"HumsiENK: Configuration loaded - {battery_count}S {battery_capacity}Ah, "
@@ -1971,54 +1317,26 @@ class HumsiENK_Ble(Battery):
         """
         Parse command 0xF5 response (Firmware Version).
 
-=======
-            
-            logger.info(f"HumsiENK: Configuration loaded - {battery_count}S {battery_capacity}Ah, "
-                       f"OVP={cell_ovp}V UVP={cell_uvp}V, "
-                       f"Charge={charge_ocp}A Discharge={discharge_ocp1}A, "
-                       f"ChgTemp={charge_low_temp}~{charge_high_temp}°C "
-                       f"DsgTemp={discharge_low_temp}~{discharge_high_temp}°C")
-            
-        except Exception as e:
-            logger.warning(f"HumsiENK: Error parsing config: {e}")
-    
-    def _parse_version(self, data: bytes):
-        """
-        Parse command 0xF5 response (Firmware Version).
-        
->>>>>>> origin/feat/external-sensor-voltage
         Returns ASCII string representation of firmware version.
         """
         try:
             if len(data) == 0:
                 logger.warning("HumsiENK: Version data is empty")
                 return
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             # Convert bytes to ASCII string
             version_str = ""
             for byte in data:
                 # Only include printable ASCII characters (32-126)
                 if 32 <= byte <= 126:
                     version_str += chr(byte)
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> origin/feat/external-sensor-voltage
             if version_str:
                 self.hardware_version = f"HumsiENK v{version_str}"
                 logger.info(f"HumsiENK: Firmware version: {version_str}")
             else:
                 logger.warning(f"HumsiENK: Unable to decode version from data: {data.hex()}")
-<<<<<<< HEAD
 
-=======
-                
->>>>>>> origin/feat/external-sensor-voltage
         except Exception as e:
             logger.warning(f"HumsiENK: Error parsing version: {e}")
 
@@ -2029,7 +1347,6 @@ class HumsiENK_Ble(Battery):
             self.ble_handle.send_data(cmd)
 
     def _pop_next_notification(self, timeout: float = 0.3):
-<<<<<<< HEAD
         # Pop a single notification chunk from the BLE notify queue.
         # Event-driven: blocks on a Condition signaled by the notify
         # callback rather than polling the queue every 20 ms (the old
@@ -2058,26 +1375,3 @@ class HumsiENK_Ble(Battery):
         except Exception:
             pass
         return None
-=======
-        # Pop a single notification chunk from the BLE notify queue, waiting up to timeout
-        if not self.ble_handle:
-            return None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                if getattr(self.ble_handle, "_notification_queue", None) and len(self.ble_handle._notification_queue) > 0:
-                    return self.ble_handle._notification_queue.popleft()
-            except Exception:
-                return None
-            time.sleep(0.02)
-        # Final attempt after timeout
-        try:
-            if getattr(self.ble_handle, "_notification_queue", None) and len(self.ble_handle._notification_queue) > 0:
-                return self.ble_handle._notification_queue.popleft()
-        except Exception:
-            pass
-        return None
-
-
-
->>>>>>> origin/feat/external-sensor-voltage
