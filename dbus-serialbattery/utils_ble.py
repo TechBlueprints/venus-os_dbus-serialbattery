@@ -3,6 +3,7 @@ import asyncio
 import subprocess
 import sys
 from bleak import BleakClient
+from bleak.exc import BleakCharacteristicNotFoundError
 from time import sleep
 from utils import logger, BLUETOOTH_ADAPTERS, BLUETOOTH_CONNECTION_BACKEND, BLUETOOTH_FORCE_RESET_BLE_STACK, capture_raw_data
 
@@ -61,7 +62,22 @@ class BleakBackend(BleConnectionBackend):
         try:
             await client.connect()
             logger.info("connected to bluetooh device" + address)
-            await client.start_notify(notify_char, notify_callback)
+            # Retry start_notify when the characteristic is not yet resolved:
+            # BleakClient.connect() can return before all GATT characteristics
+            # are exported by BlueZ, so the first attempt can raise
+            # BleakCharacteristicNotFoundError for a characteristic that
+            # actually exists. Clear bleak's cached service collection,
+            # re-run service discovery and retry before giving up.
+            for attempt in range(3):
+                try:
+                    await client.start_notify(notify_char, notify_callback)
+                    break
+                except BleakCharacteristicNotFoundError:
+                    if attempt == 2:
+                        raise
+                    client._backend.services = None
+                    await client._backend._get_services()
+                    await asyncio.sleep(0.5)
         except Exception:
             # rotate to the next configured adapter for the next attempt
             if BLUETOOTH_ADAPTERS:
@@ -123,51 +139,87 @@ class BCMBackend(BleConnectionBackend):
         self._disconnected_callback = disconnected_callback
         return None
 
+    async def _connect_device_no_scan(self, address, adapter):
+        """Create + connect the device object on a specific adapter via
+        BlueZ's experimental Adapter1.ConnectDevice (bluetoothd -E).
+
+        Returns the device object path, or None on failure.  Unlike a
+        discovery scan, this does not need the adapter's scan slot, so it
+        works while other services hold scanning on the adapter.
+        """
+        try:
+            from dbus_fast import Message, Variant
+            from dbus_fast.aio import MessageBus
+            from dbus_fast.constants import BusType, MessageType
+
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                reply = await asyncio.wait_for(
+                    bus.call(
+                        Message(
+                            destination="org.bluez",
+                            path=f"/org/bluez/{adapter}",
+                            interface="org.bluez.Adapter1",
+                            member="ConnectDevice",
+                            signature="a{sv}",
+                            body=[{"Address": Variant("s", address), "AddressType": Variant("s", "public")}],
+                        )
+                    ),
+                    timeout=30.0,
+                )
+                if reply.message_type == MessageType.METHOD_RETURN:
+                    return reply.body[0] if reply.body else f"/org/bluez/{adapter}/dev_" + address.replace(":", "_").upper()
+                error_name = getattr(reply, "error_name", "")
+                if "AlreadyExists" in error_name:
+                    # device object already present on this adapter — usable
+                    return f"/org/bluez/{adapter}/dev_" + address.replace(":", "_").upper()
+                logger.debug(f"BLE [{address}] ConnectDevice on {adapter} failed: {error_name}")
+                return None
+            finally:
+                bus.disconnect()
+        except Exception as e:
+            logger.debug(f"BLE [{address}] ConnectDevice on {adapter} error: {repr(e)}")
+            return None
+
     async def establish(self, client, address, notify_char, notify_callback):
         adapters = self._adapters()
         escalation = EscalationPolicy(adapters or [], config=PROFILE_BATTERY)
 
         # Cache-first device resolution; scan only if the cache misses and
-        # the scan lock can be acquired.  If the configured adapters cannot
-        # resolve the device (their scan slots are frequently held by other
-        # services on GX hardware), widen the search to every adapter — a
-        # BLE device object can only be connected on the adapter whose scan
-        # actually saw it, so finding it anywhere beats not connecting.
+        # the scan lock can be acquired.  BLUETOOTH_ADAPTERS is a hard
+        # allow-list: connections are made ONLY via the listed adapters.
+        # When the listed adapters cannot resolve the device by scanning
+        # (their scan slots are frequently held by other services on GX
+        # hardware), fall back to BlueZ's ConnectDevice API, which creates
+        # and connects the device object on a chosen adapter without any
+        # discovery (requires bluetoothd -E, standard on Venus OS).
         device = None
         try:
             device = await bcm_find_device(address, timeout=15.0, max_attempts=2, adapters=adapters)
         except Exception as e:
             logger.warning(f"BLE [{address}] managed scan failed: {repr(e)}")
-        if device is None and adapters:
-            logger.info(f"BLE [{address}] not seen on {adapters}, widening scan to all adapters")
-            try:
-                device = await bcm_find_device(address, timeout=15.0, max_attempts=2, adapters=None)
-            except Exception as e:
-                logger.warning(f"BLE [{address}] wide scan failed: {repr(e)}")
 
         connect_adapters = adapters
-        if device is None:
-            # Not seen advertising anywhere — last resort: direct connect
-            # against the expected BlueZ path on the first candidate adapter
-            # (works when the device object survives in the BlueZ cache).
-            from bleak.backends.device import BLEDevice
-
-            first_adapter = (adapters or ["hci0"])[0]
-            logger.info(f"BLE [{address}] not resolved by any scan, trying cached path on {first_adapter}")
-            path = f"/org/bluez/{first_adapter}/dev_" + address.replace(":", "_").upper()
-            device = BLEDevice(address=address, name=None, details={"path": path, "props": {}})
-            connect_adapters = [first_adapter]
-        else:
-            # Pin the connection to the adapter that actually resolved the
-            # device: its Device1 object only exists on that adapter, so
-            # rotating to others would fail with 'device not found'.
+        if device is not None:
+            # Pin the connection to the adapter whose scan resolved the
+            # device: its Device1 object only exists there, and (with an
+            # allow-list) find_device only searched allowed adapters.
             try:
-                found_adapter = device.details["path"].split("/")[3]
-                if not adapters or found_adapter not in adapters:
-                    logger.info(f"BLE [{address}] resolved on {found_adapter}, connecting there")
-                connect_adapters = [found_adapter]
+                connect_adapters = [device.details["path"].split("/")[3]]
             except Exception:
                 pass
+        else:
+            for adapter in adapters or ["hci0"]:
+                path = await self._connect_device_no_scan(address, adapter)
+                if path:
+                    from bleak.backends.device import BLEDevice
+
+                    logger.info(f"BLE [{address}] created device on {adapter} via ConnectDevice (no scan)")
+                    device = BLEDevice(address=address, name=None, details={"path": path, "props": {}})
+                    connect_adapters = [adapter]
+                    break
+            if device is None:
+                raise Exception(f"device not resolvable on allowed adapters {adapters} (scan + ConnectDevice both failed)")
 
         client = await establish_connection(
             BleakClient,
