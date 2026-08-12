@@ -922,20 +922,17 @@ class DbusHelper:
 
     def stale_serving_eligible(self) -> bool:
         """
-        Check if stale data serving can be entered/continued after the BMS disconnected.
+        Check if stale data serving can be entered after the BMS disconnected.
 
-        Requires FALLBACK_SERVE_STALE_MINUTES to be set, BLOCK_ON_DISCONNECT to be disabled,
-        a connected fallback sensor and cell voltages that were within the safe thresholds
-        at the moment of disconnection.
+        Requires FALLBACK_SERVE_STALE_MINUTES to be set, BLOCK_ON_DISCONNECT to be disabled
+        and a connected fallback sensor. There is deliberately no cell voltage condition:
+        the BMS's own cell-level protection acts independently of this driver, and the loads
+        keep running during an outage either way — serving live fallback data is always
+        better than serving nothing.
 
         :return: True if stale data serving is allowed
         """
-        return (
-            utils.FALLBACK_SERVE_STALE_MINUTES > 0
-            and not utils.BLOCK_ON_DISCONNECT
-            and self.battery.dbus_fallback_objects is not None
-            and self.cell_voltages_good is True
-        )
+        return utils.FALLBACK_SERVE_STALE_MINUTES > 0 and not utils.BLOCK_ON_DISCONNECT and self.battery.dbus_fallback_objects is not None
 
     def publish_battery(self, loop) -> None:
         """
@@ -1155,17 +1152,22 @@ class DbusHelper:
                     )
 
                     # set BMS cable alarm to warning
+                    # while the fallback sensor is actively serving, the outage is not yet
+                    # user-actionable degradation, so the warning is held back longer
+                    bms_cable_warn_seconds = utils.FALLBACK_BMS_CABLE_WARN_MINUTES * 60 if self.stale_serving else 60
                     self.bms_cable_alarm = (
                         1
                         if self.error["timestamp_last"] is not None
                         and self.error["timestamp_first"] is not None
-                        and 60 < self.error["timestamp_last"] - self.error["timestamp_first"]
+                        and bms_cable_warn_seconds < self.error["timestamp_last"] - self.error["timestamp_first"]
                         else 0
                     )
 
                     # Exit if recovery time exceeded and
                     # if BLOCK_ON_DISCONNECT is enabled or cell voltages are unsafe
-                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good):
+                    # (not while serving stale data: the fallback sensor provides live values
+                    # and the exit is deferred to the stale window)
+                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good) and not self.stale_serving:
                         recovery_failed = True
                     # Exit if extended recovery time exceeded
                     # This is only possible if cell voltages are good and BLOCK_ON_DISCONNECT is disabled else it would have exited earlier
