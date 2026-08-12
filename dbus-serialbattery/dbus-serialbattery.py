@@ -22,6 +22,12 @@ from utils import (
     EXTERNAL_SENSOR_DBUS_DEVICE,
     EXTERNAL_SENSOR_DBUS_PATH_CURRENT,
     EXTERNAL_SENSOR_DBUS_PATH_SOC,
+    EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE,
+    EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE,
+    FALLBACK_SENSOR_DBUS_DEVICE,
+    FALLBACK_SENSOR_DBUS_PATH_CURRENT,
+    FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE,
+    FALLBACK_SENSOR_DBUS_PATH_VOLTAGE,
     get_bms_detection_cache_key,
     get_venus_os_version,
     get_venus_os_image_type,
@@ -429,6 +435,10 @@ def main():
                 # noqa: F401 --> ignore flake "imported but unused" error
                 from bms.lltjbd_ble import LltJbd_Ble  # noqa: F401
 
+            elif port == "HumsiENK_Ble":
+                # noqa: F401 --> ignore flake "imported but unused" error
+                from bms.humsienk_ble import HumsiENK_Ble  # noqa: F401
+
             elif port == "Xdzn_Ble":
                 # noqa: F401 --> ignore flake "imported but unused" error
                 from bms.xdzn_ble import Xdzn_Ble  # noqa: F401
@@ -676,10 +686,24 @@ def main():
             battery[key_address].state = 10
             battery[key_address].error_code = 119
 
-    # check, if external current sensor should be used
-    if EXTERNAL_SENSOR_DBUS_DEVICE is not None and (EXTERNAL_SENSOR_DBUS_PATH_CURRENT is not None or EXTERNAL_SENSOR_DBUS_PATH_SOC is not None):
+    # check, if external sensor should be used
+    if EXTERNAL_SENSOR_DBUS_DEVICE is not None and (
+        EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE is not None
+        or EXTERNAL_SENSOR_DBUS_PATH_CURRENT is not None
+        or EXTERNAL_SENSOR_DBUS_PATH_SOC is not None
+        or EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE is not None
+    ):
         for key_address in battery:
             battery[key_address].setup_external_sensor()
+
+    # check, if fallback sensor should be used
+    if FALLBACK_SENSOR_DBUS_DEVICE is not None and (
+        FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is not None
+        or FALLBACK_SENSOR_DBUS_PATH_CURRENT is not None
+        or FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE is not None
+    ):
+        for key_address in battery:
+            battery[key_address].setup_fallback_sensor()
 
     # Run the main loop
     try:

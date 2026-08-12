@@ -307,16 +307,44 @@ if not BLOCK_ON_DISCONNECT:
 BMS_CABLE_ALARM: bool = get_bool_from_config("DEFAULT", "BMS_CABLE_ALARM")
 
 
-# --------- External Sensor for Current and/or SoC ---------
+# --------- External Sensor for Voltage, Current, SoC and/or Temperature ---------
 EXTERNAL_SENSOR_DBUS_DEVICE: Union[str, None] = config["DEFAULT"]["EXTERNAL_SENSOR_DBUS_DEVICE"] or None
+EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE: Union[str, None] = config["DEFAULT"]["EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE"] or None
 EXTERNAL_SENSOR_DBUS_PATH_CURRENT: Union[str, None] = config["DEFAULT"]["EXTERNAL_SENSOR_DBUS_PATH_CURRENT"] or None
 EXTERNAL_SENSOR_DBUS_PATH_SOC: Union[str, None] = config["DEFAULT"]["EXTERNAL_SENSOR_DBUS_PATH_SOC"] or None
+EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE: Union[str, None] = config["DEFAULT"]["EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE"] or None
+
+
+# --------- Fallback Sensor and Stale Data Serving ---------
+FALLBACK_SENSOR_DBUS_DEVICE: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_DEVICE"] or None
+FALLBACK_SENSOR_DBUS_PATH_VOLTAGE: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_PATH_VOLTAGE"] or None
+FALLBACK_SENSOR_DBUS_PATH_CURRENT: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_PATH_CURRENT"] or None
+FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE"] or None
+FALLBACK_SERVE_STALE_MINUTES: float = get_float_from_config("DEFAULT", "FALLBACK_SERVE_STALE_MINUTES")
+FALLBACK_BMS_CABLE_WARN_MINUTES: float = get_float_from_config("DEFAULT", "FALLBACK_BMS_CABLE_WARN_MINUTES", 10)
+FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE: float = get_float_from_config("DEFAULT", "FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE")
 
 
 # Common configuration checks
 check_config_issue(
     SOC_CALCULATION and EXTERNAL_SENSOR_DBUS_PATH_SOC is not None,
     "SOC_CALCULATION and EXTERNAL_SENSOR_DBUS_PATH_SOC are both enabled. This will lead to a conflict. Please disable one of them in the configuration.",
+)
+
+check_config_issue(
+    FALLBACK_SERVE_STALE_MINUTES > 0 and FALLBACK_SENSOR_DBUS_DEVICE is None,
+    "FALLBACK_SERVE_STALE_MINUTES is set but FALLBACK_SENSOR_DBUS_DEVICE is empty. Stale serving requires a fallback device. Please check the configuration.",
+)
+
+check_config_issue(
+    FALLBACK_SERVE_STALE_MINUTES > 0 and BLOCK_ON_DISCONNECT,
+    "FALLBACK_SERVE_STALE_MINUTES and BLOCK_ON_DISCONNECT are both enabled. Stale serving is not entered when BLOCK_ON_DISCONNECT is active. Please disable one of them in the configuration.",
+)
+
+check_config_issue(
+    FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE > 0 and (FALLBACK_SENSOR_DBUS_DEVICE is None or FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is None),
+    "FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE is set but there is no fallback shunt voltage to compare against. "
+    "It requires FALLBACK_SENSOR_DBUS_DEVICE and FALLBACK_SENSOR_DBUS_PATH_VOLTAGE. Please check the configuration.",
 )
 
 
@@ -541,7 +569,7 @@ Poll interval in milliseconds
 """
 PUBLISH_CONFIG_VALUES: bool = get_bool_from_config("DEFAULT", "PUBLISH_CONFIG_VALUES")
 PUBLISH_BATTERY_DATA_AS_JSON: bool = get_bool_from_config("DEFAULT", "PUBLISH_BATTERY_DATA_AS_JSON")
-BATTERY_CELL_DATA_FORMAT: int = get_int_from_config("DEFAULT", "BATTERY_CELL_DATA_FORMAT")
+BATTERY_CELL_DATA_FORMAT: int = get_int_from_config("DEFAULT", "BATTERY_CELL_DATA_FORMAT", 3)
 MIDPOINT_ENABLE: bool = get_bool_from_config("DEFAULT", "MIDPOINT_ENABLE")
 TEMPERATURE_SOURCE_BATTERY: List[int] = get_list_from_config("DEFAULT", "TEMPERATURE_SOURCE_BATTERY", int)
 TEMPERATURE_1_NAME: str = config["DEFAULT"]["TEMPERATURE_1_NAME"]
@@ -561,6 +589,7 @@ TEMPERATURE_4_ADJUST: List[float] = get_list_from_config("DEFAULT", "TEMPERATURE
 TEMPERATURE_MOS_ADJUST: List[float] = get_list_from_config("DEFAULT", "TEMPERATURE_MOS_ADJUST", float)
 GUI_PARAMETERS_SHOW_ADDITIONAL_INFO: bool = get_bool_from_config("DEFAULT", "GUI_PARAMETERS_SHOW_ADDITIONAL_INFO")
 TELEMETRY: bool = get_bool_from_config("DEFAULT", "TELEMETRY")
+LOG_DBUS_UPDATES: bool = get_bool_from_config("DEFAULT", "LOG_DBUS_UPDATES")
 
 
 # --------- Voltage drop ---------

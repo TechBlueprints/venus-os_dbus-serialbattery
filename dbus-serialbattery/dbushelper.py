@@ -129,6 +129,7 @@ class DbusHelper:
         self.cell_voltages_good: bool = None
         self.disconnect_threshold: int = None
         self.bms_cable_alarm: int = 0
+        self.stale_serving: bool = False
         self._dbusname: str = (
             "com.victronenergy.battery."
             + self.battery.port[self.battery.port.rfind("/") + 1 :]
@@ -923,6 +924,20 @@ class DbusHelper:
 
         return True
 
+    def stale_serving_eligible(self) -> bool:
+        """
+        Check if stale data serving can be entered after the BMS disconnected.
+
+        Requires FALLBACK_SERVE_STALE_MINUTES to be set, BLOCK_ON_DISCONNECT to be disabled
+        and a connected fallback sensor. There is deliberately no cell voltage condition:
+        the BMS's own cell-level protection acts independently of this driver, and the loads
+        keep running during an outage either way — serving live fallback data is always
+        better than serving nothing.
+
+        :return: True if stale data serving is allowed
+        """
+        return utils.FALLBACK_SERVE_STALE_MINUTES > 0 and not utils.BLOCK_ON_DISCONNECT and self.battery.dbus_fallback_objects is not None
+
     def publish_battery(self, loop) -> None:
         """
         Publishes the battery data to dbus.
@@ -944,7 +959,10 @@ class DbusHelper:
 
             # Check if external sensor is still connected
             if utils.EXTERNAL_SENSOR_DBUS_DEVICE is not None and (
-                utils.EXTERNAL_SENSOR_DBUS_PATH_CURRENT is not None or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None
+                utils.EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE is not None
+                or utils.EXTERNAL_SENSOR_DBUS_PATH_CURRENT is not None
+                or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None
+                or utils.EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE is not None
             ):
                 # Check if external sensor was and is still connected
                 if self.battery.dbus_external_objects is not None and utils.EXTERNAL_SENSOR_DBUS_DEVICE not in get_bus(self._dbusname).list_names():
@@ -955,6 +973,23 @@ class DbusHelper:
                 elif self.battery.dbus_external_objects is None and utils.EXTERNAL_SENSOR_DBUS_DEVICE in get_bus(self._dbusname).list_names():
                     logger.info("External current sensor was connected, switching to external sensor")
                     self.battery.setup_external_sensor()
+
+            # Check if fallback sensor is still connected
+            fallback_device = self.battery.get_fallback_sensor_device()
+            if fallback_device is not None and (
+                utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is not None
+                or utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT is not None
+                or utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE is not None
+            ):
+                # Check if fallback sensor was and is still connected
+                if self.battery.dbus_fallback_objects is not None and fallback_device not in get_bus(self._dbusname).list_names():
+                    logger.error("Fallback sensor was disconnected, stale data serving not available")
+                    self.battery.dbus_fallback_objects = None
+
+                # Check if fallback sensor was not connected and is now connected
+                elif self.battery.dbus_fallback_objects is None and fallback_device in get_bus(self._dbusname).list_names():
+                    logger.info("Fallback sensor was connected")
+                    self.battery.setup_fallback_sensor()
 
             if result:
                 # reset error count, if last error was more than 60 seconds ago
@@ -971,6 +1006,12 @@ class DbusHelper:
                     logger.info(">>> Battery reconnected <<<")
 
                 self.battery.online = True
+
+                # stop serving stale data, live values are available again
+                if self.stale_serving:
+                    self.stale_serving = False
+                    logger.info(">>> Battery responds again, stop serving stale data <<<")
+
                 if self.error["count"] > 0:
                     seconds_since_first_error = int(time()) - self.error["timestamp_first"]
                     self.battery.connection_info = (
@@ -1010,15 +1051,30 @@ class DbusHelper:
                 # Manage battery state, if not set to error (10)
                 # change state from initializing to running, if there is no error
                 if self.battery.state == 0:
-                    self.battery.state = 9
+                    self.battery.state = 1  # default to Charging until we know current direction
 
                 # change state from running to standby, if charging and discharging is not allowed
-                if self.battery.state == 9 and not self.battery.get_allow_to_charge() and not self.battery.get_allow_to_discharge():
+                if self.battery.state in (1, 2, 5, 9) and not self.battery.get_allow_to_charge() and not self.battery.get_allow_to_discharge():
                     self.battery.state = 14
 
                 # change state from standby to running, if charging or discharging is allowed
                 if self.battery.state == 14 and (self.battery.get_allow_to_charge() or self.battery.get_allow_to_discharge()):
-                    self.battery.state = 9
+                    self.battery.state = 1
+
+                # Set battery state based on actual current direction
+                # 1 = Charging, 2 = Discharging, 5 = Float (Charging)
+                if self.battery.state not in (0, 10, 14):
+                    if self.battery.current is not None:
+                        if self.battery.current < -0.5:
+                            self.battery.state = 2  # Discharging
+                        elif self.battery.current > 0.5:
+                            # Preserve Float (5) if charge_mode says Float
+                            if self.battery.charge_mode is not None and self.battery.charge_mode.startswith("Float"):
+                                self.battery.state = 5  # Float
+                            else:
+                                self.battery.state = 1  # Charging
+                        else:
+                            self.battery.state = 0  # Idle
 
             else:
                 # update error variables
@@ -1044,6 +1100,9 @@ class DbusHelper:
                     # set disconnect threshold time
                     if self.disconnect_threshold is None:
                         self.disconnect_threshold = RETRY_CYCLE_LONG_COUNT if utils.BLOCK_ON_DISCONNECT else utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES * 60
+                        # keep the driver alive at least as long as stale data serving is allowed
+                        if self.stale_serving_eligible():
+                            self.disconnect_threshold = max(self.disconnect_threshold, int(utils.FALLBACK_SERVE_STALE_MINUTES * 60))
 
                     # if the battery did not update in 10 second, it's assumed to be offline
                     if time_since_first_error >= RETRY_CYCLE_SHORT_COUNT:
@@ -1079,7 +1138,15 @@ class DbusHelper:
                                     + ("OK" if self.battery.get_max_cell_voltage() < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX else "NOT OK")
                                 )
 
-                            self.battery.init_values()
+                            if self.stale_serving_eligible():
+                                # keep the last read values and serve V/I/T from the fallback sensor
+                                self.stale_serving = True
+                                logger.warning(
+                                    "    Serving stale data instead of resetting values: voltage/current/temperature live from the "
+                                    + f"fallback sensor, other values frozen for up to {utils.FALLBACK_SERVE_STALE_MINUTES:.0f} minutes."
+                                )
+                            else:
+                                self.battery.init_values()
 
                     # set connection info
                     remaining = self.disconnect_threshold - time_since_first_error
@@ -1090,22 +1157,32 @@ class DbusHelper:
                     )
 
                     # set BMS cable alarm to warning
+                    # while the fallback sensor is actively serving, the outage is not yet
+                    # user-actionable degradation, so the warning is held back longer
+                    bms_cable_warn_seconds = utils.FALLBACK_BMS_CABLE_WARN_MINUTES * 60 if self.stale_serving else 60
                     self.bms_cable_alarm = (
                         1
                         if self.error["timestamp_last"] is not None
                         and self.error["timestamp_first"] is not None
-                        and 60 < self.error["timestamp_last"] - self.error["timestamp_first"]
+                        and bms_cable_warn_seconds < self.error["timestamp_last"] - self.error["timestamp_first"]
                         else 0
                     )
 
                     # Exit if recovery time exceeded and
                     # if BLOCK_ON_DISCONNECT is enabled or cell voltages are unsafe
-                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good):
+                    # (not while serving stale data: the fallback sensor provides live values
+                    # and the exit is deferred to the stale window)
+                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good) and not self.stale_serving:
                         recovery_failed = True
                     # Exit if extended recovery time exceeded
                     # This is only possible if cell voltages are good and BLOCK_ON_DISCONNECT is disabled else it would have exited earlier
                     elif time_since_first_error >= self.disconnect_threshold:
                         recovery_failed = True
+
+            # while serving stale data, refresh the calculated values so that
+            # voltage/current/power/temperature update live from the fallback sensor
+            if not result and self.stale_serving:
+                self.battery.set_calculated_data()
 
             # publish all the data from the battery object to dbus
             self.publish_dbus()
@@ -1137,7 +1214,7 @@ class DbusHelper:
         else:
             self._dbusservice["/Soc"] = round(self.battery.soc_calc, 2) if self.battery.soc is not None else None
         self._dbusservice["/Soh"] = round(self.battery.soh, 2) if self.battery.soh is not None else None
-        self._dbusservice["/Dc/0/Voltage"] = round(self.battery.voltage, 2) if self.battery.voltage is not None else None
+        self._dbusservice["/Dc/0/Voltage"] = round(self.battery.voltage_calc, 2) if self.battery.voltage_calc is not None else None
         self._dbusservice["/Dc/0/Current"] = round(self.battery.current_calc, 2) if self.battery.current_calc is not None else None
         self._dbusservice["/Dc/0/Power"] = round(self.battery.power_calc, 2) if self.battery.power_calc is not None else None
         self._dbusservice["/Dc/0/Temperature"] = self.battery.get_temperature()
@@ -1253,8 +1330,28 @@ class DbusHelper:
         if self.battery.control_discharge_current is not None:
             self._dbusservice["/Info/MaxDischargeCurrent"] = self.battery.control_discharge_current
 
+        # While serving stale data, block charging but keep discharging allowed:
+        # without live cell-level data the driver must not request further charging,
+        # while discharging is still safely monitored by the fallback sensor and
+        # the BMS's own cell-level protection.
+        if self.stale_serving:
+            self._dbusservice["/Info/MaxChargeCurrent"] = 0
+            self._dbusservice["/Io/AllowToCharge"] = 0
+            self._dbusservice["/System/NrOfModulesBlockingCharge"] = 1
+
+            # Report discharge as blocked when the live shunt voltage drops below the
+            # configured floor. Only meaningful with a fallback shunt delivering live
+            # voltage; without one there is nothing valid to compare. This is a report,
+            # not a cutoff: the BMS's own protection does the actual low-voltage disconnect.
+            if utils.FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE > 0:
+                shunt_voltage = self.battery.get_value_from_fallback_sensor("Voltage")
+                if shunt_voltage is not None and shunt_voltage < utils.FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE:
+                    self._dbusservice["/Info/MaxDischargeCurrent"] = 0
+                    self._dbusservice["/Io/AllowToDischarge"] = 0
+                    self._dbusservice["/System/NrOfModulesBlockingDischarge"] = 1
+
         # Voltage and charge control info (custom dbus paths)
-        self._dbusservice["/Info/ChargeMode"] = self.battery.charge_mode
+        self._dbusservice["/Info/ChargeMode"] = "Stale data - charging blocked" if self.stale_serving else self.battery.charge_mode
         self._dbusservice["/Info/ChargeModeDebug"] = self.battery.charge_mode_debug
         self._dbusservice["/Info/ChargeModeDebugFloat"] = self.battery.charge_mode_debug_float
         self._dbusservice["/Info/ChargeModeDebugBulk"] = self.battery.charge_mode_debug_bulk

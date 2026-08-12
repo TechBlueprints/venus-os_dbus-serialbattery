@@ -21,3 +21,15 @@ dbus-serialbattery/bms_detection_cache.json
 dbus-serialbattery/capture/
 venus-data.tar.gz
 *.bak
+
+# Development / sample drivers
+sample-driver/
+
+# IDE / workspace
+*.code-workspace
+
+# Cerbo deployment configs (local backup)
+cerbo-deploy/
+
+# LLM-generated docs and test scripts
+llm-docs/
