@@ -1172,7 +1172,11 @@ class DbusHelper:
                     # if BLOCK_ON_DISCONNECT is enabled or cell voltages are unsafe
                     # (not while serving stale data: the fallback sensor provides live values
                     # and the exit is deferred to the stale window)
-                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good) and not self.stale_serving:
+                    if (
+                        time_since_first_error >= RETRY_CYCLE_LONG_COUNT
+                        and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good)
+                        and not self.stale_serving
+                    ):
                         recovery_failed = True
                     # Exit if extended recovery time exceeded
                     # This is only possible if cell voltages are good and BLOCK_ON_DISCONNECT is disabled else it would have exited earlier

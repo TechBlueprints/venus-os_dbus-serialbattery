@@ -698,9 +698,7 @@ def main():
 
     # check, if fallback sensor should be used
     if FALLBACK_SENSOR_DBUS_DEVICE is not None and (
-        FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is not None
-        or FALLBACK_SENSOR_DBUS_PATH_CURRENT is not None
-        or FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE is not None
+        FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is not None or FALLBACK_SENSOR_DBUS_PATH_CURRENT is not None or FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE is not None
     ):
         for key_address in battery:
             battery[key_address].setup_fallback_sensor()
