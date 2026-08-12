@@ -5,7 +5,7 @@ import sys
 from bleak import BleakClient
 from bleak.exc import BleakCharacteristicNotFoundError
 from time import sleep
-from utils import logger, BLUETOOTH_CONNECTION_BACKEND, BLUETOOTH_FORCE_RESET_BLE_STACK, capture_raw_data
+from utils import logger, BLUETOOTH_ADAPTERS, BLUETOOTH_CONNECTION_BACKEND, BLUETOOTH_FORCE_RESET_BLE_STACK, capture_raw_data
 
 
 class BleConnectionBackend:
@@ -40,32 +40,50 @@ class BleakBackend(BleConnectionBackend):
     """
     Default backend: connects directly with bleak, matching the historical
     behavior of this driver.
+
+    If BLUETOOTH_ADAPTERS is set, connections are made only via the listed
+    adapters, rotating to the next entry after a failed attempt. An empty
+    list uses the system default adapter.
     """
 
+    def __init__(self):
+        self.adapter_index = 0
+        self.current_adapter = None
+
     def create_client(self, address, disconnected_callback):
-        return BleakClient(address, disconnected_callback=disconnected_callback)
+        kwargs = {}
+        if BLUETOOTH_ADAPTERS:
+            self.current_adapter = BLUETOOTH_ADAPTERS[self.adapter_index % len(BLUETOOTH_ADAPTERS)]
+            kwargs["adapter"] = self.current_adapter
+        return BleakClient(address, disconnected_callback=disconnected_callback, **kwargs)
 
     async def establish(self, client, address, notify_char, notify_callback):
-        logger.info("initiating BLE connection to: " + address)
-        await client.connect()
-        logger.info("connected to bluetooh device" + address)
-        # On some devices GATT characteristics become available only after connect()
-        # has already returned, so the first start_notify() can raise
-        # BleakCharacteristicNotFoundError for a characteristic that does exist.
-        # Re-run service discovery and retry before giving up.
-        for attempt in range(3):
-            try:
-                await client.start_notify(notify_char, notify_callback)
-                break
-            except BleakCharacteristicNotFoundError:
-                if attempt == 2:
-                    raise
-                logger.warning(f"characteristic {notify_char} not found yet, re-running service discovery")
-                # bleak has no public API to re-run service discovery on a connected
-                # client; clear the cached services so _get_services() fetches again
-                client._backend.services = None
-                await client._backend._get_services()
-                await asyncio.sleep(0.5)
+        logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
+        try:
+            await client.connect()
+            logger.info("connected to bluetooh device" + address)
+            # On some devices GATT characteristics become available only after connect()
+            # has already returned, so the first start_notify() can raise
+            # BleakCharacteristicNotFoundError for a characteristic that does exist.
+            # Re-run service discovery and retry before giving up.
+            for attempt in range(3):
+                try:
+                    await client.start_notify(notify_char, notify_callback)
+                    break
+                except BleakCharacteristicNotFoundError:
+                    if attempt == 2:
+                        raise
+                    logger.warning(f"characteristic {notify_char} not found yet, re-running service discovery")
+                    # bleak has no public API to re-run service discovery on a connected
+                    # client; clear the cached services so _get_services() fetches again
+                    client._backend.services = None
+                    await client._backend._get_services()
+                    await asyncio.sleep(0.5)
+        except Exception:
+            # rotate to the next configured adapter for the next attempt
+            if BLUETOOTH_ADAPTERS:
+                self.adapter_index += 1
+            raise
         return client
 
     async def release(self, client):
