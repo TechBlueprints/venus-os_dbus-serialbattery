@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dbus-serialbat
 
 import utils  # noqa: E402
 from battery import Battery  # noqa: E402
+from dbushelper import DbusHelper  # noqa: E402
 
 
 class _FakeDbusItem:
@@ -111,6 +112,39 @@ class TestFallbackSensor:
         assert battery.get_value_from_fallback_sensor("Voltage") is None
         battery.online = False
         assert battery.get_value_from_fallback_sensor("Voltage") == 25.5
+
+
+class TestStaleServingEligible:
+    def _make_helper(self, monkeypatch, fallback_objects, minutes=480.0, block_on_disconnect=False, cell_voltages_good=None):
+        monkeypatch.setattr(utils, "FALLBACK_SERVE_STALE_MINUTES", minutes)
+        monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT", block_on_disconnect)
+        helper = DbusHelper.__new__(DbusHelper)
+        helper.battery = _make_battery()
+        helper.battery.dbus_fallback_objects = fallback_objects
+        helper.cell_voltages_good = cell_voltages_good
+        return helper
+
+    def test_eligible_with_fallback_sensor(self, monkeypatch):
+        helper = self._make_helper(monkeypatch, {"Voltage": _FakeDbusItem(25.5)})
+        assert helper.stale_serving_eligible() is True
+
+    def test_eligible_regardless_of_cell_voltages(self, monkeypatch):
+        # the BMS's own cell-level protection acts independently of this driver,
+        # so cells outside the BLOCK_ON_DISCONNECT band must not block stale serving
+        helper = self._make_helper(monkeypatch, {"Voltage": _FakeDbusItem(25.5)}, cell_voltages_good=False)
+        assert helper.stale_serving_eligible() is True
+
+    def test_not_eligible_without_fallback_sensor(self, monkeypatch):
+        helper = self._make_helper(monkeypatch, None)
+        assert helper.stale_serving_eligible() is False
+
+    def test_not_eligible_when_disabled(self, monkeypatch):
+        helper = self._make_helper(monkeypatch, {"Voltage": _FakeDbusItem(25.5)}, minutes=0)
+        assert helper.stale_serving_eligible() is False
+
+    def test_not_eligible_with_block_on_disconnect(self, monkeypatch):
+        helper = self._make_helper(monkeypatch, {"Voltage": _FakeDbusItem(25.5)}, block_on_disconnect=True)
+        assert helper.stale_serving_eligible() is False
 
 
 class TestGetFallbackSensorDevice:
