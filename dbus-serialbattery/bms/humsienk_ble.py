@@ -603,6 +603,7 @@ class HumsiENK_Ble(Battery):
 
         # Collect binary response frames and parse commands 0x21, 0x22, 0x20
         data_refreshed = False
+        ble_connected = bool(self.ble_handle and getattr(self.ble_handle, "connected", False))
         try:
             now_tick = time.time()
             if (now_tick - self._last_heartbeat_log) > 900.0:
@@ -790,8 +791,19 @@ class HumsiENK_Ble(Battery):
                 self._update_ram_state()
                 if hasattr(self, "protection") and self.protection is not None:
                     self.protection.internal_failure = 0
+            elif not ble_connected:
+                # BLE link is down and nothing was parsed this cycle: report
+                # failure so the framework's disconnect handling engages
+                # (error counting, offline flag, fallback-sensor stale serving,
+                # BmsCable alarm).  The daemon thread keeps retrying the
+                # connection in the background; once data flows again we
+                # return True and the framework clears its error state.
+                logger.debug("HumsiENK: <<< refresh_data returning False (BLE down, no data)")
+                return False
             else:
-                # No fresh data — serve stale RAM values with escalating warnings
+                # Link is up but no complete frame this cycle — serve stale
+                # RAM values with escalating warnings while the poll/handshake
+                # logic above recovers the data stream
                 self._use_cached_data()
 
             # Provide placeholder values to avoid empty readings
