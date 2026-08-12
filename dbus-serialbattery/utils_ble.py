@@ -136,12 +136,16 @@ class BCMBackend(BleConnectionBackend):
             logger.warning(f"BLE [{address}] managed scan failed: {repr(e)}")
 
         if device is None:
-            # Not in cache and not seen advertising — try a direct connect
-            # from whatever BlueZ state exists rather than giving up.
+            # Not in cache and not seen advertising — construct a device
+            # with a concrete D-Bus path on the first candidate adapter so
+            # BlueZ can attempt a direct connect without a scan (a details-
+            # less BLEDevice cannot connect on the BlueZ backend).
             from bleak.backends.device import BLEDevice
 
-            logger.info(f"BLE [{address}] not resolved by scan, trying direct connect")
-            device = BLEDevice(address=address, name=None, details={})
+            first_adapter = (adapters or ["hci0"])[0]
+            logger.info(f"BLE [{address}] not resolved by scan, trying direct connect via {first_adapter}")
+            path = f"/org/bluez/{first_adapter}/dev_" + address.replace(":", "_").upper()
+            device = BLEDevice(address=address, name=None, details={"path": path, "props": {}})
 
         client = await establish_connection(
             BleakClient,
