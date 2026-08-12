@@ -201,14 +201,27 @@ class BCMBackend(BleConnectionBackend):
 
         connect_adapters = adapters
         if device is not None:
-            # Pin the connection to the adapter whose scan resolved the
-            # device: its Device1 object only exists there, and (with an
-            # allow-list) find_device only searched allowed adapters.
+            # Pin the connection to the adapter holding the device object.
+            # The cache-first resolution can return an object cached on a
+            # NON-allowed adapter (e.g. left over from an earlier connection
+            # there) — reject and remove those so they stop shadowing the
+            # allowed adapters, and fall through to ConnectDevice instead.
             try:
-                connect_adapters = [device.details["path"].split("/")[3]]
+                found_adapter = device.details["path"].split("/")[3]
+                if adapters and found_adapter not in adapters:
+                    logger.info(f"BLE [{address}] cached on disallowed {found_adapter} — removing and using ConnectDevice on allowed adapters")
+                    try:
+                        from bleak_connection_manager.bluez import remove_device
+
+                        await remove_device(address, found_adapter)
+                    except Exception:
+                        pass
+                    device = None
+                else:
+                    connect_adapters = [found_adapter]
             except Exception:
                 pass
-        else:
+        if device is None:
             for adapter in adapters or ["hci0"]:
                 path = await self._connect_device_no_scan(address, adapter)
                 if path:
