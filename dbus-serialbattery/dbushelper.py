@@ -1334,6 +1334,18 @@ class DbusHelper:
             self._dbusservice["/Io/AllowToCharge"] = 0
             self._dbusservice["/System/NrOfModulesBlockingCharge"] = 1
 
+            # Report discharge as blocked when the live fallback voltage drops below the
+            # configured floor. This is a report, not a cutoff: the BMS's own protection
+            # does the actual low-voltage disconnect.
+            if (
+                utils.FALLBACK_DISCHARGE_BLOCK_VOLTAGE > 0
+                and self.battery.voltage_calc is not None
+                and self.battery.voltage_calc < utils.FALLBACK_DISCHARGE_BLOCK_VOLTAGE
+            ):
+                self._dbusservice["/Info/MaxDischargeCurrent"] = 0
+                self._dbusservice["/Io/AllowToDischarge"] = 0
+                self._dbusservice["/System/NrOfModulesBlockingDischarge"] = 1
+
         # Voltage and charge control info (custom dbus paths)
         self._dbusservice["/Info/ChargeMode"] = "Stale data - charging blocked" if self.stale_serving else self.battery.charge_mode
         self._dbusservice["/Info/ChargeModeDebug"] = self.battery.charge_mode_debug
