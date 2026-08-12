@@ -30,7 +30,7 @@ from collections import deque
 from bleak import BleakClient
 from bleak.exc import BleakCharacteristicNotFoundError
 from utils_ble import Syncron_Ble
-from utils import logger, BATTERY_CAPACITY, MAX_BATTERY_CHARGE_CURRENT, MAX_BATTERY_DISCHARGE_CURRENT
+from utils import logger, BATTERY_CAPACITY, BLUETOOTH_PREFERRED_ADAPTERS, MAX_BATTERY_CHARGE_CURRENT, MAX_BATTERY_DISCHARGE_CURRENT
 
 
 class HumsiENK_Syncron_Ble(Syncron_Ble):
@@ -76,7 +76,7 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
             self.response_data = data
             self.response_event.set()
 
-    async def _find_cached_device(self, address):
+    async def _find_cached_device(self, address, adapter=None):
         """Locate the device in BlueZ's cache so we can connect without scanning.
 
         bleak's address-based connect first runs a discovery scan to resolve
@@ -94,6 +94,8 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
             suffix = "/dev_" + address.replace(":", "_").upper()
             for path, interfaces in manager._properties.items():
                 if path.endswith(suffix) and "org.bluez.Device1" in interfaces:
+                    if adapter is not None and f"/{adapter}/" not in path:
+                        continue
                     props = interfaces["org.bluez.Device1"]
                     return BLEDevice(address, props.get("Name"), {"path": path, "props": props})
         except Exception as e:
@@ -112,24 +114,35 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
             return []
 
     async def connect_to_bms(self, address):
-        target = await self._find_cached_device(address) or address
-        # On a GX device other BLE services can occupy the default adapter's
-        # scan slot for long stretches (StartDiscovery then fails with
-        # org.bluez.Error.InProgress on every retry).  After 3 consecutive
-        # busy failures, rotate through the other adapters — multi-dongle
-        # setups are common on Cerbos precisely because of this contention.
-        kwargs = {}
-        adapter_note = ""
-        if self._scan_busy_count >= 3 and isinstance(target, str):
+        # Adapter selection, in priority order:
+        # 1. BLUETOOTH_PREFERRED_ADAPTERS (config): always connect via one of
+        #    these, rotating to the next entry after a failed attempt.  Lets
+        #    installations keep BMS links off an adapter that other services
+        #    keep busy or that shows controller-level instability.
+        # 2. No preference configured: system default adapter, but after 3
+        #    consecutive org.bluez.Error.InProgress scan failures rotate
+        #    through all adapters — multi-dongle setups are common on GX
+        #    devices precisely because of scan contention.
+        adapter = None
+        preferred = [a.strip() for a in BLUETOOTH_PREFERRED_ADAPTERS if a.strip()]
+        if preferred:
+            adapter = preferred[self._adapter_idx % len(preferred)]
+        elif self._scan_busy_count >= 3:
             adapters = await self._list_adapters()
             if adapters:
                 adapter = adapters[self._adapter_idx % len(adapters)]
                 self._adapter_idx += 1
-                kwargs["adapter"] = adapter
-                adapter_note = f" (adapter {adapter})"
+        target = await self._find_cached_device(address, adapter) or address
+        kwargs = {}
+        adapter_note = ""
+        if adapter is not None and isinstance(target, str):
+            kwargs["adapter"] = adapter
+            adapter_note = f" (adapter {adapter})"
         self.client = BleakClient(target, disconnected_callback=self.client_disconnected, **kwargs)
         try:
-            logger.info("initiating BLE connection to: " + address + (" (via cached BlueZ device, no scan)" if target is not address else adapter_note))
+            if target is not address:
+                adapter_note = f" (via cached BlueZ device on {adapter or 'default adapter'}, no scan)"
+            logger.info("initiating BLE connection to: " + address + adapter_note)
             await self.client.connect()
             logger.info("connected to bluetooth device " + address)
             for attempt in range(3):
@@ -150,6 +163,9 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
                 self._scan_busy_count += 1
             else:
                 self._scan_busy_count = 0
+            if preferred:
+                # try the next preferred adapter on the next attempt
+                self._adapter_idx += 1
             logger.error(f"Failed when trying to connect: {e}")
             return False
         finally:
