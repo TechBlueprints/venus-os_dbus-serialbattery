@@ -36,6 +36,40 @@ def _adjust_temperature(value, adjustment):
     return (value * adjustment[1]) + adjustment[0]
 
 
+# ── Publish gate (perf) ──────────────────────────────────────────────────
+#
+# Per-path significance thresholds: a numeric value is only re-published
+# when it has moved at least this far from the LAST PUBLISHED value, so
+# sensor flicker stops generating D-Bus traffic while cumulative drift
+# still gets through (the comparison base is not updated on suppression).
+# Pattern and tuning approach proven in dbus-aggregate-smartshunts, where
+# it took a quiet bank from ~0.5 ItemsChanged/s to 0.
+#
+# Deliberately UNGATED (not listed): everything under /Info (CVL/CCL/DCL
+# feed the charge control loop — a stale limit is a control error), all
+# /Alarms (discrete integer state), FET/balance flags, counters, strings.
+# Cell voltages are gated at 1 mV — below BMS resolution, so effectively
+# only deduplicated — because balance displays read them.
+PUBLISH_GATE_THRESHOLDS = {
+    "/Dc/0/Voltage": 0.01,  # V — kept tight: feeds monitoring and control displays
+    "/Dc/0/Current": 0.1,  # A
+    "/Dc/0/Power": 5.0,  # W — derived from V*I, wobbles the most
+    "/Dc/0/Temperature": 0.2,  # °C
+    "/System/Temperature1": 0.2,
+    "/System/Temperature2": 0.2,
+    "/System/Temperature3": 0.2,
+    "/System/Temperature4": 0.2,
+    "/System/MOSTemperature": 0.5,
+    "/TimeToGo": 60,  # s
+    "/ConsumedAmphours": 0.1,  # Ah
+    "/Capacity": 0.1,  # Ah
+}
+
+# Force a full re-publish at least this often even when nothing crosses a
+# threshold, so freshness watchers (VRM, GUI) can tell the service is alive.
+PUBLISH_HEARTBEAT_S = 900
+
+
 class _CachedDbusProxy:
     """Thin proxy around VeDbusService that suppresses redundant D-Bus writes.
 
@@ -47,22 +81,30 @@ class _CachedDbusProxy:
 
     This proxy keeps a lightweight in-process cache and only forwards
     the write to the real service when the new value differs from the
-    last written one, eliminating the majority of D-Bus traffic while
-    remaining fully transparent for reads and method calls.
+    last written one — and, for paths listed in PUBLISH_GATE_THRESHOLDS,
+    differs *significantly* — eliminating the majority of D-Bus traffic
+    while remaining fully transparent for reads and method calls.
     """
 
-    __slots__ = ("_svc", "_cache", "_ctx")
+    __slots__ = ("_svc", "_cache", "_ctx", "_last_heartbeat")
 
     def __init__(self, svc):
         self._svc = svc
         self._cache: dict = {}
         self._ctx = None
+        self._last_heartbeat = time()
 
     def __enter__(self):
         # Batch mode: route writes through a velib ServiceContext so all
         # changes of one cycle are emitted as a single ItemsChanged signal
         # instead of one PropertiesChanged per path. Measured as the largest
         # D-Bus signal source on a Cerbo during active charge/discharge.
+        # Heartbeat: periodically drop the cache so every path re-publishes
+        # once even if it never crossed its gate threshold.
+        now = time()
+        if now - self._last_heartbeat >= PUBLISH_HEARTBEAT_S:
+            self._last_heartbeat = now
+            self._cache.clear()
         self._ctx = self._svc.__enter__()
         return self
 
@@ -72,12 +114,20 @@ class _CachedDbusProxy:
 
     def __setitem__(self, path, value):
         prev = self._cache.get(path, _SENTINEL)
-        if prev is not value and prev != value:
-            self._cache[path] = value
-            if self._ctx is not None:
-                self._ctx[path] = value
-            else:
-                self._svc[path] = value
+        if prev is value or prev == value:
+            return
+        if prev is not _SENTINEL and isinstance(value, (int, float)) and isinstance(prev, (int, float)):
+            threshold = PUBLISH_GATE_THRESHOLDS.get(path)
+            if threshold is not None and abs(value - prev) < threshold:
+                # Sub-threshold flicker: suppress, and keep the old cache
+                # entry as the comparison base so cumulative drift still
+                # crosses the gate eventually.
+                return
+        self._cache[path] = value
+        if self._ctx is not None:
+            self._ctx[path] = value
+        else:
+            self._svc[path] = value
 
     def __getitem__(self, path):
         return self._svc[path]
