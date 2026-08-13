@@ -126,14 +126,24 @@ class BCMBackend(BleConnectionBackend):
             logger.error(f"BCMBackend selected but bleak_connection_manager is not importable: {_BCM_IMPORT_ERROR}")
             raise ImportError(_BCM_IMPORT_ERROR)
 
-    def _adapters(self):
+    def _adapters(self, address=None):
         if BLUETOOTH_ADAPTERS:
-            return list(BLUETOOTH_ADAPTERS)
-        try:
-            return discover_adapters()
-        except Exception as e:
-            logger.warning(f"BLE: adapter discovery failed ({e}), using system default")
-            return None
+            adapters = list(BLUETOOTH_ADAPTERS)
+        else:
+            try:
+                adapters = discover_adapters()
+            except Exception as e:
+                logger.warning(f"BLE: adapter discovery failed ({e}), using system default")
+                return None
+        # Deterministic per-device spread: rotate each device's preference
+        # order by a stable hash of its address so multiple BMS instances
+        # distribute across the allowed adapters instead of all competing
+        # for (and sharing the fate of) the first one. Preference order
+        # only — every allowed adapter is still tried on failure.
+        if address and adapters and len(adapters) > 1:
+            offset = sum(ord(c) for c in str(address)) % len(adapters)
+            adapters = adapters[offset:] + adapters[:offset]
+        return adapters
 
     def create_client(self, address, disconnected_callback):
         # BCM creates and returns its own client during establish()
@@ -183,7 +193,7 @@ class BCMBackend(BleConnectionBackend):
             return None
 
     async def establish(self, client, address, notify_char, notify_callback):
-        adapters = self._adapters()
+        adapters = self._adapters(address)
         escalation = EscalationPolicy(adapters or [], config=PROFILE_BATTERY)
 
         # Cache-first device resolution; scan only if the cache misses and
