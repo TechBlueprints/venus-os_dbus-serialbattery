@@ -1075,21 +1075,35 @@ class DbusHelper:
             return None
         return [voltage + delta_per_cell for voltage in self.stale_cell_snapshot]
 
+    def stale_zone_configured(self) -> bool:
+        """
+        Check if the dedicated fallback safe zone is configured
+        (FALLBACK_SAFE_CELL_VOLTAGE_MIN/MAX, both set and sane).
+        """
+        return 0 < utils.FALLBACK_SAFE_CELL_VOLTAGE_MIN < utils.FALLBACK_SAFE_CELL_VOLTAGE_MAX
+
     def stale_update_band_flags(self, projected_min: float, projected_max: float) -> None:
         """
-        Evaluate the projected cell extremes against the safe zone
-        (BLOCK_ON_DISCONNECT_VOLTAGE_MIN/MAX) with hysteresis:
-        above the zone charging is blocked, below the zone discharging is blocked,
-        inside the zone both are allowed.
+        Evaluate the projected cell extremes against the dedicated fallback safe
+        zone (FALLBACK_SAFE_CELL_VOLTAGE_MIN/MAX) with hysteresis: above the zone
+        charging is blocked, below the zone discharging is blocked, inside the
+        zone both are allowed. Without a configured zone there is no basis to
+        allow blind charging: charging stays blocked, discharging stays allowed
+        with the last known limits.
         """
-        if projected_max >= utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX:
+        if not self.stale_zone_configured():
             self.stale_charge_blocked = True
-        elif projected_max < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX - self.STALE_BAND_HYSTERESIS:
+            self.stale_discharge_blocked = False
+            return
+
+        if projected_max >= utils.FALLBACK_SAFE_CELL_VOLTAGE_MAX:
+            self.stale_charge_blocked = True
+        elif projected_max < utils.FALLBACK_SAFE_CELL_VOLTAGE_MAX - self.STALE_BAND_HYSTERESIS:
             self.stale_charge_blocked = False
 
-        if projected_min <= utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN:
+        if projected_min <= utils.FALLBACK_SAFE_CELL_VOLTAGE_MIN:
             self.stale_discharge_blocked = True
-        elif projected_min > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN + self.STALE_BAND_HYSTERESIS:
+        elif projected_min > utils.FALLBACK_SAFE_CELL_VOLTAGE_MIN + self.STALE_BAND_HYSTERESIS:
             self.stale_discharge_blocked = False
 
     def stale_serving_eligible(self) -> bool:
@@ -1617,6 +1631,11 @@ class DbusHelper:
         if self.stale_serving:
             if not self.stale_projection_valid:
                 stale_charge_mode = "Fallback - charging blocked (no cell projection)"
+                self._dbusservice["/Info/MaxChargeCurrent"] = 0
+                self._dbusservice["/Io/AllowToCharge"] = 0
+                self._dbusservice["/System/NrOfModulesBlockingCharge"] = 1
+            elif not self.stale_zone_configured():
+                stale_charge_mode = "Fallback - charging blocked (no safe zone configured)"
                 self._dbusservice["/Info/MaxChargeCurrent"] = 0
                 self._dbusservice["/Io/AllowToCharge"] = 0
                 self._dbusservice["/System/NrOfModulesBlockingCharge"] = 1
