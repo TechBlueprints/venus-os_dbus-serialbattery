@@ -1194,7 +1194,8 @@ class DbusHelper:
                             self.battery.online = False
                             logger.warning(
                                 "    Serving stale data instead of resetting values: voltage/current/temperature live from the "
-                                + f"fallback sensor, other values frozen for up to {utils.FALLBACK_SERVE_STALE_MINUTES:.0f} minutes."
+                                + "fallback sensor, other values frozen "
+                                + f"(bounded to {utils.FALLBACK_SERVE_STALE_MINUTES:.0f} minutes without live fallback data)."
                             )
 
                     # stale phase progression: the window clock only runs while the
