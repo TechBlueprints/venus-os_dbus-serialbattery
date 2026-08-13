@@ -202,14 +202,23 @@ class TestStaleCellProjection:
 
 
 class TestStaleBandFlags:
-    def _make_helper(self, monkeypatch, band_min=2.70, band_max=3.55):
-        monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT_VOLTAGE_MIN", band_min)
-        monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT_VOLTAGE_MAX", band_max)
+    def _make_helper(self, monkeypatch, zone_min=2.70, zone_max=3.55):
+        # the safe zone is its own dedicated config (FALLBACK_SAFE_CELL_VOLTAGE_MIN/MAX),
+        # set from the battery manufacturer's spec — deliberately not shared with any
+        # other voltage option
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MIN", zone_min)
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MAX", zone_max)
         helper = DbusHelper.__new__(DbusHelper)
         helper.battery = _make_battery()
         helper.stale_charge_blocked = False
         helper.stale_discharge_blocked = False
         return helper
+
+    def test_zone_unset_blocks_charging_keeps_discharging(self, monkeypatch):
+        helper = self._make_helper(monkeypatch, zone_min=0, zone_max=0)
+        helper.stale_update_band_flags(3.20, 3.35)
+        assert helper.stale_charge_blocked is True
+        assert helper.stale_discharge_blocked is False
 
     def test_inside_zone_allows_both(self, monkeypatch):
         helper = self._make_helper(monkeypatch)
@@ -254,6 +263,62 @@ class TestStaleBandFlags:
         helper.stale_update_band_flags(2.65, 3.60)
         assert helper.stale_charge_blocked is True
         assert helper.stale_discharge_blocked is True
+
+
+class TestUtilsImportTimeConfig:
+    """Import utils.py for real against a config file, so import-time validation
+    and clamping runs — the class of bug the monkeypatch pattern structurally
+    misses (production incident: config values silently clamped + error #119)."""
+
+    def _import_utils_with_config(self, tmp_path, config_ini):
+        import json
+        import shutil
+        import subprocess
+
+        src = os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery")
+        shutil.copy(os.path.join(src, "utils.py"), tmp_path / "utils.py")
+        shutil.copy(os.path.join(src, "config.default.ini"), tmp_path / "config.default.ini")
+        (tmp_path / "config.ini").write_text(config_ini)
+        # minimal serial stub so utils imports without pyserial
+        (tmp_path / "serial.py").write_text("class Serial:\n    pass\n\nclass SerialException(IOError):\n    pass\n\nEIGHTBITS = 8\nPARITY_NONE = 'N'\nSTOPBITS_ONE = 1\n")
+        result = subprocess.run(
+            [sys.executable, "-c", "import utils, json; print(json.dumps(utils.errors_in_config))"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, f"utils import failed: {result.stderr}"
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_fallback_config_loads_without_config_errors(self, tmp_path):
+        errors = self._import_utils_with_config(
+            tmp_path,
+            "[DEFAULT]\n"
+            "FALLBACK_SENSOR_DBUS_DEVICE = ble_test:com.victronenergy.battery.ttyS5\n"
+            "FALLBACK_SENSOR_DBUS_PATH_VOLTAGE = /Dc/0/Voltage\n"
+            "FALLBACK_SENSOR_DBUS_PATH_CURRENT = /Dc/0/Current\n"
+            "FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE = /Dc/0/Temperature\n"
+            "FALLBACK_SENSOR_DBUS_PATH_SOC = /Soc\n"
+            "FALLBACK_SERVE_STALE_MINUTES = 480\n"
+            "FALLBACK_SAFE_CELL_VOLTAGE_MIN = 2.70\n"
+            "FALLBACK_SAFE_CELL_VOLTAGE_MAX = 3.55\n",
+        )
+        assert errors == []
+
+    def test_stale_minutes_without_device_reports_config_error(self, tmp_path):
+        errors = self._import_utils_with_config(
+            tmp_path,
+            "[DEFAULT]\nFALLBACK_SERVE_STALE_MINUTES = 480\n",
+        )
+        assert any("FALLBACK_SERVE_STALE_MINUTES" in error for error in errors)
+
+    def test_safe_zone_min_without_max_reports_config_error(self, tmp_path):
+        errors = self._import_utils_with_config(
+            tmp_path,
+            "[DEFAULT]\nFALLBACK_SAFE_CELL_VOLTAGE_MIN = 2.70\n",
+        )
+        assert any("FALLBACK_SAFE_CELL_VOLTAGE" in error for error in errors)
 
 
 class TestStaleServingEligible:

@@ -316,6 +316,8 @@ FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE: Union[str, None] = config["DEFAULT"]["FAL
 FALLBACK_SENSOR_DBUS_PATH_SOC: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_PATH_SOC"] or None
 FALLBACK_SERVE_STALE_MINUTES: float = get_float_from_config("DEFAULT", "FALLBACK_SERVE_STALE_MINUTES")
 FALLBACK_BMS_CABLE_WARN_MINUTES: float = get_float_from_config("DEFAULT", "FALLBACK_BMS_CABLE_WARN_MINUTES", 10)
+FALLBACK_SAFE_CELL_VOLTAGE_MIN: float = get_float_from_config("DEFAULT", "FALLBACK_SAFE_CELL_VOLTAGE_MIN")
+FALLBACK_SAFE_CELL_VOLTAGE_MAX: float = get_float_from_config("DEFAULT", "FALLBACK_SAFE_CELL_VOLTAGE_MAX")
 
 
 # Common configuration checks
@@ -332,6 +334,16 @@ check_config_issue(
 check_config_issue(
     FALLBACK_SERVE_STALE_MINUTES > 0 and BLOCK_ON_DISCONNECT,
     "FALLBACK_SERVE_STALE_MINUTES and BLOCK_ON_DISCONNECT are both enabled. Stale serving is not entered when BLOCK_ON_DISCONNECT is active. Please disable one of them in the configuration.",
+)
+
+check_config_issue(
+    (FALLBACK_SAFE_CELL_VOLTAGE_MIN > 0) != (FALLBACK_SAFE_CELL_VOLTAGE_MAX > 0),
+    "FALLBACK_SAFE_CELL_VOLTAGE_MIN and FALLBACK_SAFE_CELL_VOLTAGE_MAX must be set together. Please check the configuration.",
+)
+
+check_config_issue(
+    FALLBACK_SAFE_CELL_VOLTAGE_MIN > 0 and FALLBACK_SAFE_CELL_VOLTAGE_MAX > 0 and FALLBACK_SAFE_CELL_VOLTAGE_MIN >= FALLBACK_SAFE_CELL_VOLTAGE_MAX,
+    "FALLBACK_SAFE_CELL_VOLTAGE_MIN is greater or equal to FALLBACK_SAFE_CELL_VOLTAGE_MAX. Please check the configuration.",
 )
 
 
