@@ -196,21 +196,32 @@ class BCMBackend(BleConnectionBackend):
         adapters = self._adapters(address)
         escalation = EscalationPolicy(adapters or [], config=PROFILE_BATTERY)
 
-        # Cache-first device resolution; scan only if the cache misses and
-        # the scan lock can be acquired.  BLUETOOTH_ADAPTERS is a hard
-        # allow-list: connections are made ONLY via the listed adapters.
-        # When the listed adapters cannot resolve the device by scanning
-        # (their scan slots are frequently held by other services on GX
-        # hardware), fall back to BlueZ's ConnectDevice API, which creates
-        # and connects the device object on a chosen adapter without any
-        # discovery (requires bluetoothd -E, standard on Venus OS).
+        # Resolution order:
+        #   1. ConnectDevice on the PREFERRED adapter (no cache, no scan
+        #      slot needed). This makes the per-device adapter preference
+        #      actually win: cache-first resolution otherwise pins the
+        #      device to whichever adapter last scanned it (observed: a
+        #      sibling instance's scans re-cache the device on the shared
+        #      adapter within seconds, defeating any migration).
+        #   2. Cache-first find across allowed adapters.
+        #   3. ConnectDevice on the remaining allowed adapters.
+        # BLUETOOTH_ADAPTERS remains a hard allow-list throughout.
         device = None
+        connect_adapters = adapters
+        if adapters:
+            path = await self._connect_device_no_scan(address, adapters[0])
+            if path:
+                from bleak.backends.device import BLEDevice
+
+                logger.info(f"BLE [{address}] connected on preferred adapter {adapters[0]} via ConnectDevice")
+                device = BLEDevice(address=address, name=None, details={"path": path, "props": {}})
+                connect_adapters = [adapters[0]]
         try:
-            device = await bcm_find_device(address, timeout=15.0, max_attempts=2, adapters=adapters)
+            if device is None:
+                device = await bcm_find_device(address, timeout=15.0, max_attempts=2, adapters=adapters)
         except Exception as e:
             logger.warning(f"BLE [{address}] managed scan failed: {repr(e)}")
 
-        connect_adapters = adapters
         if device is not None:
             # Pin the connection to the adapter holding the device object.
             # The cache-first resolution can return an object cached on a
