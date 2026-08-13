@@ -196,6 +196,8 @@ class DbusHelper:
         self.disconnect_threshold: int = None
         self.bms_cable_alarm: int = 0
         self.fallback_mode: bool = False
+        self.fallback_alive: bool = False
+        """Whether the fallback sensor delivered a live value this cycle; drives the /Mgmt/Connection suffix."""
         self.fallback_last_alive: float = None
         """
         Base of the fallback timeout clock. Reset to now on every cycle where the
@@ -1393,6 +1395,8 @@ class DbusHelper:
                             self.battery.init_values()
                             logger.error(">>> Fallback timeout expired without live fallback data — treating as ordinary BMS disconnect <<<")
 
+                    self.fallback_alive = fallback_alive
+
                     # set connection info
                     if self.fallback_mode:
                         self.battery.connection_info = f"BMS lost for: {self.battery.get_seconds_to_string(time_since_first_error, 3)} | " + (
@@ -1546,6 +1550,14 @@ class DbusHelper:
         # https://github.com/victronenergy/veutil/blob/master/src/qt/bms_error.cpp
         self._dbusservice["/ErrorCode"] = self.battery.error_code
         self._dbusservice["/ConnectionInformation"] = self.battery.connection_info
+        # surface the fallback state where every stock GUI already shows it: the
+        # "Connection" row of the Device page (and the VRM device list)
+        if self.fallback_mode:
+            self._dbusservice["/Mgmt/Connection"] = self.battery.connection_name() + (
+                " - FALLBACK: on shunt" if self.fallback_alive else " - FALLBACK: holding, shunt dark"
+            )
+        else:
+            self._dbusservice["/Mgmt/Connection"] = self.battery.connection_name()
 
         self._dbusservice["/History/DeepestDischarge"] = (
             abs(self.battery.history.deepest_discharge) * -1 if self.battery.history.deepest_discharge is not None else None

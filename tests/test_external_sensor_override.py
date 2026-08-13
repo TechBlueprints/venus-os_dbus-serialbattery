@@ -484,6 +484,7 @@ class TestNeverOnlineFallbackEngagement:
         helper = DbusHelper.__new__(DbusHelper)
         helper.battery = battery
         helper.fallback_mode = False
+        helper.fallback_alive = False
         helper.fallback_last_alive = None
         helper.fallback_concluded_at = None
         helper.cell_voltages_good = None
@@ -518,6 +519,8 @@ class TestNeverOnlineFallbackEngagement:
         assert loop.quit_called is False
         # BmsCable stays quiet inside the warn window while the fallback covers
         assert helper.bms_cable_alarm == 0
+        # drives the "- FALLBACK: on shunt" suffix on /Mgmt/Connection
+        assert helper.fallback_alive is True
 
     def test_both_instruments_dark_alarms_immediately(self, monkeypatch):
         # BMS down AND fallback not delivering: a real fault — no warn-window
@@ -532,6 +535,8 @@ class TestNeverOnlineFallbackEngagement:
         helper.publish_battery(loop)
 
         assert helper.fallback_mode is True  # engaged (device present) but dark
+        # drives the "- FALLBACK: holding, shunt dark" suffix on /Mgmt/Connection
+        assert helper.fallback_alive is False
         assert helper.bms_cable_alarm == 2
         # dark grace not yet expired: no exit, values not reset yet
         assert loop.quit_called is False
