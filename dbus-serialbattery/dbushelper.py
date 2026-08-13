@@ -1040,15 +1040,15 @@ class DbusHelper:
         """
         Check if fallback mode can be entered after the BMS disconnected.
 
-        Requires FALLBACK_TIMEOUT_MINUTES to be set, BLOCK_ON_DISCONNECT to be disabled
-        and a connected fallback sensor. There is deliberately no cell voltage condition:
+        Requires a connected fallback sensor (configuring one is the opt-in) and
+        BLOCK_ON_DISCONNECT to be disabled. There is deliberately no cell voltage condition:
         the BMS's own cell-level protection acts independently of this driver, and the loads
         keep running during an outage either way — serving live fallback data is always
         better than serving nothing.
 
         :return: True if fallback mode is allowed
         """
-        return utils.FALLBACK_TIMEOUT_MINUTES > 0 and not utils.BLOCK_ON_DISCONNECT and self.battery.dbus_fallback_objects is not None
+        return not utils.BLOCK_ON_DISCONNECT and self.battery.dbus_fallback_objects is not None
 
     def publish_battery(self, loop) -> None:
         """
@@ -1222,9 +1222,6 @@ class DbusHelper:
                     # set disconnect threshold time
                     if self.disconnect_threshold is None:
                         self.disconnect_threshold = RETRY_CYCLE_LONG_COUNT if utils.BLOCK_ON_DISCONNECT else utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES * 60
-                        # keep the driver alive at least as long as fallback mode is allowed
-                        if self.fallback_mode_eligible():
-                            self.disconnect_threshold = max(self.disconnect_threshold, int(utils.FALLBACK_TIMEOUT_MINUTES * 60))
 
                     # if the battery did not update in 10 second, it's assumed to be offline
                     if time_since_first_error >= RETRY_CYCLE_SHORT_COUNT:
@@ -1287,7 +1284,11 @@ class DbusHelper:
                             logger.warning(
                                 "    Entering fallback mode instead of resetting values: voltage/current/temperature live from the "
                                 + "fallback sensor, remaining values held from the last BMS read "
-                                + f"(mode ends after {utils.FALLBACK_TIMEOUT_MINUTES:.0f} minutes without live fallback data)."
+                                + (
+                                    f"(treated as disconnected after {utils.FALLBACK_STOP_MINUTES:.0f} minutes without live fallback data)."
+                                    if utils.FALLBACK_STOP_MINUTES > 0
+                                    else "(held until the BMS or the fallback sensor returns)."
+                                )
                             )
 
                     # fallback timeout progression: the clock only runs while the
@@ -1299,28 +1300,20 @@ class DbusHelper:
                         fallback_alive = self.battery.get_value_from_fallback_sensor("Voltage") is not None
                         if fallback_alive:
                             self.fallback_last_alive = time()
-                        elif time() - self.fallback_last_alive >= utils.FALLBACK_TIMEOUT_MINUTES * 60:
-                            # fallback mode concluded without live fallback data: stop
-                            # serving, reset values, and only NOW start the ordinary
-                            # disconnect timer (sequential with fallback mode)
+                        elif utils.FALLBACK_STOP_MINUTES > 0 and time() - self.fallback_last_alive >= utils.FALLBACK_STOP_MINUTES * 60:
+                            # fallback mode concluded without live fallback data: both
+                            # instruments are gone, so this is an ordinary disconnect —
+                            # reset the values and hand over to the stock upstream
+                            # disconnect handling (counted from the original disconnect)
                             self.fallback_mode = False
                             self.fallback_concluded_at = time()
                             self.battery.init_values()
-                            logger.error(
-                                ">>> Fallback timeout expired without live fallback data — starting disconnect timer "
-                                + f"({utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES:.0f} min) <<<"
-                            )
+                            logger.error(">>> Fallback timeout expired without live fallback data — treating as ordinary BMS disconnect <<<")
 
                     # set connection info
                     if self.fallback_mode:
                         self.battery.connection_info = f"BMS lost for: {self.battery.get_seconds_to_string(time_since_first_error, 3)} | " + (
                             "operating on live fallback values" if fallback_alive else "holding last values, fallback sensor not answering"
-                        )
-                    elif self.fallback_concluded_at is not None:
-                        remaining = utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES * 60 - (time() - self.fallback_concluded_at)
-                        self.battery.connection_info = (
-                            f"Lost for: {self.battery.get_seconds_to_string(time_since_first_error, 3)} | "
-                            + f"Disconnect in: {self.battery.get_seconds_to_string(max(0, int(remaining)), 3)}"
                         )
                     else:
                         remaining = self.disconnect_threshold - time_since_first_error
@@ -1330,30 +1323,32 @@ class DbusHelper:
                             + f"Threshold: {self.battery.get_seconds_to_string(self.disconnect_threshold, 3)}"
                         )
 
-                    # set BMS cable alarm to warning
+                    # set BMS cable alarm
                     # while the fallback sensor is actively serving, the outage is not yet
-                    # user-actionable degradation, so the warning is held back longer
-                    bms_cable_warn_seconds = utils.FALLBACK_BMS_CABLE_WARN_MINUTES * 60 if self.fallback_mode else 60
-                    self.bms_cable_alarm = (
-                        1
-                        if self.error["timestamp_last"] is not None
-                        and self.error["timestamp_first"] is not None
-                        and bms_cable_warn_seconds < self.error["timestamp_last"] - self.error["timestamp_first"]
-                        else 0
-                    )
+                    # user-actionable degradation, so the warning is held back longer; but
+                    # when the fallback goes dark too (or the fallback phase has concluded),
+                    # both instruments are gone — that is a real fault, alarm immediately
+                    if (self.fallback_mode and not fallback_alive) or self.fallback_concluded_at is not None:
+                        self.bms_cable_alarm = 2
+                    else:
+                        bms_cable_warn_seconds = utils.FALLBACK_BMS_CABLE_WARN_MINUTES * 60 if self.fallback_mode else 60
+                        self.bms_cable_alarm = (
+                            1
+                            if self.error["timestamp_last"] is not None
+                            and self.error["timestamp_first"] is not None
+                            and bms_cable_warn_seconds < self.error["timestamp_last"] - self.error["timestamp_first"]
+                            else 0
+                        )
 
-                    # Exit conditions — three mutually exclusive regimes:
+                    # Exit conditions — two regimes:
                     # 1. fallback mode active: never exit (live fallback = measuring,
-                    #    not degrading; frozen-only serving is bounded by the window)
-                    # 2. fallback mode concluded: the ordinary disconnect timer runs
-                    #    from the conclusion moment, sequential with fallback mode
-                    # 3. fallback mode never engaged (stock behavior): original timers from
-                    #    the first error
+                    #    not degrading; operation without live data is bounded by the
+                    #    fallback timeout)
+                    # 2. fallback mode not active (never engaged, or concluded because
+                    #    the fallback went dark): stock upstream disconnect handling,
+                    #    counted from the original disconnect
                     if self.fallback_mode:
                         pass
-                    elif self.fallback_concluded_at is not None:
-                        if time() - self.fallback_concluded_at >= utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES * 60:
-                            recovery_failed = True
                     elif time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good):
                         recovery_failed = True
                     # Exit if extended recovery time exceeded

@@ -300,7 +300,7 @@ class TestUtilsImportTimeConfig:
             "FALLBACK_SENSOR_DBUS_PATH_CURRENT = /Dc/0/Current\n"
             "FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE = /Dc/0/Temperature\n"
             "FALLBACK_SENSOR_DBUS_PATH_SOC = /Soc\n"
-            "FALLBACK_TIMEOUT_MINUTES = 480\n"
+            "FALLBACK_STOP_MINUTES = 480\n"
             "FALLBACK_SAFE_CELL_VOLTAGE_MIN = 2.70\n"
             "FALLBACK_SAFE_CELL_VOLTAGE_MAX = 3.55\n",
         )
@@ -309,9 +309,9 @@ class TestUtilsImportTimeConfig:
     def test_timeout_minutes_without_device_reports_config_error(self, tmp_path):
         errors = self._import_utils_with_config(
             tmp_path,
-            "[DEFAULT]\nFALLBACK_TIMEOUT_MINUTES = 480\n",
+            "[DEFAULT]\nFALLBACK_STOP_MINUTES = 480\n",
         )
-        assert any("FALLBACK_TIMEOUT_MINUTES" in error for error in errors)
+        assert any("FALLBACK_STOP_MINUTES" in error for error in errors)
 
     def test_safe_zone_min_without_max_reports_config_error(self, tmp_path):
         errors = self._import_utils_with_config(
@@ -323,7 +323,7 @@ class TestUtilsImportTimeConfig:
 
 class TestFallbackModeEligible:
     def _make_helper(self, monkeypatch, fallback_objects, minutes=480.0, block_on_disconnect=False, cell_voltages_good=None):
-        monkeypatch.setattr(utils, "FALLBACK_TIMEOUT_MINUTES", minutes)
+        monkeypatch.setattr(utils, "FALLBACK_STOP_MINUTES", minutes)
         monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT", block_on_disconnect)
         helper = DbusHelper.__new__(DbusHelper)
         helper.battery = _make_battery()
@@ -345,9 +345,11 @@ class TestFallbackModeEligible:
         helper = self._make_helper(monkeypatch, None)
         assert helper.fallback_mode_eligible() is False
 
-    def test_not_eligible_when_disabled(self, monkeypatch):
+    def test_eligible_with_stop_minutes_zero(self, monkeypatch):
+        # configuring the fallback device is the opt-in;
+        # FALLBACK_STOP_MINUTES = 0 means hold forever, not disabled
         helper = self._make_helper(monkeypatch, {"Voltage": _FakeDbusItem(25.5)}, minutes=0)
-        assert helper.fallback_mode_eligible() is False
+        assert helper.fallback_mode_eligible() is True
 
     def test_not_eligible_with_block_on_disconnect(self, monkeypatch):
         helper = self._make_helper(monkeypatch, {"Voltage": _FakeDbusItem(25.5)}, block_on_disconnect=True)
@@ -450,7 +452,7 @@ class TestNeverOnlineFallbackEngagement:
     def _make_helper(self, monkeypatch):
         from time import time as now
 
-        monkeypatch.setattr(utils, "FALLBACK_TIMEOUT_MINUTES", 480.0)
+        monkeypatch.setattr(utils, "FALLBACK_STOP_MINUTES", 480.0)
         monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT", False)
         monkeypatch.setattr(utils, "FALLBACK_BMS_CABLE_WARN_MINUTES", 480.0)
         monkeypatch.setattr(utils, "EXTERNAL_SENSOR_DBUS_DEVICE", None)
@@ -513,4 +515,23 @@ class TestNeverOnlineFallbackEngagement:
         assert helper.battery.get_temperature() == 28.0
         assert helper.battery.get_voltage() == 26.1
         # no exit while the fallback is serving
+        assert loop.quit_called is False
+        # BmsCable stays quiet inside the warn window while the fallback covers
+        assert helper.bms_cable_alarm == 0
+
+    def test_both_instruments_dark_alarms_immediately(self, monkeypatch):
+        # BMS down AND fallback not delivering: a real fault — no warn-window
+        # grace, BmsCable goes straight to alarm (2)
+        helper = self._make_helper(monkeypatch)
+        helper.battery.dbus_fallback_objects = {
+            "Voltage": _FakeDbusItem(None),
+            "Temperature": _FakeDbusItem(None),
+        }
+        loop = self._FakeLoop()
+
+        helper.publish_battery(loop)
+
+        assert helper.fallback_mode is True  # engaged (device present) but dark
+        assert helper.bms_cable_alarm == 2
+        # dark grace not yet expired: no exit, values not reset yet
         assert loop.quit_called is False

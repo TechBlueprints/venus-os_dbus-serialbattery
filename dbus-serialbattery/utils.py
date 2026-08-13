@@ -314,7 +314,7 @@ FALLBACK_SENSOR_DBUS_PATH_VOLTAGE: Union[str, None] = config["DEFAULT"]["FALLBAC
 FALLBACK_SENSOR_DBUS_PATH_CURRENT: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_PATH_CURRENT"] or None
 FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE"] or None
 FALLBACK_SENSOR_DBUS_PATH_SOC: Union[str, None] = config["DEFAULT"]["FALLBACK_SENSOR_DBUS_PATH_SOC"] or None
-FALLBACK_TIMEOUT_MINUTES: float = get_float_from_config("DEFAULT", "FALLBACK_TIMEOUT_MINUTES")
+FALLBACK_STOP_MINUTES: float = get_float_from_config("DEFAULT", "FALLBACK_STOP_MINUTES")
 FALLBACK_BMS_CABLE_WARN_MINUTES: float = get_float_from_config("DEFAULT", "FALLBACK_BMS_CABLE_WARN_MINUTES", 10)
 FALLBACK_SAFE_CELL_VOLTAGE_MIN: float = get_float_from_config("DEFAULT", "FALLBACK_SAFE_CELL_VOLTAGE_MIN")
 FALLBACK_SAFE_CELL_VOLTAGE_MAX: float = get_float_from_config("DEFAULT", "FALLBACK_SAFE_CELL_VOLTAGE_MAX")
@@ -327,13 +327,13 @@ check_config_issue(
 )
 
 check_config_issue(
-    FALLBACK_TIMEOUT_MINUTES > 0 and FALLBACK_SENSOR_DBUS_DEVICE is None,
-    "FALLBACK_TIMEOUT_MINUTES is set but FALLBACK_SENSOR_DBUS_DEVICE is empty. Fallback mode requires a fallback device. Please check the configuration.",
+    FALLBACK_STOP_MINUTES > 0 and FALLBACK_SENSOR_DBUS_DEVICE is None,
+    "FALLBACK_STOP_MINUTES is set but FALLBACK_SENSOR_DBUS_DEVICE is empty. Fallback mode requires a fallback device. Please check the configuration.",
 )
 
 check_config_issue(
-    FALLBACK_TIMEOUT_MINUTES > 0 and BLOCK_ON_DISCONNECT,
-    "FALLBACK_TIMEOUT_MINUTES and BLOCK_ON_DISCONNECT are both enabled. Fallback mode is not entered when BLOCK_ON_DISCONNECT is active. Please disable one of them in the configuration.",
+    FALLBACK_SENSOR_DBUS_DEVICE is not None and BLOCK_ON_DISCONNECT,
+    "FALLBACK_SENSOR_DBUS_DEVICE and BLOCK_ON_DISCONNECT are both enabled. Fallback mode is not entered when BLOCK_ON_DISCONNECT is active. Please disable one of them in the configuration.",
 )
 
 check_config_issue(
