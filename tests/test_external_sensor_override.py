@@ -4,6 +4,8 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery", "ext", "velib_python"))
 
@@ -147,6 +149,113 @@ class TestFallbackSensor:
         assert battery.get_capacity_remain() == 291.0
 
 
+class _FakeCell:
+    def __init__(self, voltage):
+        self.voltage = voltage
+
+
+class TestStaleCellProjection:
+    def _make_helper(self, cell_voltages):
+        helper = DbusHelper.__new__(DbusHelper)
+        helper.battery = _make_battery()
+        helper.battery.cell_count = len(cell_voltages)
+        helper.battery.cells = [_FakeCell(v) for v in cell_voltages]
+        helper.stale_cell_snapshot = None
+        helper.stale_charge_blocked = False
+        helper.stale_discharge_blocked = False
+        return helper
+
+    def test_snapshot_captures_cells(self):
+        helper = self._make_helper([3.30, 3.31, 3.29, 3.35])
+        helper.stale_take_cell_snapshot()
+        assert helper.stale_cell_snapshot == [3.30, 3.31, 3.29, 3.35]
+
+    def test_snapshot_none_when_cell_unread(self):
+        helper = self._make_helper([3.30, None, 3.29, 3.35])
+        helper.stale_take_cell_snapshot()
+        assert helper.stale_cell_snapshot is None
+
+    def test_projection_distributes_delta_evenly(self):
+        helper = self._make_helper([3.30, 3.31, 3.29, 3.35])
+        helper.stale_take_cell_snapshot()
+        # snapshot sum 13.25, live shunt 13.05 -> delta -0.05 per cell
+        projected = helper.stale_project_cells(13.05)
+        assert projected == pytest.approx([3.25, 3.26, 3.24, 3.30])
+
+    def test_projection_preserves_cell_ordering(self):
+        helper = self._make_helper([3.30, 3.31, 3.29, 3.35])
+        helper.stale_take_cell_snapshot()
+        projected = helper.stale_project_cells(12.85)
+        assert projected.index(max(projected)) == 3
+        assert projected.index(min(projected)) == 2
+
+    def test_projection_none_without_shunt_voltage(self):
+        helper = self._make_helper([3.30, 3.31, 3.29, 3.35])
+        helper.stale_take_cell_snapshot()
+        assert helper.stale_project_cells(None) is None
+
+    def test_projection_rejects_implausible_delta(self):
+        # one shunt across a series string (or wrong pairing): voltage ~2x the pack
+        helper = self._make_helper([3.30, 3.31, 3.29, 3.35])
+        helper.stale_take_cell_snapshot()
+        assert helper.stale_project_cells(26.5) is None
+
+
+class TestStaleBandFlags:
+    def _make_helper(self, monkeypatch, band_min=2.70, band_max=3.55):
+        monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT_VOLTAGE_MIN", band_min)
+        monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT_VOLTAGE_MAX", band_max)
+        helper = DbusHelper.__new__(DbusHelper)
+        helper.battery = _make_battery()
+        helper.stale_charge_blocked = False
+        helper.stale_discharge_blocked = False
+        return helper
+
+    def test_inside_zone_allows_both(self, monkeypatch):
+        helper = self._make_helper(monkeypatch)
+        helper.stale_update_band_flags(3.20, 3.35)
+        assert helper.stale_charge_blocked is False
+        assert helper.stale_discharge_blocked is False
+
+    def test_above_zone_blocks_charging_only(self, monkeypatch):
+        helper = self._make_helper(monkeypatch)
+        helper.stale_update_band_flags(3.40, 3.56)
+        assert helper.stale_charge_blocked is True
+        assert helper.stale_discharge_blocked is False
+
+    def test_below_zone_blocks_discharging_only(self, monkeypatch):
+        helper = self._make_helper(monkeypatch)
+        helper.stale_update_band_flags(2.69, 3.10)
+        assert helper.stale_charge_blocked is False
+        assert helper.stale_discharge_blocked is True
+
+    def test_charge_reallow_requires_hysteresis_margin(self, monkeypatch):
+        helper = self._make_helper(monkeypatch)
+        helper.stale_update_band_flags(3.40, 3.56)
+        assert helper.stale_charge_blocked is True
+        # back under the edge but within the margin: stays blocked
+        helper.stale_update_band_flags(3.40, 3.52)
+        assert helper.stale_charge_blocked is True
+        # inside by more than the margin: re-allowed
+        helper.stale_update_band_flags(3.40, 3.49)
+        assert helper.stale_charge_blocked is False
+
+    def test_discharge_reallow_requires_hysteresis_margin(self, monkeypatch):
+        helper = self._make_helper(monkeypatch)
+        helper.stale_update_band_flags(2.69, 3.10)
+        assert helper.stale_discharge_blocked is True
+        helper.stale_update_band_flags(2.73, 3.10)
+        assert helper.stale_discharge_blocked is True
+        helper.stale_update_band_flags(2.76, 3.10)
+        assert helper.stale_discharge_blocked is False
+
+    def test_spread_wider_than_band_blocks_both(self, monkeypatch):
+        helper = self._make_helper(monkeypatch)
+        helper.stale_update_band_flags(2.65, 3.60)
+        assert helper.stale_charge_blocked is True
+        assert helper.stale_discharge_blocked is True
+
+
 class TestStaleServingEligible:
     def _make_helper(self, monkeypatch, fallback_objects, minutes=480.0, block_on_disconnect=False, cell_voltages_good=None):
         monkeypatch.setattr(utils, "FALLBACK_SERVE_STALE_MINUTES", minutes)
@@ -286,6 +395,7 @@ class TestNeverOnlineStaleEngagement:
         battery.online = None  # never had a successful main-loop cycle
         battery.port = "/ble_test"
         battery.cells = []
+        battery.cell_count = None
         battery.current = None
         battery.soc = None
         battery.voltage_calc = None
