@@ -196,6 +196,18 @@ class DbusHelper:
         self.disconnect_threshold: int = None
         self.bms_cable_alarm: int = 0
         self.stale_serving: bool = False
+        self.stale_clock_start: float = None
+        """
+        Base of the stale-window clock. Reset to now on every cycle where the
+        fallback sensor delivers a live value, so the window only counts
+        continuous time WITHOUT live fallback data.
+        """
+        self.stale_concluded_at: float = None
+        """
+        When the stale phase concluded (window expired without live fallback).
+        The ordinary disconnect timer starts from this moment — sequential
+        with the stale phase, not concurrent.
+        """
         self._dbusname: str = (
             "com.victronenergy.battery."
             + self.battery.port[self.battery.port.rfind("/") + 1 :]
@@ -1099,6 +1111,8 @@ class DbusHelper:
                 if self.stale_serving:
                     self.stale_serving = False
                     logger.info(">>> Battery responds again, stop serving stale data <<<")
+                self.stale_clock_start = None
+                self.stale_concluded_at = None
 
                 if self.error["count"] > 0:
                     seconds_since_first_error = int(time()) - self.error["timestamp_first"]
@@ -1239,9 +1253,10 @@ class DbusHelper:
                         # online/cleared gate: a driver that got its data during init and
                         # dropped before any main-loop success never passes that gate, and
                         # must not fall through to the 60 s cell-voltage exit below
-                        if not self.stale_serving and self.stale_serving_eligible():
+                        if not self.stale_serving and self.stale_concluded_at is None and self.stale_serving_eligible():
                             # keep the last read values and serve V/I/T from the fallback sensor
                             self.stale_serving = True
+                            self.stale_clock_start = time()
                             # mark the battery offline explicitly: on the never-online path
                             # (data only during init, dropped before any main-loop success)
                             # online is still None, and get_value_from_fallback_sensor only
@@ -1253,13 +1268,45 @@ class DbusHelper:
                                 + f"fallback sensor, other values frozen for up to {utils.FALLBACK_SERVE_STALE_MINUTES:.0f} minutes."
                             )
 
+                    # stale phase progression: the window clock only runs while the
+                    # fallback is NOT delivering — live fallback values mean the system
+                    # is measuring, not degrading, so serving continues indefinitely
+                    # (the BmsCable warning still fires on its own schedule)
+                    fallback_alive = False
+                    if self.stale_serving:
+                        fallback_alive = self.battery.get_value_from_fallback_sensor("Voltage") is not None
+                        if fallback_alive:
+                            self.stale_clock_start = time()
+                        elif time() - self.stale_clock_start >= utils.FALLBACK_SERVE_STALE_MINUTES * 60:
+                            # stale phase concluded without live fallback data: stop
+                            # serving, reset values, and only NOW start the ordinary
+                            # disconnect timer (sequential with the stale phase)
+                            self.stale_serving = False
+                            self.stale_concluded_at = time()
+                            self.battery.init_values()
+                            logger.error(
+                                ">>> Stale window expired without live fallback data — starting disconnect timer "
+                                + f"({utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES:.0f} min) <<<"
+                            )
+
                     # set connection info
-                    remaining = self.disconnect_threshold - time_since_first_error
-                    self.battery.connection_info = (
-                        f"Lost for: {self.battery.get_seconds_to_string(time_since_first_error, 3)} | "
-                        + f"Disconnect in: {self.battery.get_seconds_to_string(remaining, 3)} | "
-                        + f"Threshold: {self.battery.get_seconds_to_string(self.disconnect_threshold, 3)}"
-                    )
+                    if self.stale_serving:
+                        self.battery.connection_info = f"BMS lost for: {self.battery.get_seconds_to_string(time_since_first_error, 3)} | " + (
+                            "serving live values from fallback sensor" if fallback_alive else "serving frozen values, fallback sensor not answering"
+                        )
+                    elif self.stale_concluded_at is not None:
+                        remaining = utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES * 60 - (time() - self.stale_concluded_at)
+                        self.battery.connection_info = (
+                            f"Lost for: {self.battery.get_seconds_to_string(time_since_first_error, 3)} | "
+                            + f"Disconnect in: {self.battery.get_seconds_to_string(max(0, int(remaining)), 3)}"
+                        )
+                    else:
+                        remaining = self.disconnect_threshold - time_since_first_error
+                        self.battery.connection_info = (
+                            f"Lost for: {self.battery.get_seconds_to_string(time_since_first_error, 3)} | "
+                            + f"Disconnect in: {self.battery.get_seconds_to_string(remaining, 3)} | "
+                            + f"Threshold: {self.battery.get_seconds_to_string(self.disconnect_threshold, 3)}"
+                        )
 
                     # set BMS cable alarm to warning
                     # while the fallback sensor is actively serving, the outage is not yet
@@ -1273,15 +1320,19 @@ class DbusHelper:
                         else 0
                     )
 
-                    # Exit if recovery time exceeded and
-                    # if BLOCK_ON_DISCONNECT is enabled or cell voltages are unsafe
-                    # (not while serving stale data: the fallback sensor provides live values
-                    # and the exit is deferred to the stale window)
-                    if (
-                        time_since_first_error >= RETRY_CYCLE_LONG_COUNT
-                        and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good)
-                        and not self.stale_serving
-                    ):
+                    # Exit conditions — three mutually exclusive regimes:
+                    # 1. stale-serving active: never exit (live fallback = measuring,
+                    #    not degrading; frozen-only serving is bounded by the window)
+                    # 2. stale phase concluded: the ordinary disconnect timer runs
+                    #    from the conclusion moment, sequential with the stale phase
+                    # 3. stale never engaged (stock behavior): original timers from
+                    #    the first error
+                    if self.stale_serving:
+                        pass
+                    elif self.stale_concluded_at is not None:
+                        if time() - self.stale_concluded_at >= utils.BLOCK_ON_DISCONNECT_TIMEOUT_MINUTES * 60:
+                            recovery_failed = True
+                    elif time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good):
                         recovery_failed = True
                     # Exit if extended recovery time exceeded
                     # This is only possible if cell voltages are good and BLOCK_ON_DISCONNECT is disabled else it would have exited earlier
