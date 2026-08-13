@@ -251,6 +251,7 @@ class TestNeverOnlineStaleEngagement:
 
         battery = _make_battery()
         battery.online = None  # never had a successful main-loop cycle
+        battery.port = "/ble_test"
         battery.cells = []
         battery.current = None
         battery.soc = None
