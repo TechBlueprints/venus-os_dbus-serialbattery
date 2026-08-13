@@ -1559,17 +1559,26 @@ class DbusHelper:
                 # Update TimeToGo item
                 if utils.TIME_TO_GO_ENABLE and percent_per_seconds is not None:
 
-                    # Get settings from dbus
-                    settings_battery_life = self.get_settings_with_values(
-                        get_bus(VICTRON_SETTINGS_DBUS_NAME),
-                        VICTRON_SETTINGS_DBUS_NAME,
-                        "/Settings/CGwacs/BatteryLife",
-                    )
-                    settings_hub4mode = self.get_settings_with_values(
-                        get_bus(VICTRON_SETTINGS_DBUS_NAME),
-                        VICTRON_SETTINGS_DBUS_NAME,
-                        "/Settings/CGwacs/Hub4Mode",
-                    )
+                    # Get settings from dbus — cached: each fetch is a recursive
+                    # D-Bus introspection walk (Introspect + GetValue per child,
+                    # dozens of calls), and these ESS settings change rarely.
+                    # Uncached this made the battery drivers the dominant load
+                    # on localsettings (measured ~8 calls/s bursts per driver).
+                    if getattr(self, "_cgwacs_cache", None) is None or int(time()) - self._cgwacs_cache_time >= 300:
+                        self._cgwacs_cache = (
+                            self.get_settings_with_values(
+                                get_bus(VICTRON_SETTINGS_DBUS_NAME),
+                                VICTRON_SETTINGS_DBUS_NAME,
+                                "/Settings/CGwacs/BatteryLife",
+                            ),
+                            self.get_settings_with_values(
+                                get_bus(VICTRON_SETTINGS_DBUS_NAME),
+                                VICTRON_SETTINGS_DBUS_NAME,
+                                "/Settings/CGwacs/Hub4Mode",
+                            ),
+                        )
+                        self._cgwacs_cache_time = int(time())
+                    settings_battery_life, settings_hub4mode = self._cgwacs_cache
 
                     hub4mode = int(settings_hub4mode["Settings"]["CGwacs"]["Hub4Mode"]) if "Settings" in settings_hub4mode else None
                     state = (
