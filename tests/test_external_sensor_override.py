@@ -79,13 +79,13 @@ class TestFallbackSensor:
         battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(25.5)}
         assert battery.get_voltage() == 25.5
 
-    def test_stale_bms_value_served_when_no_fallback_path(self):
+    def test_held_bms_value_served_when_no_fallback_path(self):
         battery = _make_battery()
         battery.online = False
         battery.dbus_fallback_objects = {"Current": _FakeDbusItem(-0.2)}
         assert battery.get_voltage() == 26.0
 
-    def test_fallback_none_value_falls_back_to_stale_bms_value(self):
+    def test_fallback_none_value_falls_back_to_held_bms_value(self):
         battery = _make_battery()
         battery.online = False
         battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(None)}
@@ -123,7 +123,7 @@ class TestFallbackSensor:
         battery.dbus_fallback_objects = {"Soc": _FakeDbusItem(93.4)}
         assert battery.get_soc() == 93.4
 
-    def test_stale_bms_soc_served_when_no_fallback_soc_path(self, monkeypatch):
+    def test_held_bms_soc_served_when_no_fallback_soc_path(self, monkeypatch):
         monkeypatch.setattr(utils, "SOC_CALCULATION", False)
         battery = _make_battery()
         battery.soc = 97.0
@@ -154,54 +154,54 @@ class _FakeCell:
         self.voltage = voltage
 
 
-class TestStaleCellProjection:
+class TestFallbackCellProjection:
     def _make_helper(self, cell_voltages):
         helper = DbusHelper.__new__(DbusHelper)
         helper.battery = _make_battery()
         helper.battery.cell_count = len(cell_voltages)
         helper.battery.cells = [_FakeCell(v) for v in cell_voltages]
-        helper.stale_cell_snapshot = None
-        helper.stale_charge_blocked = False
-        helper.stale_discharge_blocked = False
+        helper.fallback_cell_snapshot = None
+        helper.fallback_charge_blocked = False
+        helper.fallback_discharge_blocked = False
         return helper
 
     def test_snapshot_captures_cells(self):
         helper = self._make_helper([3.30, 3.31, 3.29, 3.35])
-        helper.stale_take_cell_snapshot()
-        assert helper.stale_cell_snapshot == [3.30, 3.31, 3.29, 3.35]
+        helper.fallback_take_cell_snapshot()
+        assert helper.fallback_cell_snapshot == [3.30, 3.31, 3.29, 3.35]
 
     def test_snapshot_none_when_cell_unread(self):
         helper = self._make_helper([3.30, None, 3.29, 3.35])
-        helper.stale_take_cell_snapshot()
-        assert helper.stale_cell_snapshot is None
+        helper.fallback_take_cell_snapshot()
+        assert helper.fallback_cell_snapshot is None
 
     def test_projection_distributes_delta_evenly(self):
         helper = self._make_helper([3.30, 3.31, 3.29, 3.35])
-        helper.stale_take_cell_snapshot()
+        helper.fallback_take_cell_snapshot()
         # snapshot sum 13.25, live shunt 13.05 -> delta -0.05 per cell
-        projected = helper.stale_project_cells(13.05)
+        projected = helper.fallback_project_cells(13.05)
         assert projected == pytest.approx([3.25, 3.26, 3.24, 3.30])
 
     def test_projection_preserves_cell_ordering(self):
         helper = self._make_helper([3.30, 3.31, 3.29, 3.35])
-        helper.stale_take_cell_snapshot()
-        projected = helper.stale_project_cells(12.85)
+        helper.fallback_take_cell_snapshot()
+        projected = helper.fallback_project_cells(12.85)
         assert projected.index(max(projected)) == 3
         assert projected.index(min(projected)) == 2
 
     def test_projection_none_without_shunt_voltage(self):
         helper = self._make_helper([3.30, 3.31, 3.29, 3.35])
-        helper.stale_take_cell_snapshot()
-        assert helper.stale_project_cells(None) is None
+        helper.fallback_take_cell_snapshot()
+        assert helper.fallback_project_cells(None) is None
 
     def test_projection_rejects_implausible_delta(self):
         # one shunt across a series string (or wrong pairing): voltage ~2x the pack
         helper = self._make_helper([3.30, 3.31, 3.29, 3.35])
-        helper.stale_take_cell_snapshot()
-        assert helper.stale_project_cells(26.5) is None
+        helper.fallback_take_cell_snapshot()
+        assert helper.fallback_project_cells(26.5) is None
 
 
-class TestStaleBandFlags:
+class TestFallbackBandFlags:
     def _make_helper(self, monkeypatch, zone_min=2.70, zone_max=3.55):
         # the safe zone is its own dedicated config (FALLBACK_SAFE_CELL_VOLTAGE_MIN/MAX),
         # set from the battery manufacturer's spec — deliberately not shared with any
@@ -210,59 +210,59 @@ class TestStaleBandFlags:
         monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MAX", zone_max)
         helper = DbusHelper.__new__(DbusHelper)
         helper.battery = _make_battery()
-        helper.stale_charge_blocked = False
-        helper.stale_discharge_blocked = False
+        helper.fallback_charge_blocked = False
+        helper.fallback_discharge_blocked = False
         return helper
 
     def test_zone_unset_blocks_charging_keeps_discharging(self, monkeypatch):
         helper = self._make_helper(monkeypatch, zone_min=0, zone_max=0)
-        helper.stale_update_band_flags(3.20, 3.35)
-        assert helper.stale_charge_blocked is True
-        assert helper.stale_discharge_blocked is False
+        helper.fallback_update_band_flags(3.20, 3.35)
+        assert helper.fallback_charge_blocked is True
+        assert helper.fallback_discharge_blocked is False
 
     def test_inside_zone_allows_both(self, monkeypatch):
         helper = self._make_helper(monkeypatch)
-        helper.stale_update_band_flags(3.20, 3.35)
-        assert helper.stale_charge_blocked is False
-        assert helper.stale_discharge_blocked is False
+        helper.fallback_update_band_flags(3.20, 3.35)
+        assert helper.fallback_charge_blocked is False
+        assert helper.fallback_discharge_blocked is False
 
     def test_above_zone_blocks_charging_only(self, monkeypatch):
         helper = self._make_helper(monkeypatch)
-        helper.stale_update_band_flags(3.40, 3.56)
-        assert helper.stale_charge_blocked is True
-        assert helper.stale_discharge_blocked is False
+        helper.fallback_update_band_flags(3.40, 3.56)
+        assert helper.fallback_charge_blocked is True
+        assert helper.fallback_discharge_blocked is False
 
     def test_below_zone_blocks_discharging_only(self, monkeypatch):
         helper = self._make_helper(monkeypatch)
-        helper.stale_update_band_flags(2.69, 3.10)
-        assert helper.stale_charge_blocked is False
-        assert helper.stale_discharge_blocked is True
+        helper.fallback_update_band_flags(2.69, 3.10)
+        assert helper.fallback_charge_blocked is False
+        assert helper.fallback_discharge_blocked is True
 
     def test_charge_reallow_requires_hysteresis_margin(self, monkeypatch):
         helper = self._make_helper(monkeypatch)
-        helper.stale_update_band_flags(3.40, 3.56)
-        assert helper.stale_charge_blocked is True
+        helper.fallback_update_band_flags(3.40, 3.56)
+        assert helper.fallback_charge_blocked is True
         # back under the edge but within the margin: stays blocked
-        helper.stale_update_band_flags(3.40, 3.52)
-        assert helper.stale_charge_blocked is True
+        helper.fallback_update_band_flags(3.40, 3.52)
+        assert helper.fallback_charge_blocked is True
         # inside by more than the margin: re-allowed
-        helper.stale_update_band_flags(3.40, 3.49)
-        assert helper.stale_charge_blocked is False
+        helper.fallback_update_band_flags(3.40, 3.49)
+        assert helper.fallback_charge_blocked is False
 
     def test_discharge_reallow_requires_hysteresis_margin(self, monkeypatch):
         helper = self._make_helper(monkeypatch)
-        helper.stale_update_band_flags(2.69, 3.10)
-        assert helper.stale_discharge_blocked is True
-        helper.stale_update_band_flags(2.73, 3.10)
-        assert helper.stale_discharge_blocked is True
-        helper.stale_update_band_flags(2.76, 3.10)
-        assert helper.stale_discharge_blocked is False
+        helper.fallback_update_band_flags(2.69, 3.10)
+        assert helper.fallback_discharge_blocked is True
+        helper.fallback_update_band_flags(2.73, 3.10)
+        assert helper.fallback_discharge_blocked is True
+        helper.fallback_update_band_flags(2.76, 3.10)
+        assert helper.fallback_discharge_blocked is False
 
     def test_spread_wider_than_band_blocks_both(self, monkeypatch):
         helper = self._make_helper(monkeypatch)
-        helper.stale_update_band_flags(2.65, 3.60)
-        assert helper.stale_charge_blocked is True
-        assert helper.stale_discharge_blocked is True
+        helper.fallback_update_band_flags(2.65, 3.60)
+        assert helper.fallback_charge_blocked is True
+        assert helper.fallback_discharge_blocked is True
 
 
 class TestUtilsImportTimeConfig:
@@ -300,18 +300,18 @@ class TestUtilsImportTimeConfig:
             "FALLBACK_SENSOR_DBUS_PATH_CURRENT = /Dc/0/Current\n"
             "FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE = /Dc/0/Temperature\n"
             "FALLBACK_SENSOR_DBUS_PATH_SOC = /Soc\n"
-            "FALLBACK_SERVE_STALE_MINUTES = 480\n"
+            "FALLBACK_TIMEOUT_MINUTES = 480\n"
             "FALLBACK_SAFE_CELL_VOLTAGE_MIN = 2.70\n"
             "FALLBACK_SAFE_CELL_VOLTAGE_MAX = 3.55\n",
         )
         assert errors == []
 
-    def test_stale_minutes_without_device_reports_config_error(self, tmp_path):
+    def test_timeout_minutes_without_device_reports_config_error(self, tmp_path):
         errors = self._import_utils_with_config(
             tmp_path,
-            "[DEFAULT]\nFALLBACK_SERVE_STALE_MINUTES = 480\n",
+            "[DEFAULT]\nFALLBACK_TIMEOUT_MINUTES = 480\n",
         )
-        assert any("FALLBACK_SERVE_STALE_MINUTES" in error for error in errors)
+        assert any("FALLBACK_TIMEOUT_MINUTES" in error for error in errors)
 
     def test_safe_zone_min_without_max_reports_config_error(self, tmp_path):
         errors = self._import_utils_with_config(
@@ -321,9 +321,9 @@ class TestUtilsImportTimeConfig:
         assert any("FALLBACK_SAFE_CELL_VOLTAGE" in error for error in errors)
 
 
-class TestStaleServingEligible:
+class TestFallbackModeEligible:
     def _make_helper(self, monkeypatch, fallback_objects, minutes=480.0, block_on_disconnect=False, cell_voltages_good=None):
-        monkeypatch.setattr(utils, "FALLBACK_SERVE_STALE_MINUTES", minutes)
+        monkeypatch.setattr(utils, "FALLBACK_TIMEOUT_MINUTES", minutes)
         monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT", block_on_disconnect)
         helper = DbusHelper.__new__(DbusHelper)
         helper.battery = _make_battery()
@@ -333,25 +333,25 @@ class TestStaleServingEligible:
 
     def test_eligible_with_fallback_sensor(self, monkeypatch):
         helper = self._make_helper(monkeypatch, {"Voltage": _FakeDbusItem(25.5)})
-        assert helper.stale_serving_eligible() is True
+        assert helper.fallback_mode_eligible() is True
 
     def test_eligible_regardless_of_cell_voltages(self, monkeypatch):
         # the BMS's own cell-level protection acts independently of this driver,
-        # so cells outside the BLOCK_ON_DISCONNECT band must not block stale serving
+        # so cells outside the BLOCK_ON_DISCONNECT band must not block fallback mode
         helper = self._make_helper(monkeypatch, {"Voltage": _FakeDbusItem(25.5)}, cell_voltages_good=False)
-        assert helper.stale_serving_eligible() is True
+        assert helper.fallback_mode_eligible() is True
 
     def test_not_eligible_without_fallback_sensor(self, monkeypatch):
         helper = self._make_helper(monkeypatch, None)
-        assert helper.stale_serving_eligible() is False
+        assert helper.fallback_mode_eligible() is False
 
     def test_not_eligible_when_disabled(self, monkeypatch):
         helper = self._make_helper(monkeypatch, {"Voltage": _FakeDbusItem(25.5)}, minutes=0)
-        assert helper.stale_serving_eligible() is False
+        assert helper.fallback_mode_eligible() is False
 
     def test_not_eligible_with_block_on_disconnect(self, monkeypatch):
         helper = self._make_helper(monkeypatch, {"Voltage": _FakeDbusItem(25.5)}, block_on_disconnect=True)
-        assert helper.stale_serving_eligible() is False
+        assert helper.fallback_mode_eligible() is False
 
 
 class TestGetFallbackSensorDevice:
@@ -428,14 +428,14 @@ class TestGetPower:
         assert battery.get_power() is None
 
 
-class TestNeverOnlineStaleEngagement:
+class TestNeverOnlineFallbackEngagement:
     """Regression for the never-online path (production incident 2026-08-13).
 
     A driver that only got data during init and lost BLE before its first
-    successful main-loop cycle still has ``battery.online = None``. Stale
-    serving must engage on eligibility alone, mark the battery offline, and
+    successful main-loop cycle still has ``battery.online = None``. Fallback
+    mode must engage on eligibility alone, mark the battery offline, and
     the fallback getter must actually serve — an earlier half-fix engaged
-    stale serving but left ``online = None``, so the fallback refused to
+    fallback mode but left ``online = None``, so the fallback refused to
     serve, ``/Dc/0/Temperature`` published None, and dbus-aggregate-batteries
     crashed downstream on ``Temperature += None``.
     """
@@ -450,7 +450,7 @@ class TestNeverOnlineStaleEngagement:
     def _make_helper(self, monkeypatch):
         from time import time as now
 
-        monkeypatch.setattr(utils, "FALLBACK_SERVE_STALE_MINUTES", 480.0)
+        monkeypatch.setattr(utils, "FALLBACK_TIMEOUT_MINUTES", 480.0)
         monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT", False)
         monkeypatch.setattr(utils, "FALLBACK_BMS_CABLE_WARN_MINUTES", 480.0)
         monkeypatch.setattr(utils, "EXTERNAL_SENSOR_DBUS_DEVICE", None)
@@ -481,9 +481,9 @@ class TestNeverOnlineStaleEngagement:
 
         helper = DbusHelper.__new__(DbusHelper)
         helper.battery = battery
-        helper.stale_serving = False
-        helper.stale_clock_start = None
-        helper.stale_concluded_at = None
+        helper.fallback_mode = False
+        helper.fallback_last_alive = None
+        helper.fallback_concluded_at = None
         helper.cell_voltages_good = None
         helper.disconnect_threshold = None
         helper.bms_cable_alarm = 0
@@ -497,18 +497,18 @@ class TestNeverOnlineStaleEngagement:
         helper.telemetry_upload = lambda: None
         return helper
 
-    def test_stale_engages_marks_offline_and_serves_fallback(self, monkeypatch):
+    def test_fallback_engages_marks_offline_and_serves(self, monkeypatch):
         helper = self._make_helper(monkeypatch)
         loop = self._FakeLoop()
 
         helper.publish_battery(loop)
 
         # engagement must not depend on the battery ever having been online
-        assert helper.stale_serving is True
+        assert helper.fallback_mode is True
         # the engagement must mark the battery offline so the fallback serves
         assert helper.battery.online is False
         # the aggregate's contract: a fallback-configured battery ALWAYS
-        # publishes temperature while stale-serving
+        # publishes temperature while in fallback mode
         assert helper.battery.get_value_from_fallback_sensor("Temperature") == 28.0
         assert helper.battery.get_temperature() == 28.0
         assert helper.battery.get_voltage() == 26.1
