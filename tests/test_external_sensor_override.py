@@ -219,3 +219,89 @@ class TestGetPower:
         battery.power_calc = None
         battery.power_calc_last_time = None
         assert battery.get_power() is None
+
+
+class TestNeverOnlineStaleEngagement:
+    """Regression for the never-online path (production incident 2026-08-13).
+
+    A driver that only got data during init and lost BLE before its first
+    successful main-loop cycle still has ``battery.online = None``. Stale
+    serving must engage on eligibility alone, mark the battery offline, and
+    the fallback getter must actually serve — an earlier half-fix engaged
+    stale serving but left ``online = None``, so the fallback refused to
+    serve, ``/Dc/0/Temperature`` published None, and dbus-aggregate-batteries
+    crashed downstream on ``Temperature += None``.
+    """
+
+    class _FakeLoop:
+        def __init__(self):
+            self.quit_called = False
+
+        def quit(self):
+            self.quit_called = True
+
+    def _make_helper(self, monkeypatch):
+        from time import time as now
+
+        monkeypatch.setattr(utils, "FALLBACK_SERVE_STALE_MINUTES", 480.0)
+        monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT", False)
+        monkeypatch.setattr(utils, "FALLBACK_BMS_CABLE_WARN_MINUTES", 480.0)
+        monkeypatch.setattr(utils, "EXTERNAL_SENSOR_DBUS_DEVICE", None)
+        monkeypatch.setattr(utils, "FALLBACK_SENSOR_DBUS_DEVICE", None)
+
+        battery = _make_battery()
+        battery.online = None  # never had a successful main-loop cycle
+        battery.cells = []
+        battery.current = None
+        battery.soc = None
+        battery.voltage_calc = None
+        battery.current_calc = None
+        battery.power_calc = None
+        battery.power_calc_last_time = None
+        battery.soc_calc = None
+        battery.temperature_1 = None
+        battery.temperature_2 = None
+        battery.temperature_3 = None
+        battery.temperature_4 = None
+        battery.dbus_fallback_objects = {
+            "Voltage": _FakeDbusItem(26.1),
+            "Temperature": _FakeDbusItem(28.0),
+        }
+        battery.refresh_data = lambda: False
+        battery.last_refresh_duration = 0.0
+
+        helper = DbusHelper.__new__(DbusHelper)
+        helper.battery = battery
+        helper.stale_serving = False
+        helper.stale_clock_start = None
+        helper.stale_concluded_at = None
+        helper.cell_voltages_good = None
+        helper.disconnect_threshold = None
+        helper.bms_cable_alarm = 0
+        helper.error = {
+            "count": 3,
+            "timestamp_first": int(now()) - 30,
+            "timestamp_last": int(now()),
+            "cleared": True,
+        }
+        helper.publish_dbus = lambda: None
+        helper.telemetry_upload = lambda: None
+        return helper
+
+    def test_stale_engages_marks_offline_and_serves_fallback(self, monkeypatch):
+        helper = self._make_helper(monkeypatch)
+        loop = self._FakeLoop()
+
+        helper.publish_battery(loop)
+
+        # engagement must not depend on the battery ever having been online
+        assert helper.stale_serving is True
+        # the engagement must mark the battery offline so the fallback serves
+        assert helper.battery.online is False
+        # the aggregate's contract: a fallback-configured battery ALWAYS
+        # publishes temperature while stale-serving
+        assert helper.battery.get_value_from_fallback_sensor("Temperature") == 28.0
+        assert helper.battery.get_temperature() == 28.0
+        assert helper.battery.get_voltage() == 26.1
+        # no exit while the fallback is serving
+        assert loop.quit_called is False
