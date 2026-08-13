@@ -142,6 +142,19 @@ class DbusHelper:
         The ordinary disconnect timer starts from this moment — sequential
         with the stale phase, not concurrent.
         """
+        self.stale_cell_snapshot: list = None
+        """
+        Per-cell voltages captured at the moment stale serving engaged.
+        Basis for projecting live cell voltages from the fallback shunt voltage.
+        """
+        self.stale_projection_valid: bool = False
+        """
+        True while the fallback shunt delivers a live voltage that projects onto
+        the cell snapshot plausibly. Charging is only allowed during stale
+        serving while this is True and the projected cells are inside the safe zone.
+        """
+        self.stale_charge_blocked: bool = False
+        self.stale_discharge_blocked: bool = False
         self._dbusname: str = (
             "com.victronenergy.battery."
             + self.battery.port[self.battery.port.rfind("/") + 1 :]
@@ -954,6 +967,61 @@ class DbusHelper:
 
         return True
 
+    # re-entry margin for the safe-zone band checks (volts per cell): a direction
+    # blocked at a band edge is only re-allowed once the projected extreme is back
+    # inside the band by this margin, so chargers/inverter do not chatter at the edge
+    STALE_BAND_HYSTERESIS = 0.05
+
+    # maximum plausible per-cell delta between the snapshot and the projection
+    # (volts per cell): a larger delta means the shunt is not measuring this pack
+    # (series string, wrong pairing) and the projection must not be trusted
+    STALE_PROJECTION_MAX_DELTA = 0.3
+
+    def stale_take_cell_snapshot(self) -> None:
+        """
+        Capture the last-known per-cell voltages as the projection basis.
+        Leaves the snapshot as None (projection unavailable) if any cell is unread.
+        """
+        cell_count = self.battery.cell_count if self.battery.cell_count is not None else 0
+        cells = [cell.voltage for cell in self.battery.cells[:cell_count]]
+        self.stale_cell_snapshot = cells if cells and all(voltage is not None for voltage in cells) else None
+
+    def stale_project_cells(self, shunt_voltage):
+        """
+        Project per-cell voltages from the live fallback shunt voltage.
+
+        Series cells carry identical current, so the pack delta since the snapshot
+        is distributed evenly across the cells — the known imbalance is carried
+        forward instead of being erased by the sum.
+
+        :param shunt_voltage: live pack voltage from the fallback sensor
+        :return: projected per-cell voltages, or None if projection is not possible
+                 (no snapshot, no live shunt voltage, or an implausible delta)
+        """
+        if self.stale_cell_snapshot is None or shunt_voltage is None:
+            return None
+        delta_per_cell = (shunt_voltage - sum(self.stale_cell_snapshot)) / len(self.stale_cell_snapshot)
+        if abs(delta_per_cell) > self.STALE_PROJECTION_MAX_DELTA:
+            return None
+        return [voltage + delta_per_cell for voltage in self.stale_cell_snapshot]
+
+    def stale_update_band_flags(self, projected_min: float, projected_max: float) -> None:
+        """
+        Evaluate the projected cell extremes against the safe zone
+        (BLOCK_ON_DISCONNECT_VOLTAGE_MIN/MAX) with hysteresis:
+        above the zone charging is blocked, below the zone discharging is blocked,
+        inside the zone both are allowed.
+        """
+        if projected_max >= utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX:
+            self.stale_charge_blocked = True
+        elif projected_max < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX - self.STALE_BAND_HYSTERESIS:
+            self.stale_charge_blocked = False
+
+        if projected_min <= utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN:
+            self.stale_discharge_blocked = True
+        elif projected_min > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN + self.STALE_BAND_HYSTERESIS:
+            self.stale_discharge_blocked = False
+
     def stale_serving_eligible(self) -> bool:
         """
         Check if stale data serving can be entered after the BMS disconnected.
@@ -1043,6 +1111,10 @@ class DbusHelper:
                     logger.info(">>> Battery responds again, stop serving stale data <<<")
                 self.stale_clock_start = None
                 self.stale_concluded_at = None
+                self.stale_cell_snapshot = None
+                self.stale_projection_valid = False
+                self.stale_charge_blocked = False
+                self.stale_discharge_blocked = False
 
                 if self.error["count"] > 0:
                     seconds_since_first_error = int(time()) - self.error["timestamp_first"]
@@ -1187,6 +1259,11 @@ class DbusHelper:
                             # keep the last read values and serve V/I/T from the fallback sensor
                             self.stale_serving = True
                             self.stale_clock_start = time()
+                            # basis for projecting live cell voltages from the shunt
+                            self.stale_take_cell_snapshot()
+                            self.stale_projection_valid = False
+                            self.stale_charge_blocked = False
+                            self.stale_discharge_blocked = False
                             # mark the battery offline explicitly: on the never-online path
                             # (data only during init, dropped before any main-loop success)
                             # online is still None, and get_value_from_fallback_sensor only
@@ -1284,6 +1361,16 @@ class DbusHelper:
                         self.battery.state = 1  # Charging
                     else:
                         self.battery.state = 0  # Idle
+
+                # project per-cell voltages from the live shunt voltage and evaluate
+                # them against the safe zone: inside the zone charge and discharge are
+                # allowed, above it charging is blocked, below it discharging is blocked
+                projected_cells = self.stale_project_cells(self.battery.get_value_from_fallback_sensor("Voltage"))
+                self.stale_projection_valid = projected_cells is not None
+                if projected_cells is not None:
+                    for index, projected_voltage in enumerate(projected_cells):
+                        self.battery.cells[index].voltage = round(projected_voltage, 3)
+                    self.stale_update_band_flags(min(projected_cells), max(projected_cells))
 
             # publish all the data from the battery object to dbus
             self.publish_dbus()
@@ -1431,28 +1518,41 @@ class DbusHelper:
         if self.battery.control_discharge_current is not None:
             self._dbusservice["/Info/MaxDischargeCurrent"] = self.battery.control_discharge_current
 
-        # While serving stale data, block charging but keep discharging allowed:
-        # without live cell-level data the driver must not request further charging,
-        # while discharging is still safely monitored by the fallback sensor and
-        # the BMS's own cell-level protection.
+        # While serving stale data, allow charge/discharge based on the cell voltages
+        # projected from the live shunt voltage: inside the safe zone
+        # (BLOCK_ON_DISCONNECT_VOLTAGE_MIN/MAX) both are allowed with the last known
+        # limits, above it charging is blocked, below it discharging is blocked.
+        # Without a valid projection (no live shunt voltage, unread snapshot,
+        # implausible delta) charging is blocked entirely — the conservative default.
+        # These are reports, not cutoffs: the BMS's own protection does the actual
+        # disconnects.
+        stale_charge_mode = None
         if self.stale_serving:
-            self._dbusservice["/Info/MaxChargeCurrent"] = 0
-            self._dbusservice["/Io/AllowToCharge"] = 0
-            self._dbusservice["/System/NrOfModulesBlockingCharge"] = 1
-
-            # Report discharge as blocked when the live shunt voltage drops below the
-            # configured floor. Only meaningful with a fallback shunt delivering live
-            # voltage; without one there is nothing valid to compare. This is a report,
-            # not a cutoff: the BMS's own protection does the actual low-voltage disconnect.
-            if utils.FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE > 0:
-                shunt_voltage = self.battery.get_value_from_fallback_sensor("Voltage")
-                if shunt_voltage is not None and shunt_voltage < utils.FALLBACK_MIN_SHUNT_VOLTAGE_FOR_DISCHARGE:
+            if not self.stale_projection_valid:
+                stale_charge_mode = "Fallback - charging blocked (no cell projection)"
+                self._dbusservice["/Info/MaxChargeCurrent"] = 0
+                self._dbusservice["/Io/AllowToCharge"] = 0
+                self._dbusservice["/System/NrOfModulesBlockingCharge"] = 1
+            else:
+                if self.stale_charge_blocked:
+                    self._dbusservice["/Info/MaxChargeCurrent"] = 0
+                    self._dbusservice["/Io/AllowToCharge"] = 0
+                    self._dbusservice["/System/NrOfModulesBlockingCharge"] = 1
+                if self.stale_discharge_blocked:
                     self._dbusservice["/Info/MaxDischargeCurrent"] = 0
                     self._dbusservice["/Io/AllowToDischarge"] = 0
                     self._dbusservice["/System/NrOfModulesBlockingDischarge"] = 1
+                if self.stale_charge_blocked and self.stale_discharge_blocked:
+                    stale_charge_mode = "Fallback - charge and discharge blocked (projected cells outside safe zone)"
+                elif self.stale_charge_blocked:
+                    stale_charge_mode = "Fallback - charging blocked (projected cell above safe zone)"
+                elif self.stale_discharge_blocked:
+                    stale_charge_mode = "Fallback - discharging blocked (projected cell below safe zone)"
+                else:
+                    stale_charge_mode = "Fallback - operating on projected cells"
 
         # Voltage and charge control info (custom dbus paths)
-        self._dbusservice["/Info/ChargeMode"] = "Stale data - charging blocked" if self.stale_serving else self.battery.charge_mode
+        self._dbusservice["/Info/ChargeMode"] = stale_charge_mode if stale_charge_mode is not None else self.battery.charge_mode
         self._dbusservice["/Info/ChargeModeDebug"] = self.battery.charge_mode_debug
         self._dbusservice["/Info/ChargeModeDebugFloat"] = self.battery.charge_mode_debug_float
         self._dbusservice["/Info/ChargeModeDebugBulk"] = self.battery.charge_mode_debug_bulk
