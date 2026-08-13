@@ -51,17 +51,33 @@ class _CachedDbusProxy:
     remaining fully transparent for reads and method calls.
     """
 
-    __slots__ = ("_svc", "_cache")
+    __slots__ = ("_svc", "_cache", "_ctx")
 
     def __init__(self, svc):
         self._svc = svc
         self._cache: dict = {}
+        self._ctx = None
+
+    def __enter__(self):
+        # Batch mode: route writes through a velib ServiceContext so all
+        # changes of one cycle are emitted as a single ItemsChanged signal
+        # instead of one PropertiesChanged per path. Measured as the largest
+        # D-Bus signal source on a Cerbo during active charge/discharge.
+        self._ctx = self._svc.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self._ctx = None
+        return self._svc.__exit__(*exc)
 
     def __setitem__(self, path, value):
         prev = self._cache.get(path, _SENTINEL)
         if prev is not value and prev != value:
             self._cache[path] = value
-            self._svc[path] = value
+            if self._ctx is not None:
+                self._ctx[path] = value
+            else:
+                self._svc[path] = value
 
     def __getitem__(self, path):
         return self._svc[path]
@@ -1210,6 +1226,11 @@ class DbusHelper:
         """
         Publishes the battery data to dbus and refresh it.
         """
+        # Emit all of this cycle's changes as one batched ItemsChanged signal
+        with self._dbusservice:
+            self._publish_dbus_values()
+
+    def _publish_dbus_values(self) -> None:
         self._dbusservice["/System/NrOfCellsPerBattery"] = self.battery.cell_count
         if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
             self._dbusservice["/Soc"] = round(self.battery.soc_calc, 2) if self.battery.soc_calc is not None else None
