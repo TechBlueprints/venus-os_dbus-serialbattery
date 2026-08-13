@@ -113,6 +113,39 @@ class TestFallbackSensor:
         battery.online = False
         assert battery.get_value_from_fallback_sensor("Voltage") == 25.5
 
+    def test_fallback_soc_used_while_bms_offline(self, monkeypatch):
+        monkeypatch.setattr(utils, "SOC_CALCULATION", False)
+        battery = _make_battery()
+        battery.soc = 97.0
+        battery.online = False
+        battery.dbus_fallback_objects = {"Soc": _FakeDbusItem(93.4)}
+        assert battery.get_soc() == 93.4
+
+    def test_stale_bms_soc_served_when_no_fallback_soc_path(self, monkeypatch):
+        monkeypatch.setattr(utils, "SOC_CALCULATION", False)
+        battery = _make_battery()
+        battery.soc = 97.0
+        battery.online = False
+        battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(25.5)}
+        assert battery.get_soc() == 97.0
+
+    def test_capacity_remain_derived_from_soc_while_offline(self, monkeypatch):
+        monkeypatch.setattr(utils, "SOC_CALCULATION", False)
+        battery = _make_battery()
+        battery.online = False
+        battery.capacity = 300.0
+        battery.soc_calc = 93.4
+        battery.capacity_remain = 291.0  # frozen BMS value must not win while offline
+        assert battery.get_capacity_remain() == 300.0 * 93.4 / 100
+
+    def test_capacity_remain_uses_bms_value_while_online(self, monkeypatch):
+        monkeypatch.setattr(utils, "SOC_CALCULATION", False)
+        battery = _make_battery()
+        battery.capacity = 300.0
+        battery.soc_calc = 97.0
+        battery.capacity_remain = 291.0
+        assert battery.get_capacity_remain() == 291.0
+
 
 class TestStaleServingEligible:
     def _make_helper(self, monkeypatch, fallback_objects, minutes=480.0, block_on_disconnect=False, cell_voltages_good=None):

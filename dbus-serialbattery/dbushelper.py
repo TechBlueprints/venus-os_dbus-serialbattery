@@ -1080,6 +1080,7 @@ class DbusHelper:
                 utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is not None
                 or utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT is not None
                 or utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE is not None
+                or utils.FALLBACK_SENSOR_DBUS_PATH_SOC is not None
             ):
                 # Check if fallback sensor was and is still connected
                 if self.battery.dbus_fallback_objects is not None and fallback_device not in get_bus(self._dbusname).list_names():
@@ -1340,9 +1341,19 @@ class DbusHelper:
                         recovery_failed = True
 
             # while serving stale data, refresh the calculated values so that
-            # voltage/current/power/temperature update live from the fallback sensor
+            # voltage/current/power/temperature/SoC update live from the fallback sensor
             if not result and self.stale_serving:
                 self.battery.set_calculated_data()
+
+                # derive the battery state from the live fallback current instead of
+                # freezing the last BMS-reported state (same thresholds as the online path)
+                if self.battery.current_calc is not None:
+                    if self.battery.current_calc < -0.5:
+                        self.battery.state = 2  # Discharging
+                    elif self.battery.current_calc > 0.5:
+                        self.battery.state = 1  # Charging
+                    else:
+                        self.battery.state = 0  # Idle
 
             # publish all the data from the battery object to dbus
             self.publish_dbus()
