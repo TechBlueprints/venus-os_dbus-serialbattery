@@ -692,6 +692,28 @@ class DbusHelper:
         self._dbusservice.add_path("/ErrorCode", self.battery.error_code, writeable=True)
         self._dbusservice.add_path("/ConnectionInformation", "")
 
+        # ── Measurement-graph declarations ────────────────────────────────
+        # Make the measurement topology explicit on D-Bus so summing
+        # consumers (e.g. a virtual DC system service) can deduplicate
+        # overlapping monitors without name heuristics:
+        #   Kind            direct = own sensors (this BMS); derived would
+        #                   be an aggregator re-publishing other services
+        #   PhysicalDevice  opaque ID of the physical battery this service
+        #                   observes (one ID per pack; any other service
+        #                   declaring the same ID measures the same pack)
+        #   PeerServices    other DIRECT observers of the same physical
+        #                   device — declared here because Victron-driver
+        #                   services (SmartShunts) cannot declare themselves
+        #   LineAuthority   the observer best suited for line V/I (the
+        #                   shunt); consumers should prefer it for power
+        #                   sums while it is alive
+        self._dbusservice.add_path("/Measurement/Kind", "direct")
+        self._dbusservice.add_path("/Measurement/PhysicalDevice", "battery:" + self.bms_id)
+        fallback_device = self.battery.get_fallback_sensor_device()
+        if fallback_device is not None:
+            self._dbusservice.add_path("/Measurement/PeerServices", fallback_device)
+            self._dbusservice.add_path("/Measurement/LineAuthority", fallback_device)
+
         # Create static battery info
         self._dbusservice.add_path(
             "/Info/BatteryLowVoltage",
