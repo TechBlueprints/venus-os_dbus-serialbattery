@@ -1178,11 +1178,15 @@ class DbusHelper:
 
                     # check if the cell voltages are good to go for some minutes
                     if self.cell_voltages_good is None:
+                        # unread cell voltages (None) count as not-good: without cell data
+                        # there is no basis to run blind past the recovery window
+                        min_cell_voltage = self.battery.get_min_cell_voltage()
+                        max_cell_voltage = self.battery.get_max_cell_voltage()
                         self.cell_voltages_good = (
-                            True
-                            if self.battery.get_min_cell_voltage() > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN
-                            and self.battery.get_max_cell_voltage() < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX
-                            else False
+                            min_cell_voltage is not None
+                            and max_cell_voltage is not None
+                            and min_cell_voltage > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN
+                            and max_cell_voltage < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX
                         )
 
                     # set disconnect threshold time
@@ -1213,28 +1217,41 @@ class DbusHelper:
                                     + ("" if self.cell_voltages_good else " NOT")
                                     + " in a safe threshold to proceed with charging/discharging without communication to the battery."
                                 )
+                                min_cell_voltage = self.battery.get_min_cell_voltage()
+                                max_cell_voltage = self.battery.get_max_cell_voltage()
                                 logger.error(
                                     "    |- "
-                                    + f"Min cell voltage: {self.battery.get_min_cell_voltage():.3f} > "
+                                    + f"Min cell voltage: {'unread' if min_cell_voltage is None else f'{min_cell_voltage:.3f}'} > "
                                     + f"Min Threshold: {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN:.3f} --> "
-                                    + ("OK" if self.battery.get_min_cell_voltage() > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN else "NOT OK")
+                                    + ("OK" if min_cell_voltage is not None and min_cell_voltage > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN else "NOT OK")
                                 )
                                 logger.error(
                                     "    |- "
-                                    + f"Max cell voltage: {self.battery.get_max_cell_voltage():.3f} < "
+                                    + f"Max cell voltage: {'unread' if max_cell_voltage is None else f'{max_cell_voltage:.3f}'} < "
                                     + f"Max threshold: {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX:.3f} --> "
-                                    + ("OK" if self.battery.get_max_cell_voltage() < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX else "NOT OK")
+                                    + ("OK" if max_cell_voltage is not None and max_cell_voltage < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX else "NOT OK")
                                 )
 
-                            if self.stale_serving_eligible():
-                                # keep the last read values and serve V/I/T from the fallback sensor
-                                self.stale_serving = True
-                                logger.warning(
-                                    "    Serving stale data instead of resetting values: voltage/current/temperature live from the "
-                                    + f"fallback sensor, other values frozen for up to {utils.FALLBACK_SERVE_STALE_MINUTES:.0f} minutes."
-                                )
-                            else:
+                            if not self.stale_serving_eligible():
                                 self.battery.init_values()
+
+                        # engage stale data serving on eligibility alone, outside the
+                        # online/cleared gate: a driver that got its data during init and
+                        # dropped before any main-loop success never passes that gate, and
+                        # must not fall through to the 60 s cell-voltage exit below
+                        if not self.stale_serving and self.stale_serving_eligible():
+                            # keep the last read values and serve V/I/T from the fallback sensor
+                            self.stale_serving = True
+                            # mark the battery offline explicitly: on the never-online path
+                            # (data only during init, dropped before any main-loop success)
+                            # online is still None, and get_value_from_fallback_sensor only
+                            # serves when online is False — without this the fallback would
+                            # silently serve nothing while the log promises live V/I/T
+                            self.battery.online = False
+                            logger.warning(
+                                "    Serving stale data instead of resetting values: voltage/current/temperature live from the "
+                                + f"fallback sensor, other values frozen for up to {utils.FALLBACK_SERVE_STALE_MINUTES:.0f} minutes."
+                            )
 
                     # set connection info
                     remaining = self.disconnect_threshold - time_since_first_error
