@@ -1812,6 +1812,11 @@ class Battery(ABC):
         """
         if utils.SOC_CALCULATION and self.capacity is not None and self.soc_calc is not None:
             return self.capacity * self.soc_calc / 100
+        # while the BMS is offline, derive from soc_calc so Capacity and ConsumedAmphours
+        # stay consistent with the served SoC (live from the fallback sensor if configured)
+        # instead of the frozen BMS-reported remaining capacity
+        if self.online is False and self.capacity is not None and self.soc_calc is not None:
+            return self.capacity * self.soc_calc / 100
         if self.capacity_remain is not None:
             return self.capacity_remain
         if self.capacity is not None and self.soc_calc is not None:
@@ -2271,6 +2276,14 @@ class Battery(ABC):
                         utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE,
                     )
 
+                if utils.FALLBACK_SENSOR_DBUS_PATH_SOC is not None:
+                    logger.info(f"Using fallback sensor for SOC: {device}{utils.FALLBACK_SENSOR_DBUS_PATH_SOC}")
+                    dbus_objects["Soc"] = VeDbusItemImport(
+                        dbus_connection,
+                        device,
+                        utils.FALLBACK_SENSOR_DBUS_PATH_SOC,
+                    )
+
                 self.dbus_fallback_objects = dbus_objects
 
         except Exception:
@@ -2279,6 +2292,7 @@ class Battery(ABC):
             utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE = None
             utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT = None
             utils.FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE = None
+            utils.FALLBACK_SENSOR_DBUS_PATH_SOC = None
             self.dbus_fallback_objects = None
             (
                 exception_type,
@@ -2429,12 +2443,17 @@ class Battery(ABC):
             soc_external = round(self.dbus_external_objects["Soc"].get_value(), 3)
             logger.debug(f"soc: {self.soc} - soc_external: {soc_external}")
             return soc_external
+
+        # get fallback sensor value, if the BMS is offline
+        soc_fallback = self.get_value_from_fallback_sensor("Soc")
+        if soc_fallback is not None:
+            return round(soc_fallback, 3)
+
         # get calculated value
-        elif utils.SOC_CALCULATION:
+        if utils.SOC_CALCULATION:
             return self.soc_calculation()
         # get value from battery
-        else:
-            return self.soc
+        return self.soc
 
     def set_calculated_data(self) -> None:
         """
