@@ -2232,7 +2232,7 @@ class Battery(ABC):
         Setup fallback sensor and it's dbus items.
 
         Unlike the external sensor, which always overrides the BMS values, the fallback
-        sensor is only read while the connection to the BMS is lost (stale data serving).
+        sensor is only read while the connection to the BMS is lost (fallback mode).
         """
         import dbus
         import os
@@ -2243,7 +2243,7 @@ class Battery(ABC):
         try:
             device = self.get_fallback_sensor_device()
             if device is None:
-                logger.warning("No fallback sensor device configured for this battery, stale data serving not available")
+                logger.warning("No fallback sensor device configured for this battery, fallback mode not available")
                 return
 
             DBusGMainLoop(set_as_default=True)
@@ -2294,7 +2294,7 @@ class Battery(ABC):
                 self.dbus_fallback_objects = dbus_objects
 
         except Exception:
-            # set to None to avoid crashing, no stale serving without fallback sensor
+            # set to None to avoid crashing, no fallback mode without fallback sensor
             utils.FALLBACK_SENSOR_DBUS_DEVICE = None
             utils.FALLBACK_SENSOR_DBUS_PATH_VOLTAGE = None
             utils.FALLBACK_SENSOR_DBUS_PATH_CURRENT = None
@@ -2309,7 +2309,7 @@ class Battery(ABC):
             file = exception_traceback.tb_frame.f_code.co_filename
             line = exception_traceback.tb_lineno
             logger.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
-            logger.error("Fallback sensor setup failed, stale data serving not available")
+            logger.error("Fallback sensor setup failed, fallback mode not available")
 
     def get_value_from_fallback_sensor(self, key: str) -> Union[float, None]:
         """
