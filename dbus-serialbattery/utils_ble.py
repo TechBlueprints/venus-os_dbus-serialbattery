@@ -1,5 +1,6 @@
 import threading
 import asyncio
+import time
 import subprocess
 import sys
 from bleak import BleakClient
@@ -163,7 +164,11 @@ class BCMBackend(BleConnectionBackend):
             from dbus_fast.aio import MessageBus
             from dbus_fast.constants import BusType, MessageType
 
-            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            # the bus connect itself must be guarded too: any unguarded await
+            # in this path can park the BLE daemon coroutine forever if D-Bus
+            # stalls (observed in production: reconnect loop silent for hours
+            # while the fallback sensor made the outage invisible)
+            bus = await asyncio.wait_for(MessageBus(bus_type=BusType.SYSTEM).connect(), timeout=10.0)
             try:
                 reply = await asyncio.wait_for(
                     bus.call(
@@ -235,7 +240,10 @@ class BCMBackend(BleConnectionBackend):
                     try:
                         from bleak_connection_manager.bluez import remove_device
 
-                        await remove_device(address, found_adapter)
+                        # timeout-guarded: an unguarded remove_device await parked
+                        # the reconnect loop for 4 hours in production when its
+                        # D-Bus reply never arrived
+                        await asyncio.wait_for(remove_device(address, found_adapter), timeout=15.0)
                     except Exception:
                         pass
                     device = None
@@ -369,9 +377,18 @@ class Syncron_Ble:
         logger.error(f"bluetooh device with address: {self.address} disconnected")
 
     async def connect_to_bms(self, address):
+        # reconnect-liveness heartbeat, see supervision check in dbushelper
+        self.last_connect_cycle = time.time()
         self.client = self.backend.create_client(address, self.client_disconnected)
         try:
-            self.client = await self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback)
+            # outer belt-and-braces timeout: the backend's internal timeouts
+            # should always fire first, but no single stalled await may ever
+            # park the reconnect daemon loop permanently (observed in
+            # production: one unguarded D-Bus await silenced reconnection for
+            # hours while the fallback sensor made the outage invisible)
+            self.client = await asyncio.wait_for(
+                self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback), timeout=300.0
+            )
 
         except Exception as e:
             logger.error("Failed when trying to connect", e)

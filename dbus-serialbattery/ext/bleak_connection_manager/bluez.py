@@ -29,6 +29,23 @@ _PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
 _OBJECT_MANAGER_INTERFACE = "org.freedesktop.DBus.ObjectManager"
 
 
+# Hard deadline for every BlueZ D-Bus interaction in this module: a stalled
+# reply must never park the caller's coroutine (observed in production: an
+# unguarded await silenced a battery driver's reconnect loop for hours).
+_DBUS_CALL_TIMEOUT = 15.0
+_DBUS_BUS_TIMEOUT = 10.0
+
+
+async def _timed_get_bus():
+    from .dbus_bus import get_bus
+
+    return await asyncio.wait_for(get_bus(), timeout=_DBUS_BUS_TIMEOUT)
+
+
+async def _timed_call(bus, message, timeout: float = _DBUS_CALL_TIMEOUT):
+    return await asyncio.wait_for(bus.call(message), timeout=timeout)
+
+
 def address_to_bluez_path(address: str, adapter: str = "hci0") -> str:
     """Convert a BLE address + adapter to a BlueZ D-Bus object path.
 
@@ -63,8 +80,8 @@ async def _get_device_properties(
     path = address_to_bluez_path(address, adapter)
 
     try:
-        bus = await get_bus()
-        reply = await bus.call(
+        bus = await _timed_get_bus()
+        reply = await _timed_call(bus, 
             Message(
                 destination=_BLUEZ_SERVICE,
                 path=path,
@@ -151,8 +168,8 @@ async def remove_device(address: str, adapter: str = "hci0") -> bool:
     device_path = address_to_bluez_path(address, adapter)
 
     try:
-        bus = await get_bus()
-        reply = await bus.call(
+        bus = await _timed_get_bus()
+        reply = await _timed_call(bus, 
             Message(
                 destination=_BLUEZ_SERVICE,
                 path=adapter_path,
@@ -199,8 +216,8 @@ async def disconnect_device(address: str, adapter: str = "hci0") -> bool:
     path = address_to_bluez_path(address, adapter)
 
     try:
-        bus = await get_bus()
-        reply = await bus.call(
+        bus = await _timed_get_bus()
+        reply = await _timed_call(bus, 
             Message(
                 destination=_BLUEZ_SERVICE,
                 path=path,
@@ -330,8 +347,8 @@ async def get_adapter_discovering(adapter: str) -> bool | None:
     adapter_path = f"/org/bluez/{adapter}"
 
     try:
-        bus = await get_bus()
-        reply = await bus.call(
+        bus = await _timed_get_bus()
+        reply = await _timed_call(bus, 
             Message(
                 destination=_BLUEZ_SERVICE,
                 path=adapter_path,
@@ -369,8 +386,8 @@ async def _get_adapter_powered(adapter: str) -> bool | None:
         return None
 
     try:
-        bus = await get_bus()
-        reply = await bus.call(
+        bus = await _timed_get_bus()
+        reply = await _timed_call(bus, 
             Message(
                 destination=_BLUEZ_SERVICE,
                 path=f"/org/bluez/{adapter}",
@@ -408,8 +425,8 @@ async def _set_adapter_powered(adapter: str, powered: bool) -> bool:
         return False
 
     try:
-        bus = await get_bus()
-        reply = await bus.call(
+        bus = await _timed_get_bus()
+        reply = await _timed_call(bus, 
             Message(
                 destination=_BLUEZ_SERVICE,
                 path=f"/org/bluez/{adapter}",
@@ -687,8 +704,8 @@ async def try_stop_discovery(adapter: str) -> bool:
     adapter_path = f"/org/bluez/{adapter}"
 
     try:
-        bus = await get_bus()
-        reply = await bus.call(
+        bus = await _timed_get_bus()
+        reply = await _timed_call(bus, 
             Message(
                 destination=_BLUEZ_SERVICE,
                 path=adapter_path,
@@ -739,8 +756,8 @@ async def get_connected_devices(adapter: str) -> list[str]:
     adapter_prefix = f"/org/bluez/{adapter}/"
 
     try:
-        bus = await get_bus()
-        reply = await bus.call(
+        bus = await _timed_get_bus()
+        reply = await _timed_call(bus, 
             Message(
                 destination=_BLUEZ_SERVICE,
                 path="/",
@@ -805,9 +822,9 @@ async def _probe_start_discovery(adapter: str) -> bool | None:
     adapter_path = f"/org/bluez/{adapter}"
 
     try:
-        bus = await get_bus()
+        bus = await _timed_get_bus()
 
-        reply = await bus.call(
+        reply = await _timed_call(bus, 
             Message(
                 destination=_BLUEZ_SERVICE,
                 path=adapter_path,
@@ -829,7 +846,7 @@ async def _probe_start_discovery(adapter: str) -> bool | None:
             return None
 
         # Probe succeeded — adapter is clean.  Stop our test session.
-        stop_reply = await bus.call(
+        stop_reply = await _timed_call(bus, 
             Message(
                 destination=_BLUEZ_SERVICE,
                 path=adapter_path,

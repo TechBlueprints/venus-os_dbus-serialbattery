@@ -1276,6 +1276,18 @@ class DbusHelper:
                     fallback_alive = False
                     if self.stale_serving:
                         fallback_alive = self.battery.get_value_from_fallback_sensor("Voltage") is not None
+                        # reconnect-machinery liveness: while serving fallback data the
+                        # BLE daemon must keep attempting reconnects. If its heartbeat
+                        # stops advancing, a stalled await has parked the loop (observed
+                        # in production: 4 h of silence, invisible behind healthy
+                        # fallback data) — exit so the supervisor restarts the driver.
+                        last_cycle = getattr(getattr(self.battery, "ble_handle", None), "last_connect_cycle", None)
+                        if last_cycle is not None and time() - last_cycle > 600:
+                            logger.error(
+                                ">>> Reconnect machinery stalled: no BLE connect attempt completed in "
+                                + f"{time() - last_cycle:.0f}s while serving fallback data. Exiting so the driver restarts. <<<"
+                            )
+                            recovery_failed = True
                         if fallback_alive:
                             self.stale_clock_start = time()
                         elif time() - self.stale_clock_start >= utils.FALLBACK_SERVE_STALE_MINUTES * 60:

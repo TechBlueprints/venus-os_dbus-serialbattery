@@ -80,9 +80,21 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
             self.response_event.set()
 
     async def connect_to_bms(self, address):
+        # reconnect-liveness heartbeat: stamped at every attempt start and end.
+        # If this stops advancing while the driver serves fallback data, the
+        # reconnect machinery itself is parked (not the BMS being away) and
+        # the supervision layer must treat that as a driver failure.
+        self.last_connect_cycle = time.time()
         self.client = self.backend.create_client(address, self.client_disconnected)
         try:
-            self.client = await self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback)
+            # outer belt-and-braces timeout: the backend's internal timeouts
+            # should always fire first, but no single stalled await may ever
+            # park the reconnect daemon loop permanently (observed in
+            # production: one unguarded D-Bus await silenced reconnection for
+            # hours while the fallback sensor made the outage invisible)
+            self.client = await asyncio.wait_for(
+                self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback), timeout=300.0
+            )
             self.feed_watchdog()
             self.connected = True
         except Exception as e:
@@ -99,9 +111,10 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
                         await asyncio.sleep(0.1)
             finally:
                 self.connected = False
+                self.last_connect_cycle = time.time()
                 if self.client:
                     try:
-                        await self.backend.release(self.client)
+                        await asyncio.wait_for(self.backend.release(self.client), timeout=30.0)
                     except Exception:
                         pass
 
