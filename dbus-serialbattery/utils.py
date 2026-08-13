@@ -277,30 +277,21 @@ BLOCK_ON_DISCONNECT_VOLTAGE_MAX: float = get_float_from_config("DEFAULT", "BLOCK
 
 # make some checks for most common misconfigurations
 if not BLOCK_ON_DISCONNECT:
-    # With a fallback device configured, the band is the three-zone operating
-    # band compared against PROJECTED cell voltages during an outage, and may
-    # legitimately extend beyond the charge envelope (e.g. above
-    # MAX_CELL_VOLTAGE so a full pack at float stays in-band and charging
-    # keeps working through connection blips). Only guard against outright
-    # typos there; the BMS's own protection acts independently either way.
-    _fallback_configured = bool(config["DEFAULT"].get("FALLBACK_SENSOR_DBUS_DEVICE", "").strip())
-    _band_min_floor = 0.5 if _fallback_configured else MIN_CELL_VOLTAGE
-    _band_max_ceiling = 5.0 if _fallback_configured else MAX_CELL_VOLTAGE
-    if BLOCK_ON_DISCONNECT_VOLTAGE_MIN < _band_min_floor:
+    if BLOCK_ON_DISCONNECT_VOLTAGE_MIN < MIN_CELL_VOLTAGE:
         check_config_issue(
             True,
-            f"BLOCK_ON_DISCONNECT_VOLTAGE_MIN ({BLOCK_ON_DISCONNECT_VOLTAGE_MIN} V) is below the allowed minimum ({_band_min_floor} V). "
-            "To ensure that the driver still works correctly, BLOCK_ON_DISCONNECT_VOLTAGE_MIN was raised. Please check the configuration.",
+            f"BLOCK_ON_DISCONNECT_VOLTAGE_MIN ({BLOCK_ON_DISCONNECT_VOLTAGE_MIN} V) is less than MIN_CELL_VOLTAGE ({MIN_CELL_VOLTAGE} V). "
+            "To ensure that the driver still works correctly, BLOCK_ON_DISCONNECT_VOLTAGE_MIN was set to MIN_CELL_VOLTAGE. Please check the configuration.",
         )
-        BLOCK_ON_DISCONNECT_VOLTAGE_MIN = _band_min_floor
+        BLOCK_ON_DISCONNECT_VOLTAGE_MIN = MIN_CELL_VOLTAGE
 
-    if BLOCK_ON_DISCONNECT_VOLTAGE_MAX > _band_max_ceiling:
+    if BLOCK_ON_DISCONNECT_VOLTAGE_MAX > MAX_CELL_VOLTAGE:
         check_config_issue(
             True,
-            f"BLOCK_ON_DISCONNECT_VOLTAGE_MAX ({BLOCK_ON_DISCONNECT_VOLTAGE_MAX} V) is above the allowed maximum ({_band_max_ceiling} V). "
-            "To ensure that the driver still works correctly, BLOCK_ON_DISCONNECT_VOLTAGE_MAX was lowered. Please check the configuration.",
+            f"BLOCK_ON_DISCONNECT_VOLTAGE_MAX ({BLOCK_ON_DISCONNECT_VOLTAGE_MAX} V) is greater than MAX_CELL_VOLTAGE ({MAX_CELL_VOLTAGE} V). "
+            "To ensure that the driver still works correctly, BLOCK_ON_DISCONNECT_VOLTAGE_MAX was set to MAX_CELL_VOLTAGE. Please check the configuration.",
         )
-        BLOCK_ON_DISCONNECT_VOLTAGE_MAX = _band_max_ceiling
+        BLOCK_ON_DISCONNECT_VOLTAGE_MAX = MAX_CELL_VOLTAGE
 
     if BLOCK_ON_DISCONNECT_VOLTAGE_MIN >= BLOCK_ON_DISCONNECT_VOLTAGE_MAX:
         check_config_issue(
