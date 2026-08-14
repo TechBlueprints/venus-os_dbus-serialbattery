@@ -448,14 +448,21 @@ class Syncron_Ble:
         self.ble_async_thread_event_loop = asyncio.get_event_loop()
         self.ble_async_thread_ready.set()
 
-        # Wait a beat between connection attempts. Continuous 1s retry
-        # against a device that is away hammers a recovering BMS (observed
-        # live: 220 failed attempts in one 4-minute recovery) and sustained
-        # scan churn can wedge the adapter's discovery state. Five seconds
-        # keeps reconnects prompt while giving the BMS room to breathe.
+        # Space out connection attempts: 1s, 3s, then steady 6s. The first
+        # retry stays instant-ish for ordinary blips; the 6s cruise stops
+        # the continuous hammering that produced 220-attempt recovery
+        # storms and wedged adapter discovery state. A session that held
+        # for over a minute resets the ramp.
+        backoff = [1, 3, 6]
+        failures = 0
         while self.main_thread.is_alive():
+            attempt_started = time.time()
             await self.connect_to_bms(self.address)
-            await asyncio.sleep(5)
+            if time.time() - attempt_started > 60.0:
+                failures = 0
+            else:
+                failures = min(failures + 1, len(backoff) - 1)
+            await asyncio.sleep(backoff[failures])
 
     def client_disconnected(self, client):
         logger.error(f"bluetooh device with address: {self.address} disconnected")
