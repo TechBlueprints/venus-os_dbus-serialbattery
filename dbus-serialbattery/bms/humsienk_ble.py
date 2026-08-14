@@ -154,7 +154,6 @@ class HumsiENK_Ble(Battery):
         self._min_response_len = 5  # Minimum: [0xAA, CMD, LEN, CHK_LO, CHK_HI] = 5 bytes (zero data)
         self._last_frame_time = 0.0
         self._last_trigger_time = 0.0  # Unified polling timer (all cmds every 3s)
-        self._last_hello = 0.0  # Periodic session-refresh handshake (every 60s)
         self._last_heartbeat_log = 0.0
         self._last_stale_log = 0.0
         self._last_update_log_time = 0.0
@@ -710,7 +709,6 @@ class HumsiENK_Ble(Battery):
                         handshake_cmd = self._build_command(self.CMD_HANDSHAKE, [])
                         self.ble_handle.send_data(handshake_cmd)
                         self._last_handshake_resend = now
-                        self._last_hello = now
                     except Exception as e:
                         logger.warning(f"HumsiENK: Handshake resend failed: {e}")
 
@@ -721,19 +719,6 @@ class HumsiENK_Ble(Battery):
                 # The ~3s silence between bursts mirrors the app's overall cadence.
                 if ble_connected and (now - self._last_trigger_time) >= 3.0:
                     self._last_trigger_time = now
-                    # Periodic session refresh: repeat the connect-time hello
-                    # (0x00) once a minute ahead of the data poll. The BMS
-                    # needs this hello to start answering after connect and
-                    # after some wobbles - refreshing it proactively tests
-                    # whether its session state decays between hellos.
-                    if (now - self._last_hello) >= 60.0:
-                        self._last_hello = now
-                        try:
-                            logger.debug("HumsiENK: TX 0x00 (periodic hello)")
-                            cmd = self._build_command(self.CMD_HANDSHAKE, [])
-                            self.ble_handle.send_data(cmd)
-                        except Exception as e:
-                            logger.warning(f"HumsiENK: Periodic hello failed: {e}")
                     # 0x21 — battery info (voltage, current, SOC, temps)
                     try:
                         logger.debug("HumsiENK: TX 0x21")
