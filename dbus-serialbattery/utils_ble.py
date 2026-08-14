@@ -300,14 +300,8 @@ class BCMBackend(BleConnectionBackend):
                 logger.info(f"BLE [{address}] connected on preferred adapter {adapters[0]} via ConnectDevice")
                 device = BLEDevice(address=address, name=None, details={"path": path, "props": {}})
                 connect_adapters = [adapters[0]]
-        # Pinned devices never scan: the MAC and adapter are both known, so
-        # discovery adds nothing a direct ConnectDevice doesn't — and during
-        # an outage the scan fallback just burns radio time and churns the
-        # adapter's discovery state (observed wedged after hours of retries).
-        # Absent devices are simply retried by the reconnect loop's pacing.
-        pinned = bool(adapters_for(address))
         try:
-            if device is None and not pinned:
+            if device is None:
                 device = await bcm_find_device(address, timeout=15.0, max_attempts=2, adapters=adapters)
         except Exception as e:
             logger.warning(f"BLE [{address}] managed scan failed: {repr(e)}")
