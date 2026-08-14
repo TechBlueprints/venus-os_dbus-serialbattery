@@ -717,7 +717,7 @@ class HumsiENK_Ble(Battery):
                 # can't block the GLib main loop with time.sleep().  Instead, send
                 # all three commands back-to-back — the BMS handles this fine.
                 # The ~3s silence between bursts mirrors the app's overall cadence.
-                if ble_connected and (now - self._last_trigger_time) >= 3.0:
+                if ble_connected and (now - self._last_trigger_time) >= 5.0:
                     self._last_trigger_time = now
                     # 0x21 — battery info (voltage, current, SOC, temps)
                     try:
