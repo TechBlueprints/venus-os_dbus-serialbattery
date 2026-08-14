@@ -1538,10 +1538,16 @@ class DbusHelper:
         fallback_charge_mode = None
         if self.fallback_mode:
             if not self.fallback_projection_valid:
-                fallback_charge_mode = "Fallback - charging blocked (no cell projection)"
-                self._dbusservice["/Info/MaxChargeCurrent"] = 0
-                self._dbusservice["/Io/AllowToCharge"] = 0
-                self._dbusservice["/System/NrOfModulesBlockingCharge"] = 1
+                # No cell projection (e.g. the driver restarted mid-outage and
+                # never read cells this process lifetime). Zeroing the limits
+                # here propagated bank-wide: the aggregate went strict, the
+                # Multi raised "BMS connection lost", and the whole bank showed
+                # charging/discharging not allowed - a system outage caused by
+                # our conservatism, not by any battery fault (observed live).
+                # These are reports, not cutoffs: the BMS's own protection does
+                # the disconnects, and the live shunt still watches the pack.
+                # Keep the configured limits and say so.
+                fallback_charge_mode = "Fallback - no cell projection (limits unchanged, BMS self-protects)"
             elif not self.fallback_zone_configured():
                 fallback_charge_mode = "Fallback - charging blocked (no safe zone configured)"
                 self._dbusservice["/Info/MaxChargeCurrent"] = 0
