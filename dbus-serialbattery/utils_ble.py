@@ -6,7 +6,50 @@ import sys
 from bleak import BleakClient
 from bleak.exc import BleakCharacteristicNotFoundError
 from time import sleep
-from utils import logger, BLUETOOTH_ADAPTERS, BLUETOOTH_CONNECTION_BACKEND, BLUETOOTH_FORCE_RESET_BLE_STACK, capture_raw_data
+from utils import (
+    logger,
+    BLUETOOTH_ADAPTERS,
+    BLUETOOTH_CONNECTION_BACKEND,
+    BLUETOOTH_FORCE_RESET_BLE_STACK,
+    BLUETOOTH_SUPERVISION_TIMEOUT,
+    capture_raw_data,
+)
+
+
+def apply_supervision_timeout(address, adapters=None):
+    """
+    Raise the LE link supervision timeout of a just-established connection via
+    an HCI connection parameter update (central-initiated, no peripheral
+    consent needed). The kernel builds every LE Create Connection with its
+    420 ms default on this platform - even with the hci debugfs override set -
+    and 420 ms means any sub-second radio noise burst kills the link. A longer
+    deadline lets the link ride bursts out; a genuinely absent BMS is still
+    detected by the driver's own polling. No-op when
+    BLUETOOTH_SUPERVISION_TIMEOUT is 0.
+    """
+    if not BLUETOOTH_SUPERVISION_TIMEOUT:
+        return
+    mac = str(address).upper()
+    for adapter in adapters or BLUETOOTH_ADAPTERS or ["hci0"]:
+        try:
+            con = subprocess.run(["hcitool", "-i", adapter, "con"], capture_output=True, text=True, timeout=5)
+            for line in con.stdout.splitlines():
+                if mac in line.upper() and " handle " in line:
+                    handle = line.split(" handle ")[1].split()[0]
+                    upd = subprocess.run(
+                        ["hcitool", "-i", adapter, "lecup", "--handle", handle, "--min", "24", "--max", "40", "--latency", "0", "--timeout", str(BLUETOOTH_SUPERVISION_TIMEOUT)],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if upd.returncode == 0:
+                        logger.info(f"BLE [{address}] supervision timeout set to {BLUETOOTH_SUPERVISION_TIMEOUT * 10} ms (handle {handle} on {adapter})")
+                    else:
+                        logger.warning(f"BLE [{address}] supervision timeout update failed on {adapter}: {upd.stderr.strip() or upd.stdout.strip()}")
+                    return
+        except Exception as e:
+            logger.warning(f"BLE [{address}] supervision timeout update errored on {adapter}: {repr(e)}")
+    logger.warning(f"BLE [{address}] supervision timeout update skipped: no live handle found")
 
 
 class BleConnectionBackend:
@@ -80,6 +123,8 @@ class BleakBackend(BleConnectionBackend):
                     client._backend.services = None
                     await client._backend._get_services()
                     await asyncio.sleep(0.5)
+            adapters = [self.current_adapter] if self.current_adapter else None
+            await asyncio.get_event_loop().run_in_executor(None, apply_supervision_timeout, address, adapters)
         except Exception:
             # rotate to the next configured adapter for the next attempt
             if BLUETOOTH_ADAPTERS:
@@ -299,6 +344,7 @@ class BCMBackend(BleConnectionBackend):
             except Exception:
                 pass
             raise
+        await asyncio.get_event_loop().run_in_executor(None, apply_supervision_timeout, address, connect_adapters or adapters)
         return client
 
     async def release(self, client):

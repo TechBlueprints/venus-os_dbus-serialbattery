@@ -265,6 +265,9 @@ BLUETOOTH_CONNECTION_BACKEND: str = config["DEFAULT"]["BLUETOOTH_CONNECTION_BACK
 # Bluetooth adapters (hciX) to use for BLE BMS connections, tried in order.
 # Empty list = use the system default adapter.
 BLUETOOTH_ADAPTERS: List[str] = get_list_from_config("DEFAULT", "BLUETOOTH_ADAPTERS", str)
+# LE link supervision timeout applied to each established BMS connection,
+# in 10 ms units (2000 = 20 s). 0 leaves the kernel default (420 ms) in place.
+BLUETOOTH_SUPERVISION_TIMEOUT: int = int(get_float_from_config("DEFAULT", "BLUETOOTH_SUPERVISION_TIMEOUT", 0))
 
 # --------- Daisy Chain Configuration (Multiple BMS on one cable) ---------
 BATTERY_ADDRESSES: list = get_list_from_config("DEFAULT", "BATTERY_ADDRESSES", str)
