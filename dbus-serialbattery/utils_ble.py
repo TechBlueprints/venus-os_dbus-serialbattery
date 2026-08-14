@@ -16,6 +16,33 @@ from utils import (
 )
 
 
+def _parse_adapter_pins():
+    """
+    BLUETOOTH_ADAPTERS entries of the form MAC@hciX pin that device to exactly
+    that adapter (no rotation, no fallback to other adapters); plain hciX
+    entries form the shared pool for unpinned devices. Returns (pins, pool).
+    """
+    pins = {}
+    pool = []
+    for entry in BLUETOOTH_ADAPTERS:
+        if "@" in entry:
+            mac, _, adapter = entry.rpartition("@")
+            if mac and adapter:
+                pins[mac.strip().upper()] = adapter.strip()
+        else:
+            pool.append(entry)
+    return pins, pool
+
+
+BLUETOOTH_ADAPTER_PINS, BLUETOOTH_ADAPTER_POOL = _parse_adapter_pins()
+
+
+def adapters_for(address):
+    """Pinned adapter (as a single-element list) for this device, or None."""
+    pin = BLUETOOTH_ADAPTER_PINS.get(str(address).strip().upper())
+    return [pin] if pin else None
+
+
 def apply_supervision_timeout(address, adapters=None):
     """
     Raise the LE link supervision timeout of a just-established connection via
@@ -96,8 +123,12 @@ class BleakBackend(BleConnectionBackend):
 
     def create_client(self, address, disconnected_callback):
         kwargs = {}
-        if BLUETOOTH_ADAPTERS:
-            self.current_adapter = BLUETOOTH_ADAPTERS[self.adapter_index % len(BLUETOOTH_ADAPTERS)]
+        pinned = adapters_for(address)
+        if pinned:
+            self.current_adapter = pinned[0]
+            kwargs["adapter"] = self.current_adapter
+        elif BLUETOOTH_ADAPTER_POOL:
+            self.current_adapter = BLUETOOTH_ADAPTER_POOL[self.adapter_index % len(BLUETOOTH_ADAPTER_POOL)]
             kwargs["adapter"] = self.current_adapter
         return BleakClient(address, disconnected_callback=disconnected_callback, **kwargs)
 
@@ -173,9 +204,12 @@ class BCMBackend(BleConnectionBackend):
             raise ImportError(_BCM_IMPORT_ERROR)
 
     def _adapters(self, address=None):
-        if BLUETOOTH_ADAPTERS:
-            adapters = list(BLUETOOTH_ADAPTERS)
-        else:
+        pinned = adapters_for(address) if address else None
+        if pinned:
+            # hard pin: this device may use exactly this adapter, nothing else
+            return pinned
+        adapters = list(BLUETOOTH_ADAPTER_POOL) if BLUETOOTH_ADAPTER_POOL else None
+        if not adapters:
             try:
                 adapters = discover_adapters()
             except Exception as e:
