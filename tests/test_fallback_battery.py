@@ -968,6 +968,22 @@ class TestPublishCycleThroughDbusHelper:
         helper.telemetry_upload = lambda: None
         return helper
 
+    def test_a_cell_blind_battery_never_publishes_an_invalid_charge_limit(self, monkeypatch):
+        # velib maps a None publish to *invalid* rather than refusing it, and
+        # a consumer taking a bank minimum over its constituents then hands
+        # DVCC an invalid limit. Observed live on this system.
+        helper = self._helper(monkeypatch)
+        helper._dbusservice["/Info/MaxChargeVoltage"] = 14.6
+        for cell in helper.battery.battery.cells:
+            cell.voltage = None
+        helper.battery.battery.control_voltage = None
+
+        helper.publish_battery(None)
+
+        assert helper._dbusservice["/Info/MaxChargeVoltage"] is not None
+        assert helper._dbusservice["/Info/MaxChargeCurrent"] is not None
+        assert helper._dbusservice["/Info/MaxDischargeCurrent"] is not None
+
     def test_a_full_cycle_publishes_the_shunt_values(self, monkeypatch):
         helper = self._helper(monkeypatch)
         helper.battery._last_fresh_time = _now() - 100

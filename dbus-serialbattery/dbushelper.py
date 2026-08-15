@@ -1260,9 +1260,14 @@ class DbusHelper:
 
         # Voltage control
         self._dbusservice["/Info/BatteryLowVoltage"] = self.battery.min_battery_voltage
-        self._dbusservice["/Info/MaxChargeVoltage"] = (
-            round(self.battery.control_voltage + utils.VOLTAGE_DROP, 2) if self.battery.control_voltage is not None else None
-        )
+        # Skip the None write for the same reason as the currents below, and
+        # then some: velib publishes None as *invalid* rather than refusing
+        # it, silently, so a consumer taking a bank minimum over its
+        # constituents gets an invalid limit out and hands it to DVCC. The
+        # configured maximum set at add_path() stays in place until
+        # manage_charge_voltage() has a real one.
+        if self.battery.control_voltage is not None:
+            self._dbusservice["/Info/MaxChargeVoltage"] = round(self.battery.control_voltage + utils.VOLTAGE_DROP, 2)
         self._dbusservice["/Info/MaxChargeCellVoltage"] = (
             round(self.battery.max_battery_voltage / self.battery.cell_count, 3)
             if self.battery.max_battery_voltage is not None and self.battery.cell_count is not None
