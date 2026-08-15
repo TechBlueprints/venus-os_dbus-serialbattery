@@ -172,7 +172,7 @@ class HumsiENK_Ble(Battery):
         return "SerialBattery(" + self.type + ") " + self.address[-5:]
 
     def unique_identifier(self) -> str:
-        return self.address.replace(":", "").lower()
+        return self.address
 
     def test_connection(self):
         """

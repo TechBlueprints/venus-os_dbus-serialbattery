@@ -613,7 +613,7 @@ class TestRecoveryLadder:
         assert wrapper.battery.ble_handle.rebuilds == 0
         assert wrapper.restart_requested is False
 
-    def test_two_rebuilds_then_a_restart_request(self, monkeypatch):
+    def test_two_rebuilds_then_the_wrapper_holds_without_restarting(self, monkeypatch):
         wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
         _serve(wrapper)
         self._stalled(wrapper)
@@ -622,15 +622,30 @@ class TestRecoveryLadder:
         self._stalled(wrapper)
         assert wrapper.battery.ble_handle.rebuilds == 2
         assert wrapper.restart_requested is False
+        # Staleness alone never restarts: a long outage is covered operation,
+        # and restart-cycling the service during it is the churn the fallback
+        # exists to prevent.
+        self._stalled(wrapper)
         self._stalled(wrapper)
         assert wrapper.battery.ble_handle.rebuilds == 2
+        assert wrapper.restart_requested is False
+
+    def test_a_mechanically_failing_rebuild_asks_for_a_restart(self, monkeypatch):
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        _serve(wrapper)
+
+        def broken_rebuild():
+            raise RuntimeError("thread constructor exploded")
+
+        wrapper.battery.ble_handle.rebuild_ble_thread = broken_rebuild
+        self._stalled(wrapper)
         assert wrapper.restart_requested is True
 
-    def test_a_driver_without_a_rebuild_hook_asks_for_a_restart_directly(self, monkeypatch):
+    def test_a_driver_without_a_rebuild_hook_holds_without_restarting(self, monkeypatch):
         wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False, rebuildable=False)
         _serve(wrapper)
         self._stalled(wrapper)
-        assert wrapper.restart_requested is True
+        assert wrapper.restart_requested is False
 
     def test_recovery_resets_the_ladder(self, monkeypatch):
         wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)

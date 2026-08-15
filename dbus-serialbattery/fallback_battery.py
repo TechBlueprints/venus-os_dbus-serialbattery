@@ -143,6 +143,7 @@ class FallbackBattery:
             "_stash_written",
             "_stall_rebuilds",
             "_stall_action_time",
+            "_last_stall_log",
         )
     )
 
@@ -240,6 +241,7 @@ class FallbackBattery:
         self._stash_written: float = 0.0
         self._stall_rebuilds: int = 0
         self._stall_action_time: float = 0.0
+        self._last_stall_log: float = 0.0
 
         self._load_stash()
 
@@ -680,11 +682,18 @@ class FallbackBattery:
 
     def _update_recovery_ladder(self) -> None:
         """
-        Escalate when the wrapper has served the shunt for STALL_MINUTES with
-        zero fresh BMS data: first rebuild the driver's BLE thread in-process
-        (a wedged reconnect loop does not deserve the blast radius of taking
-        the dbus service and the fallback serving down with it), and only when
-        those rebuilds change nothing ask for a driver restart.
+        When the wrapper has served the shunt for STALL_MINUTES with zero
+        fresh BMS data, rebuild the driver's BLE thread in-process: it cures
+        a wedged reconnect loop, and against a BMS that is simply away it is
+        a cheap no-op (the fresh thread scans like the old one did).
+
+        Staleness alone NEVER requests a driver restart: the wrapper cannot
+        distinguish a wedged loop from a long outage, outages are covered
+        operation (that is the feature), and restart-cycling the dbus service
+        every STALL window during a multi-hour outage is exactly the churn
+        the fallback exists to prevent. A restart is requested only when the
+        rebuild machinery itself fails - the one case an in-process cure
+        cannot reach.
 
         :return: None
         """
@@ -703,13 +712,17 @@ class FallbackBattery:
                 f">>> No BMS data for {stalled_for:.0f}s while serving the fallback sensor — "
                 f"rebuilding the BLE thread in-process (attempt {self._stall_rebuilds}/{self.STALL_MAX_REBUILDS}) <<<"
             )
-            handle.rebuild_ble_thread()
-        else:
-            logger.error(
-                f">>> No BMS data for {stalled_for:.0f}s while serving the fallback sensor and in-process "
-                "rebuilds exhausted. Exiting so the driver restarts. <<<"
+            try:
+                handle.rebuild_ble_thread()
+            except Exception as e:
+                logger.error(f">>> BLE thread rebuild failed mechanically ({repr(e)}). Exiting so the driver restarts. <<<")
+                self.restart_requested = True
+        elif time() - self._last_stall_log >= 3600.0:
+            self._last_stall_log = time()
+            logger.warning(
+                f">>> No BMS data for {stalled_for:.0f}s; in-process rebuilds exhausted. "
+                "Holding on the fallback sensor until the BMS returns. <<<"
             )
-            self.restart_requested = True
 
     # ── persistence ──────────────────────────────────────────────────────
 
