@@ -7,7 +7,7 @@ so these tests run on macOS, CI, and Linux alike.
 import pytest
 from unittest.mock import MagicMock
 
-from dbushelper import _CachedDbusProxy, _SENTINEL
+from dbushelper import DbusHelper, _CachedDbusProxy, _SENTINEL
 
 
 @pytest.fixture
@@ -30,6 +30,69 @@ def mock_svc():
 @pytest.fixture
 def proxy(mock_svc):
     return _CachedDbusProxy(mock_svc)
+
+
+class FakeServiceContext:
+    """Stand-in for velib_python's ServiceContext.
+
+    Mirrors ext/velib_python/vedbus.py: writes are staged locally and only
+    handed to the parent as one batch when the context is flushed.
+    """
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.changes = {}
+        self.flushed = None
+
+    def __setitem__(self, path, value):
+        self.changes[path] = value
+
+    def __getitem__(self, path):
+        return self.parent[path]
+
+    def flush(self):
+        self.flushed = dict(self.changes)
+        self.parent.batches.append(self.flushed)
+        self.parent._store.update(self.changes)
+        self.changes.clear()
+
+
+class FakeService:
+    """Stand-in for VeDbusService with velib's rate-limiter stack semantics."""
+
+    def __init__(self):
+        self._store = {}
+        self._ratelimiters = []
+        self.direct_writes = []
+        self.batches = []
+
+    def __setitem__(self, path, value):
+        # velib's VeDbusService.__setitem__ bypasses the rate limiters and
+        # emits PropertiesChanged straight away.
+        self.direct_writes.append((path, value))
+        self._store[path] = value
+
+    def __getitem__(self, path):
+        return self._store[path]
+
+    def __enter__(self):
+        ctx = FakeServiceContext(self)
+        self._ratelimiters.append(ctx)
+        return ctx
+
+    def __exit__(self, *exc):
+        if self._ratelimiters:
+            self._ratelimiters.pop().flush()
+
+
+@pytest.fixture
+def fake_svc():
+    return FakeService()
+
+
+@pytest.fixture
+def batched_proxy(fake_svc):
+    return _CachedDbusProxy(fake_svc)
 
 
 class TestSetItem:
@@ -114,6 +177,111 @@ class TestSetItem:
         proxy["/ChargeFet"] = True
         proxy["/ChargeFet"] = 1  # True == 1, suppressed by equality
         assert mock_svc.__setitem__.call_count == 1
+
+
+class TestBatching:
+    """The proxy as a context manager: one ItemsChanged per publish cycle."""
+
+    def test_writes_inside_the_block_are_batched(self, batched_proxy, fake_svc):
+        with batched_proxy:
+            batched_proxy["/Soc"] = 50.0
+            batched_proxy["/Soh"] = 99.0
+            assert fake_svc.batches == []  # nothing emitted yet
+        assert fake_svc.direct_writes == []
+        assert fake_svc.batches == [{"/Soc": 50.0, "/Soh": 99.0}]
+
+    def test_only_changed_values_reach_the_batch(self, batched_proxy, fake_svc):
+        with batched_proxy:
+            batched_proxy["/Soc"] = 50.0
+            batched_proxy["/Dc/0/Current"] = 10.0
+        with batched_proxy:
+            batched_proxy["/Soc"] = 50.0  # unchanged
+            batched_proxy["/Dc/0/Current"] = 10.0  # unchanged
+            batched_proxy["/Soh"] = 99.0
+        assert fake_svc.batches[1] == {"/Soh": 99.0}
+
+    def test_empty_cycle_emits_an_empty_batch(self, batched_proxy, fake_svc):
+        with batched_proxy:
+            batched_proxy["/Soc"] = 50.0
+        with batched_proxy:
+            batched_proxy["/Soc"] = 50.0
+        assert fake_svc.batches[1] == {}
+
+    def test_writes_outside_the_block_go_out_immediately(self, batched_proxy, fake_svc):
+        """publish_battery() sets /Alarms/BmsCable after publish_dbus() returns."""
+        with batched_proxy:
+            batched_proxy["/Soc"] = 50.0
+        batched_proxy["/Alarms/BmsCable"] = 2
+        assert fake_svc.direct_writes == [("/Alarms/BmsCable", 2)]
+        assert fake_svc._store["/Alarms/BmsCable"] == 2
+
+    def test_context_manager_returns_the_proxy(self, batched_proxy):
+        with batched_proxy as entered:
+            assert entered is batched_proxy
+
+    def test_nested_blocks_flush_independently(self, batched_proxy, fake_svc):
+        with batched_proxy:
+            batched_proxy["/Soc"] = 50.0
+            with batched_proxy:
+                batched_proxy["/Soh"] = 99.0
+            # the inner block flushed its own changes only
+            assert fake_svc.batches == [{"/Soh": 99.0}]
+            batched_proxy["/ErrorCode"] = 0
+        assert fake_svc.batches == [{"/Soh": 99.0}, {"/Soc": 50.0, "/ErrorCode": 0}]
+        assert fake_svc.direct_writes == []
+
+    def test_batching_resumes_after_a_nested_block_exits(self, batched_proxy, fake_svc):
+        """A nested exit must not strand later writes outside the outer batch."""
+        with batched_proxy:
+            with batched_proxy:
+                batched_proxy["/Soh"] = 99.0
+            batched_proxy["/Soc"] = 50.0
+        assert fake_svc.direct_writes == []
+        assert fake_svc.batches[-1] == {"/Soc": 50.0}
+
+    def test_service_rate_limiter_stack_is_balanced(self, batched_proxy, fake_svc):
+        with batched_proxy:
+            with batched_proxy:
+                pass
+        assert fake_svc._ratelimiters == []
+
+    def test_exception_inside_the_block_still_flushes_and_propagates(self, batched_proxy, fake_svc):
+        with pytest.raises(ValueError):
+            with batched_proxy:
+                batched_proxy["/Soc"] = 50.0
+                raise ValueError("boom")
+        assert fake_svc.batches == [{"/Soc": 50.0}]
+        assert fake_svc._ratelimiters == []
+        # the proxy is reusable afterwards
+        batched_proxy["/ErrorCode"] = 1
+        assert fake_svc.direct_writes == [("/ErrorCode", 1)]
+
+    def test_reads_inside_a_block_still_delegate(self, batched_proxy, fake_svc):
+        fake_svc._store["/Mode"] = 3
+        with batched_proxy:
+            assert batched_proxy["/Mode"] == 3
+
+
+class TestPublishDbusBatching:
+    """DbusHelper.publish_dbus() must wrap the value writes in one batch."""
+
+    def test_publish_dbus_batches_the_value_writes(self, fake_svc):
+        proxy = _CachedDbusProxy(fake_svc)
+
+        class Helper:
+            _dbusservice = proxy
+
+            def _publish_dbus_values(self):
+                self._dbusservice["/Soc"] = 50.0
+                self._dbusservice["/Soh"] = 99.0
+                # nothing may have gone out on its own yet
+                assert fake_svc.direct_writes == []
+                assert fake_svc.batches == []
+
+        DbusHelper.publish_dbus(Helper())
+
+        assert fake_svc.direct_writes == []
+        assert fake_svc.batches == [{"/Soc": 50.0, "/Soh": 99.0}]
 
 
 class TestGetItem:

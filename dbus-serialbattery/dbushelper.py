@@ -49,19 +49,45 @@ class _CachedDbusProxy:
     the write to the real service when the new value differs from the
     last written one, eliminating the majority of D-Bus traffic while
     remaining fully transparent for reads and method calls.
+
+    Used as a context manager it additionally batches: writes made inside
+    a ``with`` block are collected in a velib ``ServiceContext`` and emitted
+    as one ``ItemsChanged`` signal on exit, instead of one
+    ``PropertiesChanged`` per path. Writes made outside a block are
+    forwarded to the service immediately, exactly as before.
     """
 
-    __slots__ = ("_svc", "_cache")
+    __slots__ = ("_svc", "_cache", "_contexts")
 
     def __init__(self, svc):
         self._svc = svc
         self._cache: dict = {}
+        # Stack of open velib ServiceContexts, mirroring the service's own
+        # rate-limiter stack so nested ``with`` blocks behave identically.
+        self._contexts: list = []
+
+    def __enter__(self):
+        self._contexts.append(self._svc.__enter__())
+        return self
+
+    def __exit__(self, *exc):
+        # Mirrors velib's nesting behaviour: each ``__exit__`` flushes the
+        # context its matching ``__enter__`` opened, after which writes fall
+        # back to the enclosing context, or straight to the service when the
+        # outermost block closes.
+        if self._contexts:
+            self._contexts.pop()
+        return self._svc.__exit__(*exc)
 
     def __setitem__(self, path, value):
         prev = self._cache.get(path, _SENTINEL)
-        if prev is not value and prev != value:
-            self._cache[path] = value
-            self._svc[path] = value
+        if prev is value or prev == value:
+            return
+        self._cache[path] = value
+        # Inside a ``with`` block the write is staged on the innermost
+        # ServiceContext and flushed as part of its ItemsChanged signal.
+        target = self._contexts[-1] if self._contexts else self._svc
+        target[path] = value
 
     def __getitem__(self, path):
         return self._svc[path]
@@ -1128,6 +1154,18 @@ class DbusHelper:
     def publish_dbus(self) -> None:
         """
         Publishes the battery data to dbus and refresh it.
+        """
+        # Emit all of this cycle's changes as a single batched ItemsChanged
+        # signal instead of one PropertiesChanged per changed path.
+        with self._dbusservice:
+            self._publish_dbus_values()
+
+    def _publish_dbus_values(self) -> None:
+        """
+        Write the battery data to the dbus service.
+
+        Split out of :meth:`publish_dbus` so that the batching context stays
+        a thin wrapper around the value writes.
         """
         self._dbusservice["/System/NrOfCellsPerBattery"] = self.battery.cell_count
         if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
