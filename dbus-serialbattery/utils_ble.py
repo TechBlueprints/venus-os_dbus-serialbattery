@@ -1,5 +1,6 @@
 import threading
 import asyncio
+import os
 import subprocess
 import sys
 import time
@@ -11,6 +12,25 @@ from utils import (
     BLUETOOTH_FORCE_RESET_BLE_STACK,
     capture_raw_data,
 )
+
+
+# Hold flag: while the flag file for a device exists, the reconnect loop makes
+# no connection attempts for that device at all, giving a degraded BMS radio
+# extended quiet. The driver, its dbus service and its published data stay up,
+# which is the whole point - killing the driver process instead makes DVCC see
+# the service disappear and raises alarms across the bank.
+# A flag whose content is "auto" was written by an automatic recovery path and
+# expires by itself; any other content is an operator hold and persists until
+# the file is removed.
+BLE_HOLD_FLAG_DIR = "/data/tmp"
+BLE_HOLD_FLAG_PREFIX = "ble-hold-"
+BLE_HOLD_AUTO_EXPIRY = 1200.0
+BLE_HOLD_POLL_INTERVAL = 5
+
+
+def ble_hold_flag_path(address):
+    """Path of the hold flag file for the given device address."""
+    return os.path.join(BLE_HOLD_FLAG_DIR, BLE_HOLD_FLAG_PREFIX + str(address).replace(":", "").lower())
 
 
 # Outer deadlines for the connection backend. Generous on purpose: they are a
@@ -175,7 +195,28 @@ class Syncron_Ble:
         # for over a minute resets the ramp.
         backoff = [1, 3, 6]
         failures = 0
+        hold_flag = ble_hold_flag_path(self.address)
+        holding = False
         while self.main_thread.is_alive() and generation == self._ble_thread_generation:
+            if os.path.exists(hold_flag):
+                try:
+                    with open(hold_flag) as f:
+                        automatic = f.read().strip() == "auto"
+                    if automatic and time.time() - os.path.getmtime(hold_flag) > BLE_HOLD_AUTO_EXPIRY:
+                        os.remove(hold_flag)
+                        logger.info(f"BLE hold for {self.address} auto-expired, resuming connection attempts")
+                        continue
+                except Exception as e:
+                    if not holding:
+                        logger.warning(f"BLE hold flag {hold_flag} could not be read: {repr(e)}")
+                if not holding:
+                    holding = True
+                    logger.warning(f"BLE hold flag {hold_flag} present, pausing connection attempts for {self.address}")
+                await asyncio.sleep(BLE_HOLD_POLL_INTERVAL)
+                continue
+            if holding:
+                holding = False
+                logger.info(f"BLE hold for {self.address} released, resuming connection attempts")
             attempt_started = time.time()
             await self.connect_to_bms(self.address)
             if time.time() - attempt_started > 60.0:

@@ -68,6 +68,19 @@ def test_config_default_backend_name_resolves_without_falling_back():
     assert type(utils_ble.get_ble_backend(configured)).__name__ == configured
 
 
+def test_hold_flag_path_normalizes_the_mac_address():
+    """One battery, one flag file — regardless of how the MAC was written."""
+    lower = utils_ble.ble_hold_flag_path("c8:47:8c:00:00:00")
+    upper = utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00")
+    assert lower == upper
+    assert os.path.basename(lower) == "ble-hold-c8478c000000"
+    assert os.path.dirname(lower) == utils_ble.BLE_HOLD_FLAG_DIR
+
+
+def test_hold_flag_paths_differ_per_device():
+    assert utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00") != utils_ble.ble_hold_flag_path("C8:47:8C:00:00:11")
+
+
 def test_backends_implement_the_connection_interface():
     """Every backend must be usable through the seam Syncron_Ble drives."""
     for cls in utils_ble.supported_ble_backends:
