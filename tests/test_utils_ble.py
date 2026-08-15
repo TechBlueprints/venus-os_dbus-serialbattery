@@ -68,6 +68,67 @@ def test_config_default_backend_name_resolves_without_falling_back():
     assert type(utils_ble.get_ble_backend(configured)).__name__ == configured
 
 
+def test_plain_entries_form_the_pool_and_pin_nothing():
+    pins, pool = utils_ble.parse_adapter_entries(["hci1", "hci2"])
+    assert pins == {}
+    assert pool == ["hci1", "hci2"]
+
+
+def test_pool_order_is_preserved():
+    """Rotation walks the pool in configured order, so order must survive parsing."""
+    _, pool = utils_ble.parse_adapter_entries(["hci2", "hci0", "hci1"])
+    assert pool == ["hci2", "hci0", "hci1"]
+
+
+def test_mac_at_adapter_entries_pin_and_stay_out_of_the_pool():
+    pins, pool = utils_ble.parse_adapter_entries(["C8:47:8C:00:00:00@hci1", "C8:47:8C:00:00:11@hci2"])
+    assert pins == {"C8:47:8C:00:00:00": "hci1", "C8:47:8C:00:00:11": "hci2"}
+    # a pinned MAC is not an adapter name and must never be handed to bleak
+    assert pool == []
+
+
+def test_pins_and_pool_can_be_mixed():
+    pins, pool = utils_ble.parse_adapter_entries(["hci0", "C8:47:8C:00:00:00@hci1"])
+    assert pins == {"C8:47:8C:00:00:00": "hci1"}
+    assert pool == ["hci0"]
+
+
+def test_entries_are_whitespace_and_case_normalized():
+    pins, pool = utils_ble.parse_adapter_entries([" c8:47:8c:00:00:00 @ hci1 ", " hci0 "])
+    assert pins == {"C8:47:8C:00:00:00": "hci1"}
+    assert pool == ["hci0"]
+
+
+def test_malformed_entries_are_dropped_rather_than_pinned():
+    pins, pool = utils_ble.parse_adapter_entries(["@hci1", "C8:47:8C:00:00:00@", "", "  ", "hci3"])
+    assert pins == {}
+    assert pool == ["hci3"]
+
+
+def test_empty_config_pins_and_pools_nothing():
+    pins, pool = utils_ble.parse_adapter_entries([])
+    assert pins == {}
+    assert pool == []
+
+
+def test_config_default_adapters_is_empty_so_the_default_adapter_is_used():
+    assert _config_default()["BLUETOOTH_ADAPTERS"].strip() == ""
+    pins, pool = utils_ble.parse_adapter_entries([])
+    assert not pins and not pool
+
+
+def test_adapters_for_matches_a_pinned_device_regardless_of_case():
+    original = utils_ble.BLUETOOTH_ADAPTER_PINS
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": "hci1"}
+    try:
+        assert utils_ble.adapters_for("c8:47:8c:00:00:00") == ["hci1"]
+        assert utils_ble.adapters_for("C8:47:8C:00:00:00") == ["hci1"]
+        # an unpinned device falls through to the shared pool
+        assert utils_ble.adapters_for("C8:47:8C:00:00:11") is None
+    finally:
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original
+
+
 def test_hold_flag_path_normalizes_the_mac_address():
     """One battery, one flag file — regardless of how the MAC was written."""
     lower = utils_ble.ble_hold_flag_path("c8:47:8c:00:00:00")
