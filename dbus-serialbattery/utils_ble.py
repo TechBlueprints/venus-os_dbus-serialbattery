@@ -327,8 +327,247 @@ class BleakRetryBackend(BleConnectionBackend):
         await client.disconnect()
 
 
+try:
+    from bleak_connection_manager import (
+        PROFILE_BATTERY,
+        EscalationPolicy,
+        establish_connection,
+    )
+    from bleak_connection_manager.adapters import discover_adapters
+    from bleak_connection_manager.scanner import find_device as bcm_find_device
+
+    _HAS_BCM = True
+    _BCM_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover - depends on the host's BLE stack
+    _HAS_BCM = False
+    _BCM_IMPORT_ERROR = e
+
+
+def _bluez_device_path(adapter, address):
+    """BlueZ object path of a device on an adapter, e.g. /org/bluez/hci1/dev_C8_47_8C_00_00_00."""
+    return f"/org/bluez/{adapter}/dev_" + str(address).replace(":", "_").upper()
+
+
+def _adapter_of(device):
+    """Adapter name a resolved BLEDevice lives under, or None if not derivable."""
+    try:
+        return device.details["path"].split("/")[3]
+    except Exception:
+        return None
+
+
+def _ble_device(address, path):
+    """Wrap a BlueZ object path as the BLEDevice bleak expects."""
+    from bleak.backends.device import BLEDevice
+
+    return BLEDevice(address=address, name=None, details={"path": path, "props": {}})
+
+
+class BCMBackend(BleConnectionBackend):
+    """
+    Managed backend built on the vendored bleak_connection_manager.
+
+    For hosts where the direct bleak path is unreliable: a GX device with
+    several BLE services competing for a small number of adapters. Adds over
+    BleakBackend:
+
+      - cache-first device resolution, so a device BlueZ already knows is
+        connected without ever calling StartDiscovery
+      - connect retries with per-adapter failure tracking and an escalation
+        ladder (diagnose stuck state, clear stale BlueZ state, rotate adapter)
+      - phantom and inactive connection cleanup before each attempt
+      - per-device adapter handling: BLUETOOTH_ADAPTERS stays a hard
+        allow-list, and a device cached on a disallowed adapter is evicted
+        rather than silently connected through
+
+    Opt in with BLUETOOTH_CONNECTION_BACKEND = BCMBackend.
+    """
+
+    def __init__(self):
+        if not _HAS_BCM:
+            raise ImportError(f"bleak_connection_manager is not importable: {_BCM_IMPORT_ERROR}")
+        self._disconnected_callback = None
+
+    def _adapters(self, address=None):
+        pinned = adapters_for(address) if address else None
+        if pinned:
+            # hard pin: this device may use exactly this adapter, nothing else
+            return pinned
+        adapters = list(BLUETOOTH_ADAPTER_POOL) if BLUETOOTH_ADAPTER_POOL else None
+        if not adapters:
+            try:
+                adapters = discover_adapters()
+            except Exception as e:
+                logger.warning(f"BLE [{address}] adapter discovery failed ({repr(e)}), using system default")
+                return None
+        # Deterministic per-device spread: rotate each device's preference
+        # order by a stable hash of its address so several BMS instances
+        # distribute across the allowed adapters instead of all competing
+        # for - and sharing the fate of - the first one. Preference order
+        # only: every allowed adapter is still tried on failure.
+        if address and adapters and len(adapters) > 1:
+            offset = sum(ord(c) for c in str(address)) % len(adapters)
+            adapters = adapters[offset:] + adapters[:offset]
+        return adapters
+
+    def create_client(self, address, disconnected_callback):
+        # BCM builds and returns its own client during establish()
+        self._disconnected_callback = disconnected_callback
+        return None
+
+    async def _connect_device_no_scan(self, address, adapter):
+        """
+        Create and connect the BlueZ device object on a specific adapter via
+        the experimental Adapter1.ConnectDevice (needs bluetoothd -E).
+
+        Returns the device object path, or None on failure. Unlike discovery,
+        this does not need the adapter's scan slot, so it still works while
+        another service holds scanning on that adapter.
+        """
+        try:
+            from dbus_fast import Message, Variant
+            from dbus_fast.aio import MessageBus
+            from dbus_fast.constants import BusType, MessageType
+
+            # Every await here is deadlined. An unguarded await in this path
+            # parks the whole reconnect loop if D-Bus stalls, and a parked
+            # loop is silent: no log line ever says it stopped trying.
+            bus = await asyncio.wait_for(MessageBus(bus_type=BusType.SYSTEM).connect(), timeout=10.0)
+            try:
+                reply = await asyncio.wait_for(
+                    bus.call(
+                        Message(
+                            destination="org.bluez",
+                            path=f"/org/bluez/{adapter}",
+                            interface="org.bluez.Adapter1",
+                            member="ConnectDevice",
+                            signature="a{sv}",
+                            body=[{"Address": Variant("s", address), "AddressType": Variant("s", "public")}],
+                        )
+                    ),
+                    timeout=30.0,
+                )
+                if reply.message_type == MessageType.METHOD_RETURN:
+                    return reply.body[0] if reply.body else _bluez_device_path(adapter, address)
+                error_name = getattr(reply, "error_name", "")
+                if "AlreadyExists" in error_name:
+                    # the device object is already present on this adapter - usable
+                    return _bluez_device_path(adapter, address)
+                logger.debug(f"BLE [{address}] ConnectDevice on {adapter} failed: {error_name}")
+                return None
+            finally:
+                bus.disconnect()
+        except Exception as e:
+            logger.debug(f"BLE [{address}] ConnectDevice on {adapter} error: {repr(e)}")
+            return None
+
+    async def _remove_cached_device(self, address, adapter):
+        """Drop a BlueZ cache entry so the next attempt resolves from scratch."""
+        try:
+            from bleak_connection_manager.bluez import remove_device
+
+            # deadlined: an unguarded remove_device await once parked the
+            # reconnect loop for hours when its D-Bus reply never arrived
+            await asyncio.wait_for(remove_device(address, adapter), timeout=15.0)
+            return True
+        except Exception as e:
+            logger.debug(f"BLE [{address}] removing cache entry on {adapter} failed: {repr(e)}")
+            return False
+
+    async def _resolve_device(self, address, adapters, prefer_connect_device=True):
+        """
+        Find a BLEDevice for this address, pinned to an allowed adapter.
+
+        Resolution order:
+          1. ConnectDevice on the preferred adapter. This is what makes the
+             per-device adapter preference actually win: cache-first
+             resolution otherwise pins the device to whichever adapter last
+             scanned it, and a sibling instance's scans re-cache the device
+             on the shared adapter within seconds of every eviction.
+          2. Cache-first find across the allowed adapters.
+          3. ConnectDevice on the remaining allowed adapters.
+
+        Returns (device, connect_adapters); device is None if unresolvable.
+        """
+        if adapters and prefer_connect_device:
+            path = await self._connect_device_no_scan(address, adapters[0])
+            if path:
+                logger.info(f"BLE [{address}] connected on preferred adapter {adapters[0]} via ConnectDevice")
+                return _ble_device(address, path), [adapters[0]]
+
+        device = None
+        try:
+            device = await bcm_find_device(address, timeout=15.0, max_attempts=2, adapters=adapters)
+        except Exception as e:
+            logger.warning(f"BLE [{address}] managed scan failed: {repr(e)}")
+
+        if device is not None:
+            # Cache-first resolution can hand back an object cached on a
+            # NON-allowed adapter, left over from an earlier connection
+            # there. Connecting through it silently breaks the allow-list,
+            # so evict it and fall through to ConnectDevice instead.
+            found_adapter = _adapter_of(device)
+            if found_adapter is None:
+                return device, adapters
+            if not adapters or found_adapter in adapters:
+                return device, [found_adapter]
+            logger.info(f"BLE [{address}] cached on disallowed {found_adapter}, removing and using ConnectDevice on allowed adapters")
+            await self._remove_cached_device(address, found_adapter)
+
+        for adapter in adapters or ["hci0"]:
+            path = await self._connect_device_no_scan(address, adapter)
+            if path:
+                logger.info(f"BLE [{address}] created device on {adapter} via ConnectDevice (no scan)")
+                return _ble_device(address, path), [adapter]
+
+        return None, adapters
+
+    async def establish(self, client, address, notify_char, notify_callback):
+        adapters = self._adapters(address)
+        escalation = EscalationPolicy(adapters or [], config=PROFILE_BATTERY)
+
+        device, connect_adapters = await self._resolve_device(address, adapters)
+        if device is None:
+            raise Exception(f"device not resolvable on allowed adapters {adapters} (scan and ConnectDevice both failed)")
+
+        client = await establish_connection(
+            BleakClient,
+            device,
+            f"serialbattery {address}",
+            disconnected_callback=self._disconnected_callback,
+            max_attempts=5,
+            adapters=connect_adapters,
+            close_inactive_connections=True,
+            escalation_policy=escalation,
+            overall_timeout=240.0,
+            timeout=15.0,
+        )
+        logger.info(f"BLE [{address}] connected via BCM")
+
+        try:
+            await asyncio.wait_for(client.start_notify(notify_char, notify_callback), timeout=10.0)
+        except Exception as e:
+            logger.warning(f"BLE [{address}] start_notify failed: {repr(e)}")
+            # A stale BlueZ cache entry produces a client that reports itself
+            # connected but carries no live link. Clear it so the next attempt
+            # performs a real connect.
+            if "Not connected" in str(e):
+                for adapter in adapters or ["hci0"]:
+                    await self._remove_cached_device(address, adapter)
+                logger.info(f"BLE [{address}] cleared stale BlueZ cache entry")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise
+        return client
+
+    async def release(self, client):
+        await client.disconnect()
+
+
 # Available connection backends, selected by class name via BLUETOOTH_CONNECTION_BACKEND
-supported_ble_backends = [BleakBackend]
+supported_ble_backends = [BleakBackend, BCMBackend]
 if HAS_BLEAK_RETRY_CONNECTOR:
     supported_ble_backends.append(BleakRetryBackend)
 
@@ -338,7 +577,13 @@ def get_ble_backend(name=None):
     name = BLUETOOTH_CONNECTION_BACKEND if name is None else name
     for backend in supported_ble_backends:
         if backend.__name__ == name:
-            return backend()
+            try:
+                return backend()
+            except Exception as e:
+                # An optional backend whose dependencies are missing on this
+                # host must not take the driver down with it.
+                logger.error(f"BLE backend '{name}' is not usable ({repr(e)}), using 'BleakBackend'")
+                return BleakBackend()
     logger.warning(f"Unknown BLUETOOTH_CONNECTION_BACKEND '{name}', using 'BleakBackend'")
     return BleakBackend()
 

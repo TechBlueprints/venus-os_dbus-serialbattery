@@ -71,9 +71,50 @@ def test_backend_lookup_falls_back_to_bleak_for_unknown_name():
 
 
 def test_every_supported_backend_is_selectable_by_its_class_name():
-    """The registry is keyed by class name, so every entry must resolve to itself."""
+    """The registry is keyed by class name, so every entry must resolve to itself.
+
+    A backend whose optional dependencies are missing on this machine degrades
+    to BleakBackend rather than raising - see the fallback test below. That is
+    the case for BCMBackend here, which needs a real bleak and BlueZ.
+    """
     for cls in utils_ble.supported_ble_backends:
-        assert type(utils_ble.get_ble_backend(cls.__name__)) is cls
+        resolved = utils_ble.get_ble_backend(cls.__name__)
+        assert type(resolved) is cls or type(resolved) is utils_ble.BleakBackend
+
+
+def test_bcm_backend_is_registered_and_reachable_by_name():
+    """BCMBackend must be selectable by config, whether or not it loads here."""
+    assert utils_ble.BCMBackend in utils_ble.supported_ble_backends
+    assert issubclass(utils_ble.BCMBackend, utils_ble.BleConnectionBackend)
+
+
+def test_an_unloadable_backend_degrades_to_bleak_instead_of_killing_the_driver():
+    """A backend whose dependency is missing must not take the driver down.
+
+    BCMBackend raises ImportError when bleak_connection_manager is not
+    importable; the selector has to survive that, because it runs inside
+    Syncron_Ble.__init__ on a GX device where a raised ImportError means no
+    dbus service at all.
+    """
+
+    class UnloadableBackend(utils_ble.BleConnectionBackend):
+        def __init__(self):
+            raise ImportError("dependency missing")
+
+    utils_ble.supported_ble_backends.append(UnloadableBackend)
+    try:
+        assert type(utils_ble.get_ble_backend("UnloadableBackend")) is utils_ble.BleakBackend
+    finally:
+        utils_ble.supported_ble_backends.remove(UnloadableBackend)
+
+
+def test_bcm_backend_constructs_when_its_dependency_is_importable():
+    """Where bleak_connection_manager does import, selection must return it."""
+    if not utils_ble._HAS_BCM:
+        import pytest
+
+        pytest.skip("bleak_connection_manager not importable in this environment")
+    assert type(utils_ble.get_ble_backend("BCMBackend")) is utils_ble.BCMBackend
 
 
 def test_config_default_backend_name_resolves_without_falling_back():
@@ -155,6 +196,70 @@ def test_hold_flag_path_normalizes_the_mac_address():
 
 def test_hold_flag_paths_differ_per_device():
     assert utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00") != utils_ble.ble_hold_flag_path("C8:47:8C:00:00:11")
+
+
+def _bcm():
+    """A BCMBackend with its dependency check bypassed.
+
+    Only the pure adapter-selection logic is exercised through it; nothing
+    here touches bleak_connection_manager or a radio.
+    """
+    return object.__new__(utils_ble.BCMBackend)
+
+
+def test_bcm_adapter_selection_honors_a_pin_and_ignores_the_pool():
+    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": ["hci1"]}
+    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci0", "hci2"]
+    try:
+        # a pinned battery may use exactly one adapter, never the pool
+        assert _bcm()._adapters("C8:47:8C:00:00:00") == ["hci1"]
+    finally:
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+
+
+def test_bcm_adapter_selection_spreads_unpinned_devices_across_the_pool():
+    """Preference order is rotated per device, but stays a permutation of the pool."""
+    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {}
+    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci0", "hci1", "hci2"]
+    try:
+        backend = _bcm()
+        orders = {addr: backend._adapters(addr) for addr in ("C8:47:8C:00:00:00", "C8:47:8C:00:00:01", "C8:47:8C:00:00:02")}
+        for order in orders.values():
+            # every allowed adapter is still tried, only the preference moves
+            assert sorted(order) == ["hci0", "hci1", "hci2"]
+        # the rotation is by address, so different devices lead with different adapters
+        assert len({tuple(order) for order in orders.values()}) == 3
+        # and it is stable: the same address always yields the same order
+        assert backend._adapters("C8:47:8C:00:00:00") == orders["C8:47:8C:00:00:00"]
+    finally:
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+
+
+def test_bluez_device_path_is_built_the_way_bluez_names_objects():
+    assert utils_ble._bluez_device_path("hci1", "c8:47:8c:00:00:00") == "/org/bluez/hci1/dev_C8_47_8C_00_00_00"
+
+
+def test_adapter_of_recovers_the_adapter_a_resolved_device_lives_under():
+    """The allow-list check depends on this, so a wrong answer connects via a banned adapter."""
+
+    class FakeDevice:
+        details = {"path": "/org/bluez/hci2/dev_C8_47_8C_00_00_00"}
+
+    assert utils_ble._adapter_of(FakeDevice()) == "hci2"
+
+
+def test_adapter_of_returns_none_when_the_path_is_not_a_bluez_device_path():
+    class NoPath:
+        details = {}
+
+    assert utils_ble._adapter_of(NoPath()) is None
+    assert utils_ble._adapter_of(object()) is None
 
 
 def test_backends_implement_the_connection_interface():
