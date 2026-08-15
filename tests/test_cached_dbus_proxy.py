@@ -7,7 +7,8 @@ so these tests run on macOS, CI, and Linux alike.
 import pytest
 from unittest.mock import MagicMock
 
-from dbushelper import DbusHelper, _CachedDbusProxy, _SENTINEL
+import dbushelper
+from dbushelper import PUBLISH_GATE_THRESHOLDS, PUBLISH_HEARTBEAT_S, DbusHelper, _CachedDbusProxy, _SENTINEL
 
 
 @pytest.fixture
@@ -179,6 +180,184 @@ class TestSetItem:
         assert mock_svc.__setitem__.call_count == 1
 
 
+class TestSignificanceGate:
+    """__setitem__: gated paths only re-publish once the value moved enough."""
+
+    def test_below_threshold_is_suppressed(self, proxy, mock_svc):
+        proxy["/Dc/0/Current"] = 10.0
+        proxy["/Dc/0/Current"] = 10.05  # 0.05 A < 0.1 A gate
+        assert mock_svc.__setitem__.call_count == 1
+        assert mock_svc._store["/Dc/0/Current"] == 10.0
+
+    def test_at_threshold_is_published(self, proxy, mock_svc):
+        proxy["/Dc/0/Current"] = 10.0
+        proxy["/Dc/0/Current"] = 10.1  # exactly the gate, must not be swallowed
+        assert mock_svc.__setitem__.call_count == 2
+
+    def test_above_threshold_is_published(self, proxy, mock_svc):
+        proxy["/Dc/0/Power"] = 100.0
+        proxy["/Dc/0/Power"] = 106.0  # 6 W > 5 W gate
+        assert mock_svc.__setitem__.call_count == 2
+        assert mock_svc._store["/Dc/0/Power"] == 106.0
+
+    def test_comparison_base_is_the_last_published_value(self, proxy, mock_svc):
+        """Cumulative drift must eventually cross the gate.
+
+        The suppressed value must NOT become the new comparison base,
+        otherwise a slow ramp would never publish again.
+        """
+        proxy["/Dc/0/Temperature"] = 20.0
+        for step in (20.05, 20.1, 20.15):
+            proxy["/Dc/0/Temperature"] = step
+            assert mock_svc.__setitem__.call_count == 1
+        proxy["/Dc/0/Temperature"] = 20.2  # 0.2 °C away from 20.0
+        assert mock_svc.__setitem__.call_count == 2
+        assert mock_svc._store["/Dc/0/Temperature"] == 20.2
+
+    def test_float_representation_error_does_not_swallow_a_step(self, proxy, mock_svc):
+        """4.35 - 4.34 evaluates to 0.00999999999999978 in binary floats.
+
+        Values are published pre-rounded, so a single 10 mV step must still
+        pass the 0.01 V gate despite the representation error.
+        """
+        assert abs(4.35 - 4.34) < 0.01  # the trap this guards against
+        proxy["/Dc/0/Voltage"] = 4.34
+        proxy["/Dc/0/Voltage"] = 4.35
+        assert mock_svc.__setitem__.call_count == 2
+
+    def test_first_write_of_a_gated_path_always_publishes(self, proxy, mock_svc):
+        proxy["/TimeToGo"] = 5
+        mock_svc.__setitem__.assert_called_once_with("/TimeToGo", 5)
+
+    def test_transition_to_none_is_never_gated(self, proxy, mock_svc):
+        proxy["/Dc/0/Current"] = 10.0
+        proxy["/Dc/0/Current"] = None
+        assert mock_svc.__setitem__.call_count == 2
+        proxy["/Dc/0/Current"] = 10.02
+        assert mock_svc.__setitem__.call_count == 3
+
+    def test_ungated_path_publishes_every_change(self, proxy, mock_svc):
+        """/Soc is deliberately not gated - ESS compares it to MinimumSocLimit."""
+        assert "/Soc" not in PUBLISH_GATE_THRESHOLDS
+        proxy["/Soc"] = 50.0
+        proxy["/Soc"] = 50.01
+        assert mock_svc.__setitem__.call_count == 2
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/Info/MaxChargeVoltage",
+            "/Info/MaxChargeCurrent",
+            "/Info/MaxDischargeCurrent",
+            "/Info/BatteryLowVoltage",
+            "/Info/ChargeRequest",
+        ],
+    )
+    def test_info_limits_are_ungated(self, proxy, mock_svc, path):
+        """Charge control limits must publish exactly; a stale limit is a control error."""
+        assert path not in PUBLISH_GATE_THRESHOLDS
+        proxy[path] = 55.2
+        proxy[path] = 55.21
+        assert mock_svc.__setitem__.call_count == 2
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/Alarms/LowVoltage",
+            "/Alarms/HighVoltage",
+            "/Alarms/HighTemperature",
+            "/Alarms/BmsCable",
+            "/Alarms/CellImbalance",
+        ],
+    )
+    def test_alarms_are_ungated(self, proxy, mock_svc, path):
+        """Alarm state is discrete and must reach consumers immediately."""
+        assert path not in PUBLISH_GATE_THRESHOLDS
+        proxy[path] = 0
+        proxy[path] = 1
+        proxy[path] = 2
+        assert mock_svc.__setitem__.call_count == 3
+
+    def test_no_gated_path_is_a_control_or_alarm_path(self):
+        for path in PUBLISH_GATE_THRESHOLDS:
+            assert not path.startswith("/Info/"), path
+            assert not path.startswith("/Alarms/"), path
+
+    def test_all_thresholds_are_positive_numbers(self):
+        for path, threshold in PUBLISH_GATE_THRESHOLDS.items():
+            assert isinstance(threshold, (int, float)), path
+            assert threshold > 0, path
+
+    def test_bool_is_never_gated(self, proxy, mock_svc):
+        """bool is an int subclass; a flag must never be threshold-compared."""
+        proxy["/TimeToGo"] = False
+        proxy["/TimeToGo"] = True  # abs(1 - 0) = 1 < the 60 s gate
+        assert mock_svc.__setitem__.call_count == 2
+
+
+class TestHeartbeat:
+    """Entering the batch context periodically forces a full re-publish."""
+
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        state = {"now": 1_000_000.0}
+        monkeypatch.setattr(dbushelper, "time", lambda: state["now"])
+        return state
+
+    def test_no_republish_before_the_interval(self, clock, fake_svc):
+        proxy = _CachedDbusProxy(fake_svc)
+        with proxy:
+            proxy["/Dc/0/Current"] = 10.0
+        assert fake_svc.batches[-1] == {"/Dc/0/Current": 10.0}
+
+        clock["now"] += PUBLISH_HEARTBEAT_S - 1
+        with proxy:
+            proxy["/Dc/0/Current"] = 10.0
+        assert fake_svc.batches[-1] == {}
+
+    def test_republish_after_the_interval(self, clock, fake_svc):
+        proxy = _CachedDbusProxy(fake_svc)
+        with proxy:
+            proxy["/Dc/0/Current"] = 10.0
+            proxy["/Soc"] = 50.0
+
+        clock["now"] += PUBLISH_HEARTBEAT_S
+        with proxy:
+            proxy["/Dc/0/Current"] = 10.0  # unchanged, but the cache was dropped
+            proxy["/Soc"] = 50.0
+        assert fake_svc.batches[-1] == {"/Dc/0/Current": 10.0, "/Soc": 50.0}
+
+    def test_heartbeat_also_defeats_a_suppressed_sub_threshold_value(self, clock, fake_svc):
+        proxy = _CachedDbusProxy(fake_svc)
+        with proxy:
+            proxy["/Dc/0/Current"] = 10.0
+        with proxy:
+            proxy["/Dc/0/Current"] = 10.05  # suppressed by the gate
+        assert fake_svc.batches[-1] == {}
+
+        clock["now"] += PUBLISH_HEARTBEAT_S
+        with proxy:
+            proxy["/Dc/0/Current"] = 10.05
+        assert fake_svc.batches[-1] == {"/Dc/0/Current": 10.05}
+
+    def test_heartbeat_is_only_evaluated_on_the_outermost_enter(self, clock, fake_svc):
+        proxy = _CachedDbusProxy(fake_svc)
+        with proxy:
+            proxy["/Soc"] = 50.0
+            clock["now"] += PUBLISH_HEARTBEAT_S
+            with proxy:
+                proxy["/Soc"] = 50.0  # must stay deduplicated mid-cycle
+                assert fake_svc._ratelimiters[-1].changes == {}
+
+    def test_heartbeat_does_not_fire_without_a_batch_context(self, clock, fake_svc):
+        """Ungated, unbatched writes keep their plain deduplication."""
+        proxy = _CachedDbusProxy(fake_svc)
+        proxy["/Soc"] = 50.0
+        clock["now"] += PUBLISH_HEARTBEAT_S * 10
+        proxy["/Soc"] = 50.0
+        assert fake_svc.direct_writes == [("/Soc", 50.0)]
+
+
 class TestBatching:
     """The proxy as a context manager: one ItemsChanged per publish cycle."""
 
@@ -196,7 +375,7 @@ class TestBatching:
             batched_proxy["/Dc/0/Current"] = 10.0
         with batched_proxy:
             batched_proxy["/Soc"] = 50.0  # unchanged
-            batched_proxy["/Dc/0/Current"] = 10.0  # unchanged
+            batched_proxy["/Dc/0/Current"] = 10.05  # below the gate
             batched_proxy["/Soh"] = 99.0
         assert fake_svc.batches[1] == {"/Soh": 99.0}
 

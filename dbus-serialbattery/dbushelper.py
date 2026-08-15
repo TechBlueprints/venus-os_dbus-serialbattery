@@ -36,6 +36,57 @@ def _adjust_temperature(value, adjustment):
     return (value * adjustment[1]) + adjustment[0]
 
 
+# ── Publish gate ─────────────────────────────────────────────────────────
+#
+# Per-path significance thresholds: a numeric value is only re-published
+# when it has moved at least this far from the LAST PUBLISHED value, so
+# sensor flicker stops generating D-Bus traffic while cumulative drift
+# still gets through (the comparison base is not updated on suppression,
+# so the published value is never more than one threshold away from the
+# measured one, no matter how long the drift takes).
+#
+# Deliberately UNGATED (not listed here, so they only get the plain
+# unchanged-value deduplication): everything under /Info (CVL/CCL/DCL feed
+# the charge control loop — a stale limit is a control error), everything
+# under /Alarms (discrete state that must be exact and immediate), /Soc
+# (ESS reads it against MinimumSocLimit), cell voltages and cell-voltage
+# extremes (balance displays read them), FET/balance flags, counters and
+# all string paths.
+PUBLISH_GATE_THRESHOLDS = {
+    "/Dc/0/Voltage": 0.01,  # V — one step of the published 2-decimal value, so effectively dedup only
+    "/Dc/0/Current": 0.1,  # A — far below BMS shunt noise; bounded 0.1 A display error
+    "/Dc/0/Power": 5.0,  # W — derived from V*I, wobbles the most; ~0.1 A at 48 V
+    "/Dc/0/Temperature": 0.2,  # °C — telemetry/display only, alarms are computed from the raw value
+    "/System/Temperature1": 0.2,  # °C
+    "/System/Temperature2": 0.2,  # °C
+    "/System/Temperature3": 0.2,  # °C
+    "/System/Temperature4": 0.2,  # °C
+    "/System/MOSTemperature": 0.5,  # °C — pure telemetry
+    "/TimeToGo": 60,  # s — an estimate whose own noise is far larger than a minute
+    "/ConsumedAmphours": 0.1,  # Ah — monotonically drifting, so it always publishes eventually
+    "/Capacity": 0.1,  # Ah
+}
+
+# Absorbs binary float representation error when comparing against a
+# threshold: values are published pre-rounded, so an exact one-step change
+# such as 4.34 -> 4.35 can compute as 0.00999999999999978 and would
+# otherwise be swallowed by a 0.01 gate.
+_GATE_TOLERANCE = 1e-9
+
+# Force a full re-publish at least this often even when nothing crosses a
+# threshold, so freshness watchers (VRM, GUI) can tell the service is alive.
+PUBLISH_HEARTBEAT_S = 900
+
+
+def _is_gateable_number(value) -> bool:
+    """True for real numbers only.
+
+    ``bool`` is a subclass of ``int`` in Python but is never a measurement,
+    so it must never be compared against a significance threshold.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 class _CachedDbusProxy:
     """Thin proxy around VeDbusService that suppresses redundant D-Bus writes.
 
@@ -47,8 +98,9 @@ class _CachedDbusProxy:
 
     This proxy keeps a lightweight in-process cache and only forwards
     the write to the real service when the new value differs from the
-    last written one, eliminating the majority of D-Bus traffic while
-    remaining fully transparent for reads and method calls.
+    last written one — and, for paths listed in PUBLISH_GATE_THRESHOLDS,
+    differs *significantly* — eliminating the majority of D-Bus traffic
+    while remaining fully transparent for reads and method calls.
 
     Used as a context manager it additionally batches: writes made inside
     a ``with`` block are collected in a velib ``ServiceContext`` and emitted
@@ -57,7 +109,7 @@ class _CachedDbusProxy:
     forwarded to the service immediately, exactly as before.
     """
 
-    __slots__ = ("_svc", "_cache", "_contexts")
+    __slots__ = ("_svc", "_cache", "_contexts", "_last_heartbeat")
 
     def __init__(self, svc):
         self._svc = svc
@@ -65,8 +117,17 @@ class _CachedDbusProxy:
         # Stack of open velib ServiceContexts, mirroring the service's own
         # rate-limiter stack so nested ``with`` blocks behave identically.
         self._contexts: list = []
+        self._last_heartbeat: float = time()
 
     def __enter__(self):
+        if not self._contexts:
+            # Heartbeat, evaluated only when the outermost block opens: drop
+            # the cache periodically so every path re-publishes once during
+            # the next cycle even if it never crossed its gate threshold.
+            now = time()
+            if now - self._last_heartbeat >= PUBLISH_HEARTBEAT_S:
+                self._last_heartbeat = now
+                self._cache.clear()
         self._contexts.append(self._svc.__enter__())
         return self
 
@@ -83,6 +144,14 @@ class _CachedDbusProxy:
         prev = self._cache.get(path, _SENTINEL)
         if prev is value or prev == value:
             return
+        if prev is not _SENTINEL and _is_gateable_number(value) and _is_gateable_number(prev):
+            threshold = PUBLISH_GATE_THRESHOLDS.get(path)
+            if threshold is not None and abs(value - prev) < threshold - _GATE_TOLERANCE:
+                # Sub-threshold flicker: suppress the write and deliberately
+                # keep the old cache entry as the comparison base, so slow
+                # cumulative drift still crosses the gate eventually instead
+                # of being reset on every cycle.
+                return
         self._cache[path] = value
         # Inside a ``with`` block the write is staged on the innermost
         # ServiceContext and flushed as part of its ItemsChanged signal.
