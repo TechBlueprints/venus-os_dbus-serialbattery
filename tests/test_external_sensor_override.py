@@ -485,7 +485,6 @@ class TestNeverOnlineFallbackEngagement:
         helper.battery = battery
         helper.fallback_mode = False
         helper.fallback_alive = False
-        helper.fallback_dark_since = None
         helper.fallback_last_alive = None
         helper.fallback_concluded_at = None
         helper.cell_voltages_good = None
@@ -523,13 +522,11 @@ class TestNeverOnlineFallbackEngagement:
         # drives the "- FALLBACK: on shunt" suffix on /Mgmt/Connection
         assert helper.fallback_alive is True
 
-    def test_both_instruments_dark_alarms_after_grace(self, monkeypatch):
-        # BMS down AND fallback not delivering: a real fault - BmsCable goes
-        # to alarm (2) after a 30s grace (a freshly restarted driver engages
-        # fallback seconds before its shunt objects resolve; alarming in that
-        # gap produced spurious VRM alarms at every driver restart mid-outage)
-        from time import time as now
-
+    def test_both_instruments_dark_alarms_immediately(self, monkeypatch):
+        # BMS down AND resolved fallback proxies delivering nothing: a real
+        # dual-instrument fault - BmsCable goes straight to alarm (2), as
+        # specified. (Unresolved proxies - the mid-outage restart gap - are
+        # NOT dark; see test below.)
         helper = self._make_helper(monkeypatch)
         helper.battery.dbus_fallback_objects = {
             "Voltage": _FakeDbusItem(None),
@@ -538,14 +535,20 @@ class TestNeverOnlineFallbackEngagement:
         loop = self._FakeLoop()
 
         helper.publish_battery(loop)
-        # first dark cycle: inside the grace window, no alarm yet
         assert helper.fallback_mode is True
         assert helper.fallback_alive is False
-        assert helper.bms_cable_alarm == 0
-
-        # dark for longer than the grace: alarm fires
-        helper.fallback_dark_since = now() - 60
-        helper.publish_battery(loop)
         assert helper.bms_cable_alarm == 2
+
+    def test_unresolved_fallback_proxies_are_not_dark(self, monkeypatch):
+        # A freshly restarted driver engages fallback before its D-Bus shunt
+        # objects are built; that gap must not fire the both-dark alarm (the
+        # shunt is healthy, only the plumbing is not wired yet - observed as
+        # spurious VRM BmsCable alarms at every mid-outage restart)
+        helper = self._make_helper(monkeypatch)
+        helper.battery.dbus_fallback_objects = None
+        loop = self._FakeLoop()
+
+        helper.publish_battery(loop)
+        assert helper.bms_cable_alarm == 0
         # dark grace not yet expired: no exit, values not reset yet
         assert loop.quit_called is False

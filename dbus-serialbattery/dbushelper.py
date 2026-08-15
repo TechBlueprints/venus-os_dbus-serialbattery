@@ -196,7 +196,6 @@ class DbusHelper:
         self.disconnect_threshold: int = None
         self.bms_cable_alarm: int = 0
         self.fallback_mode: bool = False
-        self.fallback_dark_since = None
         self.fallback_alive: bool = False
         """Whether the fallback sensor delivered a live value this cycle; drives the /Mgmt/Connection suffix."""
         self.fallback_last_alive: float = None
@@ -1423,18 +1422,19 @@ class DbusHelper:
                     # user-actionable degradation, so the warning is held back longer; but
                     # when the fallback goes dark too (or the fallback phase has concluded),
                     # both instruments are gone — that is a real fault, alarm immediately
-                    if not fallback_alive:
-                        if self.fallback_dark_since is None:
-                            self.fallback_dark_since = time()
-                    else:
-                        self.fallback_dark_since = None
-                    # 30s grace before the both-instruments-dark alarm: a
-                    # freshly (re)started driver engages fallback seconds
-                    # before its shunt objects resolve, and that gap fired
-                    # spurious BmsCable alarms (observed on VRM). A genuine
-                    # dual-instrument failure still alarms within a minute.
-                    dark_long_enough = self.fallback_dark_since is not None and (time() - self.fallback_dark_since) > 30.0
-                    if (self.fallback_mode and dark_long_enough) or self.fallback_concluded_at is not None:
+                    # "Dark" requires the fallback proxies to be RESOLVED and
+                    # returning nothing. A freshly (re)started driver engages
+                    # fallback seconds before its D-Bus shunt objects are
+                    # built; in that gap the shunt reads None because the
+                    # plumbing is not wired yet, not because the shunt is
+                    # silent - alarming there produced spurious BmsCable
+                    # alarms on VRM at every mid-outage restart while the
+                    # shunt was healthy the whole time. With resolved proxies
+                    # actually returning None, both instruments are genuinely
+                    # gone and the alarm stays immediate, as specified.
+                    fallback_resolved = bool(getattr(self.battery, "dbus_fallback_objects", None))
+                    fallback_dark = fallback_resolved and not fallback_alive
+                    if (self.fallback_mode and fallback_dark) or self.fallback_concluded_at is not None:
                         self.bms_cable_alarm = 2
                     else:
                         bms_cable_warn_seconds = utils.FALLBACK_BMS_CABLE_WARN_MINUTES * 60 if self.fallback_mode else 60
