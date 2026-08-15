@@ -202,6 +202,15 @@ class BCMBackend(BleConnectionBackend):
         if not _HAS_BCM:
             logger.error(f"BCMBackend selected but bleak_connection_manager is not importable: {_BCM_IMPORT_ERROR}")
             raise ImportError(_BCM_IMPORT_ERROR)
+        # Half-connect oscillation breaker: ConnectDevice can succeed at the
+        # HCI level while the subsequent establish fails ("device
+        # disappeared"), and each attempt re-occupies the peripheral so it
+        # never advertises long enough for scan-based resolution to repair
+        # the handoff. Observed three times in production, wedging a battery
+        # for 10-26 minutes each time. After 3 consecutive failures, skip
+        # the ConnectDevice-first path, pause so the device can advertise,
+        # and resolve by scan instead.
+        self._handoff_fails = 0
 
     def _adapters(self, address=None):
         pinned = adapters_for(address) if address else None
@@ -292,7 +301,10 @@ class BCMBackend(BleConnectionBackend):
         # BLUETOOTH_ADAPTERS remains a hard allow-list throughout.
         device = None
         connect_adapters = adapters
-        if adapters:
+        if self._handoff_fails >= 3:
+            logger.warning(f"BLE [{address}] {self._handoff_fails} consecutive half-connects — pausing 10s, then scan-resolving")
+            await asyncio.sleep(10.0)
+        if adapters and self._handoff_fails < 3:
             path = await self._connect_device_no_scan(address, adapters[0])
             if path:
                 from bleak.backends.device import BLEDevice
@@ -341,6 +353,7 @@ class BCMBackend(BleConnectionBackend):
                     connect_adapters = [adapter]
                     break
             if device is None:
+                self._handoff_fails += 1
                 raise Exception(f"device not resolvable on allowed adapters {adapters} (scan + ConnectDevice both failed)")
 
         client = await establish_connection(
@@ -377,8 +390,10 @@ class BCMBackend(BleConnectionBackend):
                 await client.disconnect()
             except Exception:
                 pass
+            self._handoff_fails += 1
             raise
         await asyncio.get_event_loop().run_in_executor(None, apply_supervision_timeout, address, connect_adapters or adapters)
+        self._handoff_fails = 0
         return client
 
     async def release(self, client):
