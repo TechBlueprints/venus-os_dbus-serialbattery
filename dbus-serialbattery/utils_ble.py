@@ -356,7 +356,8 @@ class BCMBackend(BleConnectionBackend):
                 self._handoff_fails += 1
                 raise Exception(f"device not resolvable on allowed adapters {adapters} (scan + ConnectDevice both failed)")
 
-        client = await establish_connection(
+        try:
+            client = await establish_connection(
             BleakClient,
             device,
             f"serialbattery {address}",
@@ -365,9 +366,12 @@ class BCMBackend(BleConnectionBackend):
             adapters=connect_adapters,
             close_inactive_connections=True,
             escalation_policy=escalation,
-            overall_timeout=240.0,
-            timeout=15.0,
-        )
+                overall_timeout=240.0,
+                timeout=15.0,
+            )
+        except Exception:
+            self._handoff_fails += 1
+            raise
         logger.info(f"BLE [{address}] connected via BCM")
 
         try:
