@@ -13,6 +13,12 @@ from utils import (
 )
 
 
+# Outer deadlines for the connection backend. Generous on purpose: they are a
+# last resort against a permanently parked await, not a connection timeout.
+BLE_ESTABLISH_TIMEOUT = 300.0
+BLE_RELEASE_TIMEOUT = 30.0
+
+
 class BleConnectionBackend:
     """
     Interface for establishing and releasing BLE connections.
@@ -184,7 +190,14 @@ class Syncron_Ble:
     async def connect_to_bms(self, address):
         self.client = self.backend.create_client(address, self.client_disconnected)
         try:
-            self.client = await self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback)
+            # Belt-and-braces deadline: a backend's own timeouts should always
+            # fire first, but no single stalled await may park the reconnect
+            # loop permanently. One unguarded D-Bus await once silenced
+            # reconnection for four hours without a single log line.
+            self.client = await asyncio.wait_for(
+                self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback),
+                timeout=BLE_ESTABLISH_TIMEOUT,
+            )
 
         except Exception as e:
             logger.error("Failed when trying to connect", e)
@@ -194,7 +207,12 @@ class Syncron_Ble:
             if self.client:
                 while self.client.is_connected and self.main_thread.is_alive():
                     await asyncio.sleep(0.1)
-                await self.backend.release(self.client)
+                try:
+                    await asyncio.wait_for(self.backend.release(self.client), timeout=BLE_RELEASE_TIMEOUT)
+                except Exception as e:
+                    # a disconnect that never completes must not prevent the
+                    # next connection attempt
+                    logger.warning(f"BLE [{address}] disconnect did not complete: {repr(e)}")
 
     # saves response and tells the command sender that the response has arived
     def notify_read_callback(self, sender, data: bytearray):
