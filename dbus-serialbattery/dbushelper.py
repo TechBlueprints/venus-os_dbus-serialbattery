@@ -149,6 +149,12 @@ class _CachedDbusProxy:
         prev = self._cache.get(path, _SENTINEL)
         if prev is value or prev == value:
             return
+        # NaN is not equal to itself, so an unchanged NaN passes the equality
+        # check above, and the threshold comparison below is False for NaN as
+        # well - without this guard it would be republished every cycle,
+        # forever. Treat NaN following NaN as unchanged.
+        if prev != prev and value != value:
+            return
         if prev is not _SENTINEL and _is_gateable_number(value) and _is_gateable_number(prev):
             threshold = PUBLISH_GATE_THRESHOLDS.get(path)
             if threshold is not None and abs(value - prev) < threshold - _GATE_TOLERANCE:

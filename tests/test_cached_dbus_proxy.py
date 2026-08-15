@@ -133,6 +133,24 @@ class TestSetItem:
         proxy["/ErrorCode"] = None
         assert mock_svc.__setitem__.call_count == 2
 
+    def test_unchanged_nan_is_suppressed(self, proxy, mock_svc):
+        # NaN != NaN, so the equality check cannot catch it and the threshold
+        # comparison is False for NaN too: without an explicit guard an
+        # unchanging NaN republishes on every cycle, forever.
+        proxy["/Dc/0/Voltage"] = float("nan")
+        proxy["/Dc/0/Voltage"] = float("nan")
+        assert mock_svc.__setitem__.call_count == 1
+
+    def test_nan_to_a_real_value_is_forwarded(self, proxy, mock_svc):
+        proxy["/Dc/0/Voltage"] = float("nan")
+        proxy["/Dc/0/Voltage"] = 52.4
+        assert mock_svc.__setitem__.call_count == 2
+
+    def test_real_value_to_nan_is_forwarded(self, proxy, mock_svc):
+        proxy["/Dc/0/Voltage"] = 52.4
+        proxy["/Dc/0/Voltage"] = float("nan")
+        assert mock_svc.__setitem__.call_count == 2
+
     def test_independent_paths_tracked_separately(self, proxy, mock_svc):
         proxy["/Soc"] = 50
         proxy["/Dc/0/Voltage"] = 13.6
