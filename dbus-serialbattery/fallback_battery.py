@@ -56,6 +56,17 @@ from utils import logger
 from battery import Cell
 
 
+def _alphanumeric(value) -> str:
+    """
+    Reduce a string to its lowercase alphanumeric characters, so identifiers
+    that differ only in punctuation and case compare equal.
+
+    :param value: the string to reduce
+    :return: the reduced string
+    """
+    return "".join(character for character in str(value).lower() if character.isalnum())
+
+
 class FallbackBattery:
     """Wrap a ``Battery`` so a fallback sensor serves while the BMS is away."""
 
@@ -250,7 +261,9 @@ class FallbackBattery:
         port = getattr(self.battery, "port", None) or "unknown"
         raw = port[port.rfind("/") + 1 :]
         address = getattr(self.battery, "address", None)
-        if address:
+        # Serial ports carry several bus addresses; BLE ports already spell the
+        # address out, so only add it when it is not in there already.
+        if address and _alphanumeric(address) not in _alphanumeric(raw):
             raw += "_" + str(address)
         return "".join(character if character.isalnum() else "_" for character in raw)
 

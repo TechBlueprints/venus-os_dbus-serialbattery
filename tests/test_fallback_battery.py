@@ -705,6 +705,16 @@ class TestStash:
         assert wrapper._stash_written > first
 
 
+class TestStashIdentifier:
+    def test_a_ble_port_does_not_repeat_its_address(self, monkeypatch, tmp_path):
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, battery=_FakeBattery(port="ble_5320b7d7f9e7", address="53:20:B7:D7:F9:E7"))
+        assert os.path.basename(wrapper._stash_path) == "fallback_state_ble_5320b7d7f9e7.json"
+
+    def test_a_serial_port_keeps_the_bus_address_apart(self, monkeypatch, tmp_path):
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, battery=_FakeBattery(port="/dev/ttyUSB0", address="0x02"))
+        assert os.path.basename(wrapper._stash_path) == "fallback_state_ttyUSB0_0x02.json"
+
+
 class TestTestConnection:
     def test_successful_driver_test_stamps_freshness(self, monkeypatch, tmp_path):
         wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT)
@@ -732,6 +742,120 @@ class TestTestConnection:
         wrapper.battery.refresh_result = False
         wrapper._stash = {"cell_count": 8}
         assert wrapper.test_connection() is False
+
+
+# ── end to end through DbusHelper ────────────────────────────────────────
+
+
+class _FakeDbusService(dict):
+    """Stand-in for the VeDbusService proxy: a dict that can be entered."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeLoop:
+    def __init__(self):
+        self.quit_called = False
+
+    def quit(self):
+        self.quit_called = True
+
+
+class TestPublishCycleThroughDbusHelper:
+    """Drive the real DbusHelper publish cycle against a wrapped battery.
+
+    This is the completeness check for the delegation surface: every
+    attribute, getter and setter DbusHelper touches has to resolve through
+    the wrapper, and the published values have to come from the shunt.
+    """
+
+    def _helper(self, monkeypatch, connected=False, shunt=_LIVE_SHUNT):
+        from dbushelper import DbusHelper
+
+        monkeypatch.setattr(utils, "EXTERNAL_SENSOR_DBUS_DEVICE", None)
+        monkeypatch.setattr(utils, "TIME_TO_GO_ENABLE", False)
+        monkeypatch.setattr(utils, "TIME_TO_SOC_POINTS", [])
+        monkeypatch.setattr(utils, "HISTORY_ENABLE", False)
+        monkeypatch.setattr(utils, "BMS_CABLE_ALARM", True)
+        monkeypatch.setattr(utils, "FALLBACK_BMS_CABLE_WARN_MINUTES", 480.0)
+
+        wrapper = _make_wrapper(monkeypatch, shunt=shunt, connected=connected)
+        helper = DbusHelper.__new__(DbusHelper)
+        helper.battery = wrapper
+        helper.cell_voltages_good = None
+        helper.disconnect_threshold = None
+        helper.bms_cable_alarm = 0
+        helper.error = {"cleared": True, "count": 0, "timestamp_first": None, "timestamp_last": None}
+        helper._dbusservice = _FakeDbusService({"/Mode": 3})
+        helper.history_calculated_last_time = int(_now())
+        helper.settings_saved_last_time = int(_now())
+        helper.last_seen_saved_last_time = int(_now())
+        helper.telemetry_upload = lambda: None
+        return helper
+
+    def test_a_full_cycle_publishes_the_shunt_values(self, monkeypatch):
+        helper = self._helper(monkeypatch)
+        helper.battery._last_fresh_time = _now() - 100
+        loop = _FakeLoop()
+
+        helper.publish_battery(loop)
+
+        service = helper._dbusservice
+        assert service["/Dc/0/Voltage"] == 25.5
+        assert service["/Dc/0/Current"] == -12.0
+        assert service["/Dc/0/Temperature"] == 21.0
+        assert service["/Soc"] == 61.0
+        assert service["/Capacity"] == pytest.approx(280.0 * 61.0 / 100)
+        assert service["/System/NrOfModulesOnline"] == 0
+        assert service["/System/NrOfModulesOffline"] == 1
+        assert service["/Mgmt/Connection"] == "BLE AA:BB - FALLBACK: on shunt"
+        assert "operating on live fallback values" in service["/ConnectionInformation"]
+        assert service["/Alarms/InternalFailure"] == 0
+        assert service["/Alarms/BmsCable"] == 0
+        # serving is not an outage as far as the driver lifecycle goes
+        assert loop.quit_called is False
+
+    def test_a_full_cycle_publishes_bms_values_while_fresh(self, monkeypatch):
+        helper = self._helper(monkeypatch, connected=True)
+        loop = _FakeLoop()
+
+        helper.publish_battery(loop)
+
+        service = helper._dbusservice
+        assert service["/Dc/0/Voltage"] == 26.0
+        assert service["/System/NrOfModulesOnline"] == 1
+        assert service["/Mgmt/Connection"] == "BLE AA:BB"
+        assert loop.quit_called is False
+
+    def test_the_delayed_cable_warning_reaches_dbus(self, monkeypatch):
+        helper = self._helper(monkeypatch)
+        helper.battery._last_fresh_time = _now() - 100
+        helper.publish_battery(_FakeLoop())
+        helper.battery._fallback_since = _now() - 480 * 60
+        helper.publish_battery(_FakeLoop())
+        assert helper._dbusservice["/Alarms/BmsCable"] == 1
+
+    def test_a_restart_request_quits_the_loop(self, monkeypatch):
+        helper = self._helper(monkeypatch)
+        helper.battery._last_fresh_time = _now() - 100
+        helper.battery.restart_requested = True
+        loop = _FakeLoop()
+        helper.publish_battery(loop)
+        assert loop.quit_called is True
+        assert helper._dbusservice["/Alarms/BmsCable"] == 2
+
+    def test_both_dark_falls_through_to_the_stock_disconnect_handling(self, monkeypatch):
+        helper = self._helper(monkeypatch, shunt={"Voltage": None})
+        helper.battery.battery.refresh_result = False
+        helper.battery._last_fresh_time = _now() - 100
+        helper.publish_battery(_FakeLoop())
+        # the wrapper stepped aside: DbusHelper counted an error of its own
+        assert helper.error["count"] == 1
+        assert helper.battery._serving is False
 
 
 # ── delegation integrity ─────────────────────────────────────────────────
