@@ -3,6 +3,7 @@ import asyncio
 import subprocess
 import sys
 from bleak import BleakClient
+from bleak.exc import BleakCharacteristicNotFoundError
 from time import sleep
 from utils import (
     logger,
@@ -54,7 +55,23 @@ class BleakBackend(BleConnectionBackend):
         logger.info("initiating BLE connection to: " + address)
         await client.connect()
         logger.info("connected to bluetooh device" + address)
-        await client.start_notify(notify_char, notify_callback)
+        # On some devices GATT characteristics become available only after connect()
+        # has already returned, so the first start_notify() can raise
+        # BleakCharacteristicNotFoundError for a characteristic that does exist.
+        # Re-run service discovery and retry before giving up.
+        for attempt in range(3):
+            try:
+                await client.start_notify(notify_char, notify_callback)
+                break
+            except BleakCharacteristicNotFoundError:
+                if attempt == 2:
+                    raise
+                logger.warning(f"characteristic {notify_char} not found yet, re-running service discovery")
+                # bleak has no public API to re-run service discovery on a connected
+                # client; clear the cached services so _get_services() fetches again
+                client._backend.services = None
+                await client._backend._get_services()
+                await asyncio.sleep(0.5)
         return client
 
     async def release(self, client):

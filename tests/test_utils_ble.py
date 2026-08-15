@@ -18,7 +18,13 @@ CONFIG_DEFAULT = os.path.join(DRIVER_DIR, "config.default.ini")
 sys.path.insert(0, DRIVER_DIR)
 
 if "bleak" not in sys.modules:
-    sys.modules["bleak"] = types.SimpleNamespace(BleakClient=object)
+    _bleak_exc = types.ModuleType("bleak.exc")
+    _bleak_exc.BleakCharacteristicNotFoundError = type("BleakCharacteristicNotFoundError", (Exception,), {})
+    _bleak = types.ModuleType("bleak")
+    _bleak.BleakClient = object
+    _bleak.exc = _bleak_exc
+    sys.modules["bleak"] = _bleak
+    sys.modules["bleak.exc"] = _bleak_exc
 
 
 def _load_utils_ble():
