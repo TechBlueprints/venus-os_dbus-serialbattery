@@ -25,6 +25,7 @@
 ### What's Changed
 
 * Added: `/CapacityBms` and `/ConsumedAmphoursBms` D-Bus paths to expose the raw BMS remaining/consumed Ah values alongside the calculated ones when `SOC_CALCULATION` or `EXTERNAL_SENSOR_DBUS_PATH_SOC` is active, mirroring the existing `/SocBms` path. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/414 by @mr-manuel
+* Added: `/Measurement/*` D-Bus paths, so consumers that sum battery services can tell independent measurements apart from two views of the same physical battery: `/Measurement/Kind` (`direct` for a battery publishing its own sensor readings), `/Measurement/PhysicalDevice` (stable ID of the observed pack) and, when the battery is paired with another service measuring the same pack, `/Measurement/PeerServices` and `/Measurement/LineAuthority`. Without this a pack measured by both its BMS and a SmartShunt on its terminals is counted twice, which propagates into the DC totals and from there into the DVCC compensation by @cgoudie
 * Added: aiobmsble library (https://github.com/patman15/aiobmsble), which adds a lot of Bluetooth batteries to Venus OS by @mr-manuel
 * Added: BMS auto detection caching - the last detected BMS type per serial port is cached to disk and tried first on the next start, falling back to the full auto detection scan if it's not found after 3 tries by @mr-manuel
 * Added: Daren 485 BMS - Read SoH with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/344 by @kopierschnitte

@@ -625,6 +625,49 @@ class DbusHelper:
         self._dbusservice.add_path("/ErrorCode", self.battery.error_code, writeable=True)
         self._dbusservice.add_path("/ConnectionInformation", "")
 
+        # Measurement topology declarations
+        #
+        # Any consumer that SUMS battery services (aggregators, DC system
+        # calculators, custom dashboards) has to know whether two services are
+        # two batteries or two views of the SAME battery. Without that, a pack
+        # measured by both its BMS and a SmartShunt on its terminals is counted
+        # twice, which propagates into the DC power/current totals and from
+        # there into the DVCC compensation. These paths state the relationship
+        # explicitly, so consumers do not have to guess it from service names:
+        #
+        #   /Measurement/Kind            "direct"  - this service publishes its
+        #                                own sensor readings. (An aggregator
+        #                                republishing other services would
+        #                                declare "derived".)
+        #   /Measurement/PhysicalDevice  Stable, opaque ID of the physical
+        #                                battery being observed. Two services
+        #                                declaring the same ID observe the same
+        #                                pack and must not be summed.
+        #   /Measurement/PeerServices    Other services observing the same
+        #                                physical device. Declared here because
+        #                                Victron's own driver services (e.g. a
+        #                                SmartShunt) do not declare themselves,
+        #                                so the battery speaks for its shunt.
+        #   /Measurement/LineAuthority   The service that should be treated as
+        #                                the truth for line voltage/current
+        #                                (the shunt, when one is paired).
+        #
+        # Peers/authority are only meaningful when this battery is paired with
+        # another service measuring the same pack. The pairing is looked up
+        # generically, so any future source of a paired sensor service can
+        # supply it; a battery with no pairing simply declares no peers and the
+        # two paths are left off the service entirely (an absent path is the
+        # honest encoding for "nothing to declare" - a path present but empty
+        # would suggest a value still to come; /Measurement/Kind is always
+        # present, so consumers can still tell a battery that speaks this
+        # vocabulary from one that does not).
+        self._dbusservice.add_path("/Measurement/Kind", "direct")
+        self._dbusservice.add_path("/Measurement/PhysicalDevice", "battery:" + self.bms_id)
+        paired_service = getattr(self.battery, "get_paired_sensor_device", lambda: None)()
+        if paired_service is not None:
+            self._dbusservice.add_path("/Measurement/PeerServices", paired_service)
+            self._dbusservice.add_path("/Measurement/LineAuthority", paired_service)
+
         # Create static battery info
         self._dbusservice.add_path(
             "/Info/BatteryLowVoltage",
