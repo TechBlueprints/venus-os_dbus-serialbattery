@@ -870,6 +870,12 @@ class FallbackBattery:
                 f">>> No BMS contact at startup — registering from the fallback stash and serving {self._device}. "
                 "The driver keeps trying to reach the BMS in the background. <<<"
             )
+            # Resolve the sensor and serve one cycle BEFORE the service is
+            # registered, so the values are real the instant the paths exist.
+            # Consumers that recompute on change sample the leading edge by
+            # construction, and would otherwise read None off a brand-new
+            # service for a full poll interval.
+            self.refresh_data()
             return True
         return False
 

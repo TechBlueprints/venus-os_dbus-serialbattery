@@ -829,6 +829,27 @@ class TestTestConnection:
         wrapper._stash = {"cell_count": 8}
         assert wrapper.test_connection() is False
 
+    def test_stash_registration_serves_before_the_service_exists(self, monkeypatch, tmp_path):
+        # The paths are added as None by setup_vedbus; a consumer that
+        # recomputes on value change samples that leading edge. Values must
+        # already be real when test_connection returns.
+        monkeypatch.setattr(utils, "FALLBACK_SENSOR_DBUS_DEVICE", "com.victronenergy.battery.ttyS2")
+        monkeypatch.setattr(FallbackBattery, "STASH_DIRECTORY", str(tmp_path))
+        battery = _FakeBattery()
+        battery.refresh_result = False
+        battery.voltage = None
+        battery.current = None
+        battery.soc = None
+        wrapper = FallbackBattery(battery)
+        wrapper._stash = {"cell_count": 8, "capacity": 280.0}
+        wrapper.dbus_fallback_objects = {key: _FakeDbusItem(value) for key, value in _LIVE_SHUNT.items()}
+
+        assert wrapper.test_connection() is True
+        assert wrapper._serving is True
+        assert wrapper.get_voltage() == _LIVE_SHUNT["Voltage"]
+        assert wrapper.get_current() == _LIVE_SHUNT["Current"]
+        assert wrapper.get_soc() == _LIVE_SHUNT["Soc"]
+
 
 # ── end to end through DbusHelper ────────────────────────────────────────
 
