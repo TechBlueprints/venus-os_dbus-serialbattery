@@ -262,6 +262,10 @@ CURRENT_CORRECTION: bool = CURRENT_REPORTED_BY_BMS != CURRENT_MEASURED_BY_USER
 BLUETOOTH_USE_POLLING = get_bool_from_config("DEFAULT", "BLUETOOTH_USE_POLLING")
 BLUETOOTH_FORCE_RESET_BLE_STACK = get_bool_from_config("DEFAULT", "BLUETOOTH_FORCE_RESET_BLE_STACK")
 BLUETOOTH_CONNECTION_BACKEND: str = config["DEFAULT"]["BLUETOOTH_CONNECTION_BACKEND"].strip()
+# Bluetooth adapters (hciX) to use for BLE BMS connections. A plain hciX entry
+# joins the shared pool, an entry of the form MAC@hciX pins that device to that
+# adapter. Empty list = use the system default adapter.
+BLUETOOTH_ADAPTERS: List[str] = get_list_from_config("DEFAULT", "BLUETOOTH_ADAPTERS", str)
 
 # --------- Daisy Chain Configuration (Multiple BMS on one cable) ---------
 BATTERY_ADDRESSES: list = get_list_from_config("DEFAULT", "BATTERY_ADDRESSES", str)

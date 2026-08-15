@@ -26,6 +26,7 @@
 
 * Added: `/CapacityBms` and `/ConsumedAmphoursBms` D-Bus paths to expose the raw BMS remaining/consumed Ah values alongside the calculated ones when `SOC_CALCULATION` or `EXTERNAL_SENSOR_DBUS_PATH_SOC` is active, mirroring the existing `/SocBms` path. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/414 by @mr-manuel
 * Added: aiobmsble library (https://github.com/patman15/aiobmsble), which adds a lot of Bluetooth batteries to Venus OS by @mr-manuel
+* Added: `BLUETOOTH_ADAPTERS` config option to restrict Bluetooth LE BMS connections to specific adapters. Plain `hciX` entries form a shared pool that unpinned devices rotate through after a failed attempt, while an entry of the form `MAC@hciX` pins that battery to exactly that adapter with no rotation and no fallback. Helps on GX devices where several BLE services share a few adapters: scan contention causes `org.bluez.Error.InProgress` storms, and a misbehaving controller drops every LE link on its adapter at once by @cgoudie
 * Added: `BLUETOOTH_CONNECTION_BACKEND` config option to select how Bluetooth LE connections are established. Currently only `BleakBackend` (the existing behavior) is available by @cgoudie
 * Added: BMS auto detection caching - the last detected BMS type per serial port is cached to disk and tried first on the next start, falling back to the full auto detection scan if it's not found after 3 tries by @mr-manuel
 * Added: Daren 485 BMS - Read SoH with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/344 by @kopierschnitte

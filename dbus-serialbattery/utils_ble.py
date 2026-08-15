@@ -1,6 +1,7 @@
 import threading
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import time
@@ -8,10 +9,191 @@ from bleak import BleakClient
 from time import sleep
 from utils import (
     logger,
+    BLUETOOTH_ADAPTERS,
     BLUETOOTH_CONNECTION_BACKEND,
     BLUETOOTH_FORCE_RESET_BLE_STACK,
     capture_raw_data,
 )
+
+# What the kernel reports for a controller it cannot talk to - a dead onboard
+# UART radio answers with this forever, and it must never be written back to
+# the config as if it were an identity.
+UNKNOWN_ADAPTER_MAC = "00:00:00:00:00:00"
+
+
+def parse_adapter_entries(entries):
+    """
+    Split BLUETOOTH_ADAPTERS into pinned devices and the shared pool.
+
+    Entries of the form DEVICE@ADAPTER pin that device to exactly that
+    adapter: no rotation and no fallback to any other adapter. Entries
+    without an "@" form the pool used by every device that is not pinned.
+    Returns (pins, pool), with pins keyed by upper case device address.
+
+    ADAPTER may be an hciX name or the adapter's own MAC. Prefer the MAC:
+    hciX numbering is assigned in probe order and a reboot or USB reset can
+    renumber the dongles, silently re-pointing a pin at different hardware
+    while everything still appears to work. The adapter's MAC does not move.
+
+    Entries without an "@" form the pool used by every device that is not
+    pinned, and may likewise be hciX names or adapter MACs.
+    Returns (pins, pool), with pins keyed by upper case MAC address and each
+    value a list of adapters in priority order.
+    """
+    pins = {}
+    pool = []
+    for entry in entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "@" in entry:
+            mac, _, adapter = entry.rpartition("@")
+            mac = mac.strip().upper()
+            adapter = adapter.strip()
+            if mac and adapter:
+                pins[mac] = adapter
+            else:
+                logger.warning(f"Ignoring malformed BLUETOOTH_ADAPTERS entry '{entry}'")
+        else:
+            pool.append(entry)
+    return pins, pool
+
+
+BLUETOOTH_ADAPTER_PINS, BLUETOOTH_ADAPTER_POOL = parse_adapter_entries(BLUETOOTH_ADAPTERS)
+
+
+def adapters_for(address):
+    """Pinned adapter (as a single-element list) for this device, or None."""
+    pin = BLUETOOTH_ADAPTER_PINS.get(str(address).strip().upper())
+    return [pin] if pin else None
+
+
+MAC_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+
+def is_adapter_mac(entry):
+    """Whether a configured adapter entry names a MAC rather than an hciN."""
+    return bool(MAC_PATTERN.match(str(entry).strip()))
+
+
+# Adapter identity is read from the kernel, never over D-Bus, and cached for
+# this long. Short enough that a replugged or reset card is noticed, long
+# enough that a battery reconnecting in a tight loop does not spawn a
+# subprocess per attempt.
+ADAPTER_IDENTITY_TTL = 30.0
+_adapter_identity_cache = {"at": 0.0, "adapters": {}}
+
+
+def _adapters_from_sysfs():
+    """{hciN: MAC} from /sys/class/bluetooth, or {} if the kernel has no
+    address attribute there - which is the case on Venus OS."""
+    adapters = {}
+    try:
+        names = [n for n in os.listdir("/sys/class/bluetooth") if n.startswith("hci")]
+    except OSError:
+        return {}
+    for name in names:
+        try:
+            with open(f"/sys/class/bluetooth/{name}/address") as f:
+                mac = f.read().strip().upper()
+        except OSError:
+            continue
+        if mac:
+            adapters[name] = mac
+    return adapters
+
+
+def _adapters_from_hciconfig():
+    """{hciN: MAC} by parsing one bare hciconfig call.
+
+    One call returns the whole table, so this spawns a single subprocess
+    however many adapters the box has - the production GX device has seven.
+    """
+    try:
+        result = subprocess.run(["hciconfig"], capture_output=True, text=True, timeout=5)
+    except Exception as e:
+        logger.debug(f"hciconfig unavailable: {repr(e)}")
+        return {}
+    adapters = {}
+    name = None
+    for line in result.stdout.splitlines():
+        match = re.match(r"^(hci\d+):", line)
+        if match:
+            name = match.group(1)
+            continue
+        if name:
+            found = re.search(r"BD Address:\s*([0-9A-Fa-f:]{17})", line)
+            if found:
+                adapters[name] = found.group(1).upper()
+                name = None
+    return adapters
+
+
+def bluez_adapters():
+    """
+    {hciN: MAC} for the adapters the kernel currently exposes, or {} for
+    "no answer".
+
+    hciN names are not stable identities: a USB reset or reboot renumbers
+    them, and an adapter a battery is configured for can stop existing while
+    its number lives on pointing at different hardware. The adapter's own MAC
+    is stable, so configuration can name that instead and be resolved here.
+
+    Read from the kernel and NOT over D-Bus, deliberately. This runs on the
+    BLE thread - resolve_adapter -> adapters_in_attempt_order ->
+    _select_adapter is the connect path - and asking BlueZ from here crashed
+    the driver. dbus-python's DBusGMainLoop supports only the DEFAULT GLib
+    main context, so a connection opened on this thread still registers its
+    watches and dispatch source on the MAIN thread's loop, and closing it
+    here frees the connection while that loop is still using it. Two core
+    dumps showed the main thread dying inside dbus_connection_dispatch, once
+    on a freed hash table and once on a freed mutex, and the same process
+    also aborted in malloc; one use-after-free with three presentations.
+    dbus-python belongs on the main thread, for velib.
+
+    sysfs first because it is a plain file read; hciconfig as the fallback
+    because Venus OS kernels expose no address attribute under
+    /sys/class/bluetooth at all, so on the GX devices the fallback is what
+    actually runs. An all-zeros address is what a dead or unserved
+    controller reports and never identifies anything, so it is dropped
+    rather than cached as an identity.
+    """
+    now = time.monotonic()
+    if _adapter_identity_cache["adapters"] and now - _adapter_identity_cache["at"] < ADAPTER_IDENTITY_TTL:
+        return dict(_adapter_identity_cache["adapters"])
+    adapters = _adapters_from_sysfs() or _adapters_from_hciconfig()
+    adapters = {name: mac for name, mac in adapters.items() if mac != UNKNOWN_ADAPTER_MAC}
+    if adapters:
+        _adapter_identity_cache["at"] = now
+        _adapter_identity_cache["adapters"] = dict(adapters)
+    return adapters
+
+
+def bluez_present_adapters():
+    """Adapter names BlueZ currently exposes, or an empty set for "no answer"."""
+    return set(bluez_adapters())
+
+
+def resolve_adapter(entry, adapters=None):
+    """
+    A configured adapter entry as the hciN name to hand to bleak, or None.
+
+    An hciN entry is returned unchanged - it is already what bleak wants, and
+    configuration written that way keeps working. A MAC entry is looked up in
+    live BlueZ state, which is the whole point of allowing MACs: the dongle
+    keeps its address across the renumbering that invalidates its name. A MAC
+    that matches nothing present returns None, meaning that radio is gone.
+    """
+    entry = str(entry).strip()
+    if not is_adapter_mac(entry):
+        return entry
+    if adapters is None:
+        adapters = bluez_adapters()
+    target = entry.upper()
+    for name, mac in adapters.items():
+        if mac and mac.upper() == target:
+            return name
+    return None
 
 
 # Hold flag: while the flag file for a device exists, the reconnect loop makes
@@ -72,13 +254,47 @@ class BleakBackend(BleConnectionBackend):
     """
     Default backend: connects directly with bleak, matching the historical
     behavior of this driver.
+
+    If BLUETOOTH_ADAPTERS is set, connections are made only via the listed
+    adapters: a device pinned with MAC@hciX always uses that adapter, every
+    other device takes the next entry of the shared pool after a failed
+    attempt. An empty list uses the system default adapter.
     """
 
+    def __init__(self):
+        self.adapter_index = 0
+        self.current_adapter = None
+
     def create_client(self, address, disconnected_callback):
-        return BleakClient(address, disconnected_callback=disconnected_callback)
+        kwargs = {}
+        pinned = adapters_for(address)
+        if pinned:
+            entry = pinned[0]
+        elif BLUETOOTH_ADAPTER_POOL:
+            entry = BLUETOOTH_ADAPTER_POOL[self.adapter_index % len(BLUETOOTH_ADAPTER_POOL)]
+        else:
+            entry = None
+        # a configured entry may name the adapter by MAC, which is not a name
+        # bleak understands: resolve it to whatever hciX the card answers to
+        # right now, and fall back to the system default when the card that
+        # MAC belongs to is not present
+        self.current_adapter = resolve_adapter(entry) if entry else None
+        if self.current_adapter:
+            kwargs["adapter"] = self.current_adapter
+        return BleakClient(address, disconnected_callback=disconnected_callback, **kwargs)
 
     async def establish(self, client, address, notify_char, notify_callback):
-        logger.info("initiating BLE connection to: " + address)
+        try:
+            return await self._establish(client, address, notify_char, notify_callback)
+        except Exception:
+            # rotate to the next pool adapter for the next attempt; pinned
+            # devices never rotate, and an all-pinned config has an empty pool
+            if BLUETOOTH_ADAPTER_POOL:
+                self.adapter_index += 1
+            raise
+
+    async def _establish(self, client, address, notify_char, notify_callback):
+        logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
         await client.connect()
         logger.info("connected to bluetooh device" + address)
         await client.start_notify(notify_char, notify_callback)
