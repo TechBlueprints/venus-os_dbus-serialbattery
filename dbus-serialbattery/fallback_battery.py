@@ -428,6 +428,11 @@ class FallbackBattery:
         refresh worth stamping as "real data". A driver that returns True
         with empty core values has not delivered anything to serve.
 
+        Note for other drivers: a BMS that never reports SoC at all would
+        never stamp here and would therefore serve the fallback sensor
+        permanently. Relax this to the values that BMS does report when one
+        turns up; every driver in tree reports all three.
+
         :return: True if voltage, current and SoC are all set
         """
         return self.battery.voltage is not None and self.battery.current is not None and self.battery.soc is not None
