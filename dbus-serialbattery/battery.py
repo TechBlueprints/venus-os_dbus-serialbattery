@@ -1822,7 +1822,7 @@ class Battery(ABC):
         # while the BMS is offline, derive from soc_calc so Capacity and ConsumedAmphours
         # stay consistent with the served SoC (live from the fallback sensor if configured)
         # instead of the frozen BMS-reported remaining capacity
-        if self.online is False and self.capacity is not None and self.soc_calc is not None:
+        if self.use_fallback_values() and self.capacity is not None and self.soc_calc is not None:
             return self.capacity * self.soc_calc / 100
         if self.capacity_remain is not None:
             return self.capacity_remain
@@ -2311,14 +2311,28 @@ class Battery(ABC):
             logger.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
             logger.error("Fallback sensor setup failed, fallback mode not available")
 
+    def use_fallback_values(self) -> bool:
+        """
+        Whether published values should come from the fallback sensor
+        instead of the BMS. The default preserves the classic behavior
+        (serve fallback only once the framework has marked the battery
+        offline). Drivers that track the age of their own data can
+        override this with a freshness check - serving becomes a pure
+        function of data age, indifferent to connection state, driver
+        restarts, holds, or any other machinery (stale BMS values are
+        stale no matter WHY they are stale).
+        """
+        return self.online is False
+
     def get_value_from_fallback_sensor(self, key: str) -> Union[float, None]:
         """
-        Read a value from the fallback sensor while the BMS is offline.
+        Read a value from the fallback sensor while the BMS data is not
+        current (see use_fallback_values).
 
         :param key: The item key ("Voltage", "Current" or "Temperature")
         :return: The value from the fallback sensor, or None if not available
         """
-        if self.online is not False:
+        if not self.use_fallback_values():
             return None
         if self.dbus_fallback_objects is None or key not in self.dbus_fallback_objects or self.dbus_fallback_objects[key] is None:
             return None

@@ -153,6 +153,12 @@ class HumsiENK_Ble(Battery):
         self._rx_buffer = bytearray()  # Receive buffer for assembling frames
         self._min_response_len = 5  # Minimum: [0xAA, CMD, LEN, CHK_LO, CHK_HI] = 5 bytes (zero data)
         self._last_frame_time = 0.0
+        # Timestamp of the last checksum-verified frame RECEIVED FROM THE
+        # RADIO this process lifetime (never pre-seeded from init or disk
+        # snapshots, unlike _last_frame_time). Drives use_fallback_values:
+        # BMS data older than FALLBACK_FRESHNESS_SECONDS is served from the
+        # fallback sensor regardless of connection state.
+        self._last_live_frame_time = 0.0
         self._last_trigger_time = 0.0  # Unified polling timer (all cmds every 3s)
         self._last_heartbeat_log = 0.0
         self._last_stale_log = 0.0
@@ -354,6 +360,23 @@ class HumsiENK_Ble(Battery):
                 self.protection.internal_failure = 2
 
         return True
+
+    FALLBACK_FRESHNESS_SECONDS = 15.0
+
+    def use_fallback_values(self):
+        """Serve fallback values whenever live BMS data is stale, full stop.
+
+        Freshness-based source selection (Clint's design): if a verified
+        frame arrived from the radio within FALLBACK_FRESHNESS_SECONDS,
+        publish BMS values; otherwise publish the fallback sensor's. No
+        dependence on the online flag, engagement state machines, driver
+        restarts, holds, or Bluetooth machinery - a restart mid-outage
+        serves shunt data from its very first publish cycle because a
+        fresh process has, by definition, no live frames yet.
+        """
+        if self.dbus_fallback_objects is None:
+            return self.online is False  # no fallback configured: classic behavior
+        return (time.time() - self._last_live_frame_time) > self.FALLBACK_FRESHNESS_SECONDS
 
     def test_connection(self):
         """Create the BLE handle and return True so the framework registers us.
@@ -686,6 +709,7 @@ class HumsiENK_Ble(Battery):
                         logger.debug(f"HumsiENK: RX {cmd_name} ({data_len}B)")
                     self._parse_and_update(frame)
                     self._last_frame_time = time.time()
+                    self._last_live_frame_time = self._last_frame_time
                     data_refreshed = True
                     # Feed the connection watchdog — this is the ONLY
                     # place it gets fed, proving the BMS is sending
