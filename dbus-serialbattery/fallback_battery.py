@@ -318,6 +318,26 @@ class FallbackBattery:
     def __repr__(self):
         return f"FallbackBattery({self.battery!r})"
 
+    # ── measurement topology ─────────────────────────────────────────────
+
+    def get_paired_sensor_device(self) -> Union[str, None]:
+        """
+        Expose the paired instrument for consumers that need the measurement
+        topology: a second dbus service measuring the same physical battery.
+
+        This wrapper is the only component that knows a battery has a second
+        instrument on it, so it is the natural place to publish that fact.
+        The name is deliberately generic rather than fallback specific: the
+        pairing is a physical fact about the installation — a shunt bolted to
+        the same pack — not a feature of this wrapper. Serving values from
+        that instrument during an outage is one use of the pairing; declaring
+        it so that consumers do not double count the pack is another.
+
+        :return: the dbus service name of the paired sensor, or None when no
+            fallback sensor device is configured for this battery
+        """
+        return self._device
+
     # ── fallback sensor plumbing ─────────────────────────────────────────
 
     def setup_fallback_sensor(self) -> None:

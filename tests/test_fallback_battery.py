@@ -143,6 +143,56 @@ class TestResolveDevice:
         assert FallbackBattery.configured_for(battery) is False
 
 
+# ── measurement topology ─────────────────────────────────────────────────
+
+
+class TestPairedSensorDevice:
+    """The wrapper publishes the paired instrument, so consumers that need the
+    measurement topology can learn that a second service measures this pack."""
+
+    def test_paired_device_is_the_resolved_service(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(FallbackBattery, "STASH_DIRECTORY", str(tmp_path))
+        monkeypatch.setattr(utils, "FALLBACK_SENSOR_DBUS_DEVICE", "ble_5320b7d7f9e7:com.victronenergy.battery.ttyS5")
+        wrapper = FallbackBattery(_FakeBattery(port="/ble_5320b7d7f9e7"))
+        assert wrapper.get_paired_sensor_device() == "com.victronenergy.battery.ttyS5"
+
+    def test_no_configured_device_means_no_pairing(self, monkeypatch, tmp_path):
+        wrapper = _make_wrapper(monkeypatch, tmp_path)
+        assert wrapper.get_paired_sensor_device() is None
+
+    def test_mapping_without_a_match_means_no_pairing(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(FallbackBattery, "STASH_DIRECTORY", str(tmp_path))
+        monkeypatch.setattr(utils, "FALLBACK_SENSOR_DBUS_DEVICE", "ble_5320b7d7f9e7:com.victronenergy.battery.ttyS5")
+        wrapper = FallbackBattery(_FakeBattery(port="/ble_ab807254e0b4"))
+        assert wrapper.get_paired_sensor_device() is None
+
+    def test_the_pairing_is_stated_regardless_of_the_serving_state(self, monkeypatch, tmp_path):
+        """The pairing is a physical fact, not a mode: it holds while the BMS
+        is answering and while the shunt is being served."""
+        monkeypatch.setattr(FallbackBattery, "STASH_DIRECTORY", str(tmp_path))
+        monkeypatch.setattr(utils, "FALLBACK_SENSOR_DBUS_DEVICE", "com.victronenergy.battery.ttyS5")
+        # there is no bus in the test process; the resolved proxies are injected
+        monkeypatch.setattr(FallbackBattery, "_watch_fallback_sensor", lambda self: None)
+        battery = _FakeBattery()
+        battery.ble_handle = _FakeBleHandle(connected=True)
+        wrapper = FallbackBattery(battery)
+        wrapper.dbus_fallback_objects = {key: _FakeDbusItem(value) for key, value in _LIVE_SHUNT.items()}
+        wrapper.refresh_data()
+        assert wrapper._serving is False
+        assert wrapper.get_paired_sensor_device() == "com.victronenergy.battery.ttyS5"
+        battery.ble_handle.connected = False
+        wrapper.refresh_data()
+        assert wrapper._serving is True
+        assert wrapper.get_paired_sensor_device() == "com.victronenergy.battery.ttyS5"
+
+    def test_the_accessor_is_not_swallowed_by_the_forwarding_wrapper(self, monkeypatch, tmp_path):
+        """The wrapped driver has no such method; the wrapper must answer it
+        itself rather than forwarding the lookup and raising."""
+        wrapper = _make_wrapper(monkeypatch, tmp_path)
+        assert not hasattr(wrapper.battery, "get_paired_sensor_device")
+        assert getattr(wrapper, "get_paired_sensor_device", lambda: "unreachable")() is None
+
+
 # ── serving rule ─────────────────────────────────────────────────────────
 
 
