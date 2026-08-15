@@ -129,6 +129,7 @@ def adapters_in_attempt_order(address, present=None):
 # the file is removed.
 BLE_HOLD_FLAG_DIR = "/data/tmp"
 BLE_HOLD_FLAG_PREFIX = "ble-hold-"
+BLE_HOLD_AUTO_MARKER = "auto"
 BLE_HOLD_AUTO_EXPIRY = 1200.0
 BLE_HOLD_POLL_INTERVAL = 5
 
@@ -136,6 +137,53 @@ BLE_HOLD_POLL_INTERVAL = 5
 def ble_hold_flag_path(address):
     """Path of the hold flag file for the given device address."""
     return os.path.join(BLE_HOLD_FLAG_DIR, BLE_HOLD_FLAG_PREFIX + str(address).replace(":", "").lower())
+
+
+def ble_hold_expired(path, now=None):
+    """
+    True if the hold flag at path is an automatic hold past its expiry.
+
+    An automatic hold is written by a recovery path and releases itself after
+    BLE_HOLD_AUTO_EXPIRY; a flag with any other content is an operator hold and
+    never expires. Raises if the flag cannot be read - the caller decides
+    whether an unreadable flag should still hold.
+    """
+    with open(path) as f:
+        automatic = f.read().strip() == BLE_HOLD_AUTO_MARKER
+    age = (time.time() if now is None else now) - os.path.getmtime(path)
+    return automatic and age > BLE_HOLD_AUTO_EXPIRY
+
+
+def write_ble_auto_hold(address):
+    """
+    Write the self-expiring hold flag for a device, and say whether it stuck.
+
+    The reconnect loop stops attempting connections while the flag exists, so
+    this buys a degraded BMS radio a stretch of true quiet without taking the
+    driver or its dbus service down. Written as an automatic hold, so it
+    releases itself; an operator hold has to be removed by hand.
+    """
+    flag = ble_hold_flag_path(address)
+    try:
+        os.makedirs(BLE_HOLD_FLAG_DIR, exist_ok=True)
+        with open(flag, "w") as f:
+            f.write(BLE_HOLD_AUTO_MARKER)
+        return True
+    except Exception as e:
+        logger.warning(f"BLE [{address}] auto-hold flag {flag} could not be written: {repr(e)}")
+        return False
+
+
+# Half-connect oscillation breaker (BCMBackend): how many consecutive
+# half-connects before the backend stops connecting blind, and how long it
+# then waits so the peripheral gets to advertise again.
+BLE_HANDOFF_BREAKER_THRESHOLD = 3
+BLE_HANDOFF_BREAKER_PAUSE = 10.0
+
+# Auto-hold: this many breaker engagements inside this window means the short
+# pauses are not curing it, so the hold flag goes on for real radio quiet.
+BLE_AUTO_HOLD_THRESHOLD = 10
+BLE_AUTO_HOLD_WINDOW = 300.0
 
 
 # Outer deadlines for the connection backend. Generous on purpose: they are a
@@ -387,6 +435,50 @@ class BCMBackend(BleConnectionBackend):
         if not _HAS_BCM:
             raise ImportError(f"bleak_connection_manager is not importable: {_BCM_IMPORT_ERROR}")
         self._disconnected_callback = None
+        # Half-connect oscillation breaker, see _breaker_tripped()
+        self._handoff_fails = 0
+        # Timestamps of recent breaker engagements, see _engage_breaker()
+        self._breaker_times = []
+
+    def _breaker_tripped(self):
+        """
+        True once half-connects have repeated enough to stop connecting blind.
+
+        ConnectDevice can succeed at the HCI level while the handoff to a
+        usable GATT link fails, and every attempt re-occupies the peripheral,
+        so it never gets to advertise long enough for scan-based resolution to
+        repair the handoff. Left alone this oscillates: seen three times in
+        production, each time wedging one battery for 10 to 26 minutes. Once
+        tripped, the backend pauses and resolves by scan instead.
+        """
+        return self._handoff_fails >= BLE_HANDOFF_BREAKER_THRESHOLD
+
+    def _engage_breaker(self, address, now=None):
+        """
+        Record a breaker engagement; write the auto-hold flag on a storm.
+
+        A burst of engagements means the short pauses are not curing it, and
+        the BMS radio is in a degraded state that only extended quiet clears -
+        twice in production a manual hold was what ended an identical episode.
+        This automates that: BLE_AUTO_HOLD_THRESHOLD engagements inside
+        BLE_AUTO_HOLD_WINDOW writes the hold flag, and the reconnect loop
+        stands down until it expires. Returns True if a hold was written.
+        """
+        now = time.time() if now is None else now
+        self._breaker_times = [t for t in self._breaker_times if now - t < BLE_AUTO_HOLD_WINDOW]
+        self._breaker_times.append(now)
+        if len(self._breaker_times) < BLE_AUTO_HOLD_THRESHOLD:
+            return False
+        # start a fresh window: the hold is in force, engagements before it
+        # must not immediately re-trigger once attempts resume
+        self._breaker_times = []
+        if not write_ble_auto_hold(address):
+            return False
+        logger.error(
+            f"BLE [{address}] breaker storm ({BLE_AUTO_HOLD_THRESHOLD} engagements in under "
+            f"{BLE_AUTO_HOLD_WINDOW / 60:.0f} min), auto-hold: {BLE_HOLD_AUTO_EXPIRY / 60:.0f} min of radio quiet"
+        )
+        return True
 
     def _adapters(self, address=None):
         pinned = adapters_for(address) if address else None
@@ -526,22 +618,38 @@ class BCMBackend(BleConnectionBackend):
         adapters = self._adapters(address)
         escalation = EscalationPolicy(adapters or [], config=PROFILE_BATTERY)
 
-        device, connect_adapters = await self._resolve_device(address, adapters)
+        tripped = self._breaker_tripped()
+        if tripped:
+            logger.warning(
+                f"BLE [{address}] {self._handoff_fails} consecutive half-connects, "
+                f"pausing {BLE_HANDOFF_BREAKER_PAUSE:.0f}s so the device can advertise, then scan-resolving"
+            )
+            self._engage_breaker(address)
+            await asyncio.sleep(BLE_HANDOFF_BREAKER_PAUSE)
+
+        # while the breaker is tripped, skip the ConnectDevice-first path: it
+        # is exactly what keeps re-occupying the peripheral
+        device, connect_adapters = await self._resolve_device(address, adapters, prefer_connect_device=not tripped)
         if device is None:
+            self._handoff_fails += 1
             raise Exception(f"device not resolvable on allowed adapters {adapters} (scan and ConnectDevice both failed)")
 
-        client = await establish_connection(
-            BleakClient,
-            device,
-            f"serialbattery {address}",
-            disconnected_callback=self._disconnected_callback,
-            max_attempts=5,
-            adapters=connect_adapters,
-            close_inactive_connections=True,
-            escalation_policy=escalation,
-            overall_timeout=240.0,
-            timeout=15.0,
-        )
+        try:
+            client = await establish_connection(
+                BleakClient,
+                device,
+                f"serialbattery {address}",
+                disconnected_callback=self._disconnected_callback,
+                max_attempts=5,
+                adapters=connect_adapters,
+                close_inactive_connections=True,
+                escalation_policy=escalation,
+                overall_timeout=240.0,
+                timeout=15.0,
+            )
+        except Exception:
+            self._handoff_fails += 1
+            raise
         logger.info(f"BLE [{address}] connected via BCM")
 
         try:
@@ -559,7 +667,10 @@ class BCMBackend(BleConnectionBackend):
                 await client.disconnect()
             except Exception:
                 pass
+            # connected but no usable notification channel: a half-connect
+            self._handoff_fails += 1
             raise
+        self._handoff_fails = 0
         return client
 
     async def release(self, client):
@@ -686,9 +797,7 @@ class Syncron_Ble:
         while self.main_thread.is_alive() and generation == self._ble_thread_generation:
             if os.path.exists(hold_flag):
                 try:
-                    with open(hold_flag) as f:
-                        automatic = f.read().strip() == "auto"
-                    if automatic and time.time() - os.path.getmtime(hold_flag) > BLE_HOLD_AUTO_EXPIRY:
+                    if ble_hold_expired(hold_flag):
                         os.remove(hold_flag)
                         logger.info(f"BLE hold for {self.address} auto-expired, resuming connection attempts")
                         continue

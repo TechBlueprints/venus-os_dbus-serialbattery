@@ -11,6 +11,7 @@ import configparser
 import importlib.util
 import os
 import sys
+import time
 import types
 
 DRIVER_DIR = os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery")
@@ -260,6 +261,116 @@ def test_adapter_of_returns_none_when_the_path_is_not_a_bluez_device_path():
 
     assert utils_ble._adapter_of(NoPath()) is None
     assert utils_ble._adapter_of(object()) is None
+
+
+def test_breaker_only_trips_after_consecutive_half_connects():
+    backend = _bcm()
+    backend._handoff_fails = 0
+    for _ in range(utils_ble.BLE_HANDOFF_BREAKER_THRESHOLD - 1):
+        assert not backend._breaker_tripped()
+        backend._handoff_fails += 1
+    assert not backend._breaker_tripped()
+    backend._handoff_fails += 1
+    assert backend._breaker_tripped()
+
+
+def test_a_successful_handoff_clears_the_breaker_count():
+    """The count is of *consecutive* failures - one good session resets it."""
+    backend = _bcm()
+    backend._handoff_fails = utils_ble.BLE_HANDOFF_BREAKER_THRESHOLD + 2
+    assert backend._breaker_tripped()
+    backend._handoff_fails = 0
+    assert not backend._breaker_tripped()
+
+
+def _hold_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(utils_ble, "BLE_HOLD_FLAG_DIR", str(tmp_path / "tmp"))
+    return utils_ble
+
+
+def test_auto_hold_is_written_only_once_the_engagement_threshold_is_reached(tmp_path, monkeypatch):
+    _hold_dir(tmp_path, monkeypatch)
+    backend = _bcm()
+    backend._breaker_times = []
+    address = "C8:47:8C:00:00:00"
+    flag = utils_ble.ble_hold_flag_path(address)
+
+    for engagement in range(1, utils_ble.BLE_AUTO_HOLD_THRESHOLD):
+        assert backend._engage_breaker(address, now=1000.0 + engagement) is False
+        assert not os.path.exists(flag), f"held after only {engagement} engagements"
+
+    assert backend._engage_breaker(address, now=1000.0 + utils_ble.BLE_AUTO_HOLD_THRESHOLD) is True
+    assert os.path.exists(flag)
+
+
+def test_engagements_older_than_the_window_do_not_count_towards_a_storm(tmp_path, monkeypatch):
+    """A slow trickle of engagements is not the failure this is meant to catch."""
+    _hold_dir(tmp_path, monkeypatch)
+    backend = _bcm()
+    backend._breaker_times = []
+    address = "C8:47:8C:00:00:00"
+    spacing = utils_ble.BLE_AUTO_HOLD_WINDOW  # each engagement ages the previous one out
+    for engagement in range(utils_ble.BLE_AUTO_HOLD_THRESHOLD * 2):
+        assert backend._engage_breaker(address, now=1000.0 + engagement * spacing) is False
+    assert not os.path.exists(utils_ble.ble_hold_flag_path(address))
+
+
+def test_a_written_hold_starts_a_fresh_window(tmp_path, monkeypatch):
+    """Once held, earlier engagements must not immediately re-trigger a hold."""
+    _hold_dir(tmp_path, monkeypatch)
+    backend = _bcm()
+    backend._breaker_times = []
+    address = "C8:47:8C:00:00:00"
+    for engagement in range(1, utils_ble.BLE_AUTO_HOLD_THRESHOLD + 1):
+        held = backend._engage_breaker(address, now=1000.0 + engagement)
+    assert held is True
+    assert backend._breaker_times == []
+    assert backend._engage_breaker(address, now=1000.0 + utils_ble.BLE_AUTO_HOLD_THRESHOLD + 1) is False
+
+
+def test_auto_hold_writes_a_self_expiring_flag_the_reconnect_loop_recognizes(tmp_path, monkeypatch):
+    _hold_dir(tmp_path, monkeypatch)
+    address = "C8:47:8C:00:00:00"
+    assert utils_ble.write_ble_auto_hold(address) is True
+
+    flag = utils_ble.ble_hold_flag_path(address)
+    assert os.path.dirname(flag) == utils_ble.BLE_HOLD_FLAG_DIR
+    with open(flag) as f:
+        assert f.read().strip() == utils_ble.BLE_HOLD_AUTO_MARKER
+
+    # a hold that has just been written must hold, not expire immediately
+    assert utils_ble.ble_hold_expired(flag) is False
+    # and it must release itself once it has aged past the expiry
+    assert utils_ble.ble_hold_expired(flag, now=time.time() + utils_ble.BLE_HOLD_AUTO_EXPIRY + 1) is True
+
+
+def test_an_operator_hold_never_expires_by_itself(tmp_path, monkeypatch):
+    """Only automatic holds self-release; a hand-written one persists until removed."""
+    _hold_dir(tmp_path, monkeypatch)
+    address = "C8:47:8C:00:00:00"
+    flag = utils_ble.ble_hold_flag_path(address)
+    os.makedirs(utils_ble.BLE_HOLD_FLAG_DIR, exist_ok=True)
+    with open(flag, "w") as f:
+        f.write("held by clint, radio is sick")
+
+    assert utils_ble.ble_hold_expired(flag) is False
+    assert utils_ble.ble_hold_expired(flag, now=time.time() + utils_ble.BLE_HOLD_AUTO_EXPIRY * 100) is False
+
+
+def test_an_empty_hold_flag_is_treated_as_an_operator_hold(tmp_path, monkeypatch):
+    _hold_dir(tmp_path, monkeypatch)
+    flag = utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00")
+    os.makedirs(utils_ble.BLE_HOLD_FLAG_DIR, exist_ok=True)
+    open(flag, "w").close()
+    assert utils_ble.ble_hold_expired(flag, now=time.time() + utils_ble.BLE_HOLD_AUTO_EXPIRY * 100) is False
+
+
+def test_an_unwritable_hold_directory_is_reported_rather_than_raised(tmp_path, monkeypatch):
+    """The auto-hold is a best effort; failing to write it must not kill the attempt."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    monkeypatch.setattr(utils_ble, "BLE_HOLD_FLAG_DIR", str(blocker / "tmp"))
+    assert utils_ble.write_ble_auto_hold("C8:47:8C:00:00:00") is False
 
 
 def test_backends_implement_the_connection_interface():
