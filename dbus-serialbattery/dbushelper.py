@@ -806,8 +806,8 @@ class DbusHelper:
             writeable=True,
             gettextcallback=lambda p, v: "{:0.0f}Ah".format(v),
         )
-        # add original BMS capacity values for comparing when SOC_CALCULATION overrides them
-        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
+        # add original BMS capacity values for comparing when SOC_CALCULATION or a sensor overrides them
+        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None or utils.FALLBACK_SENSOR_DBUS_PATH_SOC is not None:
             self._dbusservice.add_path(
                 "/CapacityBms",
                 None,
@@ -823,8 +823,9 @@ class DbusHelper:
 
         # Create SOC, DC and System items
         self._dbusservice.add_path("/Soc", None, writeable=True)
-        # add original SOC for comparing
-        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
+        # add original SOC for comparing (also when the fallback sensor can
+        # take over SoC serving, so the BMS-vs-shunt step stays visible)
+        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None or utils.FALLBACK_SENSOR_DBUS_PATH_SOC is not None:
             self._dbusservice.add_path("/SocBms", None, writeable=True)
 
         self._dbusservice.add_path("/Soh", None, writeable=True)
@@ -1049,11 +1050,30 @@ class DbusHelper:
     # (series string, wrong pairing) and the projection must not be trusted
     FALLBACK_PROJECTION_MAX_DELTA = 0.3
 
+    # maximum age (seconds) of the cells' underlying BMS data for it to serve
+    # as a projection basis: imbalance drifts, so projecting live shunt deltas
+    # onto cell voltages read too long ago fabricates precision the data no
+    # longer has — better no projection (configured limits) than a wrong one
+    FALLBACK_SNAPSHOT_MAX_AGE_SECONDS = 600.0
+
     def fallback_take_cell_snapshot(self) -> None:
         """
         Capture the last-known per-cell voltages as the projection basis.
-        Leaves the snapshot as None (projection unavailable) if any cell is unread.
+        Leaves the snapshot as None (projection unavailable) if any cell is
+        unread, or if the cells' underlying data is stale: drivers with
+        freshness-based source selection stamp _last_live_frame_time on every
+        checksum-verified radio frame — when that stamp is older than
+        FALLBACK_SNAPSHOT_MAX_AGE_SECONDS the cells were last refreshed too
+        long ago to anchor a projection (a fresh process or a mid-outage
+        restart has age = forever, so disk-restored or seeded cells can never
+        become a basis). Classic drivers without the stamp keep the old
+        behavior: their cells are live until the disconnect that triggers
+        this snapshot, so the basis is inherently fresh.
         """
+        last_live_frame_time = getattr(self.battery, "_last_live_frame_time", None)
+        if last_live_frame_time is not None and (time() - last_live_frame_time) > self.FALLBACK_SNAPSHOT_MAX_AGE_SECONDS:
+            self.fallback_cell_snapshot = None
+            return
         cell_count = self.battery.cell_count if self.battery.cell_count is not None else 0
         cells = [cell.voltage for cell in self.battery.cells[:cell_count]]
         self.fallback_cell_snapshot = cells if cells and all(voltage is not None for voltage in cells) else None
@@ -1277,11 +1297,14 @@ class DbusHelper:
 
                 # Set battery state based on actual current direction
                 # 1 = Charging, 2 = Discharging, 5 = Float (Charging)
+                # current_calc is the served current (external/fallback sensor
+                # aware) — same source the fallback-path derivation below uses
                 if self.battery.state not in (0, 10, 14):
-                    if self.battery.current is not None:
-                        if self.battery.current < -0.5:
+                    current_direction = self.battery.current_calc if self.battery.current_calc is not None else self.battery.current
+                    if current_direction is not None:
+                        if current_direction < -0.5:
                             self.battery.state = 2  # Discharging
-                        elif self.battery.current > 0.5:
+                        elif current_direction > 0.5:
                             # Preserve Float (5) if charge_mode says Float
                             if self.battery.charge_mode is not None and self.battery.charge_mode.startswith("Float"):
                                 self.battery.state = 5  # Float
@@ -1562,12 +1585,14 @@ class DbusHelper:
 
     def _publish_dbus_values(self) -> None:
         self._dbusservice["/System/NrOfCellsPerBattery"] = self.battery.cell_count
-        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
+        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None or utils.FALLBACK_SENSOR_DBUS_PATH_SOC is not None:
             self._dbusservice["/Soc"] = round(self.battery.soc_calc, 2) if self.battery.soc_calc is not None else None
             # add original SOC for comparing
             self._dbusservice["/SocBms"] = round(self.battery.soc, 2) if self.battery.soc is not None else None
         else:
-            self._dbusservice["/Soc"] = round(self.battery.soc_calc, 2) if self.battery.soc is not None else None
+            # gate on the served value itself: soc_calc can be live (e.g. from
+            # the fallback sensor) while the BMS-reported soc is still None
+            self._dbusservice["/Soc"] = round(self.battery.soc_calc, 2) if self.battery.soc_calc is not None else None
         self._dbusservice["/Soh"] = round(self.battery.soh, 2) if self.battery.soh is not None else None
         self._dbusservice["/Dc/0/Voltage"] = round(self.battery.voltage_calc, 2) if self.battery.voltage_calc is not None else None
         self._dbusservice["/Dc/0/Current"] = round(self.battery.current_calc, 2) if self.battery.current_calc is not None else None
@@ -1575,7 +1600,7 @@ class DbusHelper:
         self._dbusservice["/Dc/0/Temperature"] = self.battery.get_temperature()
         self._dbusservice["/Capacity"] = self.battery.get_capacity_remain()
         self._dbusservice["/ConsumedAmphours"] = self.battery.get_capacity_consumed()
-        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
+        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None or utils.FALLBACK_SENSOR_DBUS_PATH_SOC is not None:
             self._dbusservice["/CapacityBms"] = self.battery.get_capacity_remain_bms()
             self._dbusservice["/ConsumedAmphoursBms"] = self.battery.get_capacity_consumed_bms()
 

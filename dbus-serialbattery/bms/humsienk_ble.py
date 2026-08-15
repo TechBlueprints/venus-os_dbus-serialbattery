@@ -161,7 +161,6 @@ class HumsiENK_Ble(Battery):
         self._last_live_frame_time = 0.0
         self._last_trigger_time = 0.0  # Unified polling timer (all cmds every 3s)
         self._last_heartbeat_log = 0.0
-        self._last_stale_log = 0.0
         self._last_update_log_time = 0.0
         # Wake-up trigger backoff tracking
         self._wake_trigger_attempt = 0  # Track which wake-up attempt we're on
@@ -174,12 +173,13 @@ class HumsiENK_Ble(Battery):
         # Seed sane max currents so base control logic doesn't collapse to zero
         self.max_battery_charge_current = MAX_BATTERY_CHARGE_CURRENT
         self.max_battery_discharge_current = MAX_BATTERY_DISCHARGE_CURRENT
-        # Pre-initialize cells and basic values to prevent internal calculation errors
+        # Pre-initialize cells and basic values to prevent internal calculation errors.
+        # Cell voltages deliberately stay None: a seeded 3.4 V/cell is fabricated
+        # data and must never become a projection basis for the fallback layer
+        # (dbushelper.fallback_take_cell_snapshot refuses unread cells).
         if len(self.cells) == 0:
             for _ in range(self.cell_count):
                 self.cells.append(Cell(False))
-        for c in range(len(self.cells)):
-            self.cells[c].voltage = 3.4
         self.voltage = round(self.cell_count * 3.4, 2)
         self.current = 0.0
         self.soc = 50
@@ -188,9 +188,11 @@ class HumsiENK_Ble(Battery):
         self.discharge_fet = True
         # Optional extras
         self.heater_on = None
-        # State persistence — RAM cache updated every cycle, disk flush every 15 min or on shutdown
+        # INTERIM registration-metadata stash (cell_count/capacity for service
+        # registration when starting with no BMS contact) — see the stash
+        # methods below; persistence moves to the FallbackBattery wrapper (phase 4)
         self._state_file = f"/data/serialbattery_state_{self.address.replace(':', '_').lower()}.json"
-        self._ram_state = {}  # In-memory snapshot of last good data
+        self._registration_metadata = {}
         self._last_disk_flush = 0.0
         self._disk_flush_interval = 900.0  # Flush to /data/ every 15 minutes
         self._last_reconnect_attempt = 0.0  # Track last reconnection attempt
@@ -198,10 +200,10 @@ class HumsiENK_Ble(Battery):
         self._reconnecting_in_progress = False  # Flag to prevent Bleak operations during scan/reconnect
         self._reconnect_failure_count = 0  # Track consecutive failures for exponential backoff
         self._max_reconnect_attempts = 3  # Max consecutive attempts before longer backoff
-        self._load_cached_state()  # Load previous state on init (any age)
+        self._load_registration_metadata()  # Load structural metadata on init (any age)
         import atexit
 
-        atexit.register(self._flush_state_to_disk)
+        atexit.register(self._flush_metadata_to_disk)
         logger.info("Init of HumsiENK_Ble at " + address)
 
     def connection_name(self) -> str:
@@ -213,69 +215,77 @@ class HumsiENK_Ble(Battery):
     def unique_identifier(self) -> str:
         return self.address
 
-    def _load_cached_state(self):
-        """Load previously saved battery state from /data/.
+    # ── INTERIM: registration metadata only ─────────────────────────────
+    # The on-disk stash carries ONLY what D-Bus service registration needs
+    # when the driver starts with no BMS contact: cell_count (per-cell
+    # paths are built once, at registration — too few registered paths
+    # floods the log with KeyError on the real pack's cells) and capacity
+    # (/InstalledCapacity gets its value at registration). No live values:
+    # the driver never serves stale data itself — the fallback layer owns
+    # serving during an outage. Persistence moves to the FallbackBattery
+    # wrapper (phase 4); delete this whole block when it lands.
 
-        Always load regardless of age — old real data is better than
-        hardcoded defaults.  Defaults (3.4 V/cell, 50 % SOC) are only
-        used on the very first start when no state file exists.
-        """
+    def _load_registration_metadata(self):
+        """Load the registration-metadata stash from /data/ (see INTERIM note)."""
         try:
             if not os.path.exists(self._state_file):
                 logger.info("HumsiENK: No saved state file, using startup defaults")
                 return
             with open(self._state_file, "r") as f:
-                self._ram_state = json.load(f)
-            age = time.time() - self._ram_state.get("timestamp", 0)
-            logger.info(f"HumsiENK: Loaded saved state ({age:.0f}s old)")
-            self._restore_from_ram_state()
+                self._registration_metadata = json.load(f)
+            age = time.time() - self._registration_metadata.get("timestamp", 0)
+            logger.info(f"HumsiENK: Loaded saved registration metadata ({age:.0f}s old)")
+            self._apply_registration_metadata()
         except Exception as e:
-            logger.debug(f"HumsiENK: Could not load cached state: {e}")
+            logger.debug(f"HumsiENK: Could not load registration metadata: {e}")
 
-    def _restore_from_ram_state(self):
-        """Apply values from _ram_state onto self."""
+    def _apply_registration_metadata(self):
+        """Apply capacity and cell count from the stash onto self.
+
+        Deliberately does NOT restore voltage/current/soc/cell voltages
+        (see INTERIM note). Restored cells keep voltage None (unread).
+        """
         try:
-            if "voltage" in self._ram_state:
-                self.voltage = self._ram_state["voltage"]
-            if "current" in self._ram_state:
-                self.current = self._ram_state["current"]
-            if "soc" in self._ram_state:
-                self.soc = self._ram_state["soc"]
-            if "capacity" in self._ram_state:
-                self.capacity = self._ram_state["capacity"]
-            if "cells" in self._ram_state and len(self._ram_state["cells"]) > 0:
-                for idx, cell_v in enumerate(self._ram_state["cells"]):
-                    if idx < len(self.cells):
-                        self.cells[idx].voltage = cell_v
+            if self._registration_metadata.get("capacity"):
+                self.capacity = self._registration_metadata["capacity"]
+            # explicit key in the current format; legacy stash files only
+            # carried a "cells" voltage list — use its length
+            cell_count = self._registration_metadata.get("cell_count") or len(self._registration_metadata.get("cells") or [])
+            if cell_count > 0:
+                self.cell_count = cell_count
+                while len(self.cells) < self.cell_count:
+                    self.cells.append(Cell(False))
+                if len(self.cells) > self.cell_count:
+                    self.cells = self.cells[: self.cell_count]
         except Exception as e:
-            logger.debug(f"HumsiENK: Error restoring state: {e}")
+            logger.debug(f"HumsiENK: Error applying registration metadata: {e}")
 
-    def _update_ram_state(self):
-        """Snapshot current values into RAM (called every refresh cycle)."""
-        self._ram_state = {
+    def _stash_registration_metadata(self):
+        """Refresh the in-RAM stash (on each fresh-data cycle) and flush
+        it to disk at most every 15 minutes (see INTERIM note)."""
+        self._registration_metadata = {
             "timestamp": time.time(),
-            "voltage": self.voltage if self.voltage is not None else 0.0,
-            "current": self.current if self.current is not None else 0.0,
-            "soc": self.soc if self.soc is not None else 50.0,
             "capacity": self.capacity if self.capacity is not None else 0.0,
-            "cells": [c.voltage for c in self.cells if c.voltage is not None],
+            "cell_count": self.cell_count,
         }
         # Periodic flush to persistent storage
         now = time.time()
         if now - self._last_disk_flush >= self._disk_flush_interval:
-            self._flush_state_to_disk()
+            self._flush_metadata_to_disk()
 
-    def _flush_state_to_disk(self):
-        """Write RAM state to /data/ (called every 15 min and on shutdown)."""
-        if not self._ram_state:
+    def _flush_metadata_to_disk(self):
+        """Write the stash to /data/ (every 15 min and on shutdown)."""
+        if not self._registration_metadata:
             return
         try:
             with open(self._state_file, "w") as f:
-                json.dump(self._ram_state, f)
+                json.dump(self._registration_metadata, f)
             self._last_disk_flush = time.time()
-            logger.debug("HumsiENK: State flushed to disk")
+            logger.debug("HumsiENK: Registration metadata flushed to disk")
         except Exception as e:
-            logger.debug(f"HumsiENK: Could not flush state to disk: {e}")
+            logger.debug(f"HumsiENK: Could not flush registration metadata to disk: {e}")
+
+    # ── end INTERIM registration-metadata stash ──────────────────────────
 
     def _build_command(self, command: int, data: list = None) -> bytes:
         """
@@ -314,53 +324,6 @@ class HumsiENK_Ble(Battery):
 
         return bytes(packet)
 
-    def _use_cached_data(self) -> bool:
-        """Serve stale RAM state and apply escalating log / D-Bus alarms.
-
-        Thresholds:
-            <15 s   — DEBUG, internal_failure = 0
-            15-60 s — INFO,  internal_failure = 0
-            1-10 m  — WARN,  internal_failure = 0
-            10-30 m — WARN,  internal_failure = 1 (warning)
-            >30 m   — ERROR, internal_failure = 2 (alarm)
-        Fresh data resets internal_failure to 0.
-        """
-        if not self._ram_state or "timestamp" not in self._ram_state:
-            return False
-
-        age = time.time() - self._ram_state["timestamp"]
-
-        # Restore values from RAM snapshot
-        self._restore_from_ram_state()
-
-        now = time.time()
-        stale_throttle = (now - self._last_stale_log) >= 60.0
-
-        if age < 15:
-            logger.debug(f"HumsiENK: No new data this cycle ({age:.0f}s since last)")
-        elif age < 60:
-            if stale_throttle:
-                logger.info(f"HumsiENK: No new data ({age:.0f}s since last)")
-                self._last_stale_log = now
-        elif age < 600:
-            if stale_throttle:
-                logger.warning(f"HumsiENK: Stale data ({age:.0f}s since last)")
-                self._last_stale_log = now
-        elif age < 1800:
-            if stale_throttle:
-                logger.warning(f"HumsiENK: Stale data ({age:.0f}s since last), D-Bus warning")
-                self._last_stale_log = now
-            if hasattr(self, "protection") and self.protection is not None:
-                self.protection.internal_failure = 1
-        else:
-            if stale_throttle:
-                logger.error(f"HumsiENK: Stale data ({age:.0f}s since last), D-Bus alarm")
-                self._last_stale_log = now
-            if hasattr(self, "protection") and self.protection is not None:
-                self.protection.internal_failure = 2
-
-        return True
-
     FALLBACK_FRESHNESS_SECONDS = 15.0
 
     def use_fallback_values(self):
@@ -388,8 +351,8 @@ class HumsiENK_Ble(Battery):
              which kills the daemon thread mid-connect and leaves BlueZ dirty.
              Repeated restarts degrade BlueZ until both adapters are unusable.
           2. Staying alive lets the daemon thread keep retrying without any
-             BlueZ corruption, and refresh_data() serves cached/default data
-             in the meantime.
+             BlueZ corruption, and the fallback layer serves values in the
+             meantime (refresh_data() reports honestly that its data is stale).
         """
         try:
             # Fallback-first startup: with a disk snapshot to register from
@@ -502,13 +465,12 @@ class HumsiENK_Ble(Battery):
         if getattr(self, "cell_count", None) in (None, 0):
             self.cell_count = 4
         # init cells if empty to avoid dbus crashes; will be resized on first real frame
+        # (cell voltages stay None until a real frame fills them — the base class
+        # and dbushelper handle unread cells, and a fabricated placeholder would
+        # poison the fallback layer's projection basis)
         if len(self.cells) == 0:
             for _ in range(self.cell_count):
                 self.cells.append(Cell(False))
-        # Initialize placeholder voltages to avoid None in internal calculations
-        for c in range(len(self.cells)):
-            if getattr(self.cells[c], "voltage", None) is None:
-                self.cells[c].voltage = 0.0
         if getattr(self, "capacity", None) is None:
             self.capacity = BATTERY_CAPACITY if BATTERY_CAPACITY is not None else 0
         if getattr(self, "max_battery_charge_current", None) is None:
@@ -593,7 +555,6 @@ class HumsiENK_Ble(Battery):
 
         # Collect binary response frames and parse commands 0x21, 0x22, 0x20
         data_refreshed = False
-        ble_connected = bool(self.ble_handle and getattr(self.ble_handle, "connected", False))
         try:
             now_tick = time.time()
             if (now_tick - self._last_heartbeat_log) > 900.0:
@@ -754,7 +715,7 @@ class HumsiENK_Ble(Battery):
                 # can't block the GLib main loop with time.sleep().  Instead, send
                 # all three commands back-to-back — the BMS handles this fine.
                 # The ~3s silence between bursts mirrors the app's overall cadence.
-                if ble_connected and (now - self._last_trigger_time) >= 5.0:
+                if ble_connected and (now - self._last_trigger_time) >= 3.0:
                     self._last_trigger_time = now
                     # 0x21 — battery info (voltage, current, SOC, temps)
                     try:
@@ -778,25 +739,14 @@ class HumsiENK_Ble(Battery):
                     except Exception as e:
                         logger.warning(f"HumsiENK: Failed to send cell voltages command: {e}")
 
-            # On fresh data: update RAM state and clear any stale-data alarm
+            # On fresh data: update the registration-metadata snapshot.
+            # No stale-serving here: when no frame arrived this cycle the
+            # last parsed values simply remain on self, and the honest
+            # freshness verdict below tells the framework whether they are
+            # still current. The driver never resurrects cached values —
+            # the fallback layer owns serving during an outage.
             if data_refreshed:
-                self._update_ram_state()
-                if hasattr(self, "protection") and self.protection is not None:
-                    self.protection.internal_failure = 0
-            elif not ble_connected:
-                # BLE link is down and nothing was parsed this cycle: report
-                # failure so the framework's disconnect handling engages
-                # (error counting, offline flag, fallback-sensor stale serving,
-                # BmsCable alarm).  The daemon thread keeps retrying the
-                # connection in the background; once data flows again we
-                # return True and the framework clears its error state.
-                logger.debug("HumsiENK: <<< refresh_data returning False (BLE down, no data)")
-                return False
-            else:
-                # Link is up but no complete frame this cycle — serve stale
-                # RAM values with escalating warnings while the poll/handshake
-                # logic above recovers the data stream
-                self._use_cached_data()
+                self._stash_registration_metadata()
 
             # Provide placeholder values to avoid empty readings
             if getattr(self, "voltage", None) is None:
@@ -805,13 +755,11 @@ class HumsiENK_Ble(Battery):
                 self.current = 0.0
             if getattr(self, "soc", None) is None:
                 self.soc = 50
-            # Ensure cells exist and have numeric voltages to prevent internal calc errors
+            # Ensure the cells list exists (voltages stay None until read —
+            # a numeric placeholder would fabricate a projection basis)
             if len(self.cells) == 0:
                 for _ in range(self.cell_count):
                     self.cells.append(Cell(False))
-            for c in range(len(self.cells)):
-                if getattr(self.cells[c], "voltage", None) is None:
-                    self.cells[c].voltage = 0.0
             if getattr(self, "charge_fet", None) is None:
                 self.charge_fet = True
             if getattr(self, "discharge_fet", None) is None:
@@ -819,8 +767,16 @@ class HumsiENK_Ble(Battery):
         except Exception as ex:
             # Keep driver alive on parsing issues
             logger.warning(f"HumsiENK: refresh_data exception: {repr(ex)}")
-        logger.debug(f"HumsiENK: <<< refresh_data returning True, refreshed={data_refreshed}")
-        return True
+        # Honest freshness verdict, regardless of link state: success means a
+        # checksum-verified radio frame arrived within
+        # FALLBACK_FRESHNESS_SECONDS. A live link with a starved data stream
+        # is a failure — this puts the framework's governance (error
+        # counting, fallback_mode engagement, BmsCable timing, cell snapshot
+        # and projection, FALLBACK_STOP_MINUTES) on the same clock as value
+        # serving (use_fallback_values).
+        data_is_fresh = (time.time() - self._last_live_frame_time) <= self.FALLBACK_FRESHNESS_SECONDS
+        logger.debug(f"HumsiENK: <<< refresh_data returning {data_is_fresh}, refreshed={data_refreshed}")
+        return data_is_fresh
 
     def _parse_and_update(self, frame: bytes):
         """

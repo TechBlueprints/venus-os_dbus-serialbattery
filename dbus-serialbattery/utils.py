@@ -598,7 +598,6 @@ TEMPERATURE_4_ADJUST: List[float] = get_list_from_config("DEFAULT", "TEMPERATURE
 TEMPERATURE_MOS_ADJUST: List[float] = get_list_from_config("DEFAULT", "TEMPERATURE_MOS_ADJUST", float)
 GUI_PARAMETERS_SHOW_ADDITIONAL_INFO: bool = get_bool_from_config("DEFAULT", "GUI_PARAMETERS_SHOW_ADDITIONAL_INFO")
 TELEMETRY: bool = get_bool_from_config("DEFAULT", "TELEMETRY")
-LOG_DBUS_UPDATES: bool = get_bool_from_config("DEFAULT", "LOG_DBUS_UPDATES")
 
 
 # --------- Voltage drop ---------

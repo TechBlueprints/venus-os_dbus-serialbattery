@@ -607,7 +607,10 @@ class Battery(ABC):
         # If battery is actively discharging, override the charge mode label
         # so the UI reflects the actual state instead of showing a misleading
         # charging label (e.g. "Bulk") while the battery is being drained.
-        if self.current is not None and self.current < 0:
+        # Direction comes from the served current (current_calc: external/
+        # fallback sensor aware), matching the battery-state derivation.
+        current_direction = self.current_calc if self.current_calc is not None else self.current
+        if current_direction is not None and current_direction < 0:
             self.charge_mode = "Discharging"
 
     def soc_calculation(self) -> float:

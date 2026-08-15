@@ -705,6 +705,7 @@ class TestHalfConnectFallbackExit:
         battery.cells = []
         battery.cell_count = 4
         battery.current = 0.0
+        battery.current_calc = None
         battery.charge_mode = None
         battery.state = 1
         battery.temperature_1 = None
@@ -775,3 +776,131 @@ class TestHalfConnectFallbackExit:
         assert helper.battery.online is True
         assert helper.fallback_mode is False
         assert helper.fallback_cell_snapshot is None
+
+
+class TestHonestRefreshData:
+    """refresh_data() reports the freshness verdict, not the link state:
+    success means a checksum-verified radio frame arrived within
+    FALLBACK_FRESHNESS_SECONDS. A live link with a starved data stream is a
+    failure, so the framework's governance (error counting, fallback_mode
+    engagement, BmsCable timing, FALLBACK_STOP_MINUTES) runs on the same
+    clock as value serving (use_fallback_values)."""
+
+    def _make_refresh_battery(self, connected=True, last_live_age=0.0):
+        now = time_module.time()
+        battery = HumsiENK_Ble.__new__(HumsiENK_Ble)
+        battery.ble_handle = types.SimpleNamespace(connected=connected, send_data=lambda data: True)
+        battery._rx_buffer = bytearray()
+        battery._last_frame_time = now  # keep handshake-resend/heartbeat quiet
+        battery._last_live_frame_time = now - last_live_age
+        battery._last_trigger_time = now
+        battery._last_heartbeat_log = now
+        battery.cells = []
+        battery.cell_count = 4
+        battery.voltage = None
+        battery.current = None
+        battery.soc = None
+        battery.charge_fet = None
+        battery.discharge_fet = None
+        battery._registration_metadata = {}
+        return battery
+
+    def test_stale_despite_link_up_returns_false(self):
+        battery = self._make_refresh_battery(connected=True, last_live_age=16.0)
+        assert battery.refresh_data() is False
+
+    def test_fresh_with_link_up_returns_true(self):
+        battery = self._make_refresh_battery(connected=True, last_live_age=1.0)
+        assert battery.refresh_data() is True
+
+    def test_fresh_process_returns_false_even_with_link_up(self):
+        # a fresh process has no live frames yet: honest failure from cycle
+        # one, matching use_fallback_values serving the shunt from cycle one
+        battery = self._make_refresh_battery(connected=True)
+        battery._last_live_frame_time = 0.0
+        assert battery.refresh_data() is False
+
+    def test_link_down_within_freshness_window_returns_true(self):
+        # single clock: a just-dropped link with still-fresh data is not yet
+        # a failure — governance flips exactly when serving flips
+        battery = self._make_refresh_battery(connected=False, last_live_age=1.0)
+        assert battery.refresh_data() is True
+
+    def test_link_down_and_stale_returns_false(self):
+        battery = self._make_refresh_battery(connected=False, last_live_age=16.0)
+        assert battery.refresh_data() is False
+
+    def test_stale_cycle_does_not_resurrect_cached_values(self):
+        # the driver must not serve stale values itself (the alarm-ladder
+        # cache restore is gone): whatever is on self stays, the verdict is
+        # the only signal
+        battery = self._make_refresh_battery(connected=True, last_live_age=16.0)
+        battery._registration_metadata = {"timestamp": time_module.time() - 16.0, "capacity": 300.0, "cell_count": 4}
+        battery.voltage = 25.9
+        battery.soc = 81
+        assert battery.refresh_data() is False
+        assert battery.voltage == 25.9
+        assert battery.soc == 81
+
+
+class TestNoFabricatedProjectionBasis:
+    """F4: the driver must not fabricate cell voltages — a seeded 3.4 V/cell
+    could become the fallback layer's projection basis after a mid-outage
+    restart, anchoring per-cell projections to invented data."""
+
+    def _make_real_humsienk(self):
+        return HumsiENK_Ble("/ble_test", 9600, "AA:BB:CC:DD:EE:FF")
+
+    def test_cell_seed_is_none(self):
+        battery = self._make_real_humsienk()
+        assert len(battery.cells) == battery.cell_count
+        assert all(cell.voltage is None for cell in battery.cells)
+
+    def test_seeded_cells_cannot_become_projection_basis(self):
+        battery = self._make_real_humsienk()
+        helper = DbusHelper.__new__(DbusHelper)
+        helper.battery = battery
+        helper.fallback_cell_snapshot = "sentinel"
+        helper.fallback_take_cell_snapshot()
+        assert helper.fallback_cell_snapshot is None
+
+
+class TestFallbackSnapshotStaleness:
+    """The projection basis must be anchored to recently-read cells: drivers
+    with a frame clock (_last_live_frame_time) get their snapshot refused when
+    the underlying data is older than FALLBACK_SNAPSHOT_MAX_AGE_SECONDS;
+    classic drivers (no clock; cells live until the disconnect that triggers
+    the snapshot) keep the old always-accept behavior."""
+
+    def _make_helper(self, cell_voltages, last_live_age=None):
+        helper = DbusHelper.__new__(DbusHelper)
+        helper.battery = _make_battery()
+        helper.battery.cell_count = len(cell_voltages)
+        helper.battery.cells = [_FakeCell(v) for v in cell_voltages]
+        if last_live_age is not None:
+            helper.battery._last_live_frame_time = time_module.time() - last_live_age
+        helper.fallback_cell_snapshot = "sentinel"
+        return helper
+
+    def test_fresh_basis_is_captured(self):
+        helper = self._make_helper([3.30, 3.31, 3.29, 3.35], last_live_age=30.0)
+        helper.fallback_take_cell_snapshot()
+        assert helper.fallback_cell_snapshot == [3.30, 3.31, 3.29, 3.35]
+
+    def test_stale_basis_is_refused(self):
+        helper = self._make_helper([3.30, 3.31, 3.29, 3.35], last_live_age=601.0)
+        helper.fallback_take_cell_snapshot()
+        assert helper.fallback_cell_snapshot is None
+
+    def test_fresh_process_never_gets_a_basis(self):
+        # _last_live_frame_time = 0.0: no frame this process lifetime, so
+        # disk-restored or seeded cells can never anchor a projection
+        helper = self._make_helper([3.30, 3.31, 3.29, 3.35], last_live_age=None)
+        helper.battery._last_live_frame_time = 0.0
+        helper.fallback_take_cell_snapshot()
+        assert helper.fallback_cell_snapshot is None
+
+    def test_classic_driver_without_clock_keeps_old_behavior(self):
+        helper = self._make_helper([3.30, 3.31, 3.29, 3.35])  # no frame clock
+        helper.fallback_take_cell_snapshot()
+        assert helper.fallback_cell_snapshot == [3.30, 3.31, 3.29, 3.35]
