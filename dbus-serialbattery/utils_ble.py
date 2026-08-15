@@ -212,6 +212,10 @@ class BCMBackend(BleConnectionBackend):
         # the ConnectDevice-first path, pause so the device can advertise,
         # and resolve by scan instead.
         self._handoff_fails = 0
+        # auto-hold: timestamps of recent oscillation-breaker engagements;
+        # a storm of them means the BMS is in a degraded state that only
+        # extended radio quiet cures (proven repeatedly in production)
+        self._breaker_times = []
 
     def _adapters(self, address=None):
         pinned = adapters_for(address) if address else None
@@ -304,6 +308,25 @@ class BCMBackend(BleConnectionBackend):
         connect_adapters = adapters
         if self._handoff_fails >= 3:
             logger.warning(f"BLE [{address}] {self._handoff_fails} consecutive half-connects — pausing 10s, then scan-resolving")
+            # breaker storm detection -> automatic extended hold. Two manual
+            # holds cured identical GATT-degraded episodes in production;
+            # this automates that playbook: 10 breaker engagements within
+            # 5 minutes = the short pauses are not curing it, apply 20
+            # minutes of true radio quiet (the hold flag is honored by the
+            # reconnect loop, which keeps serving fallback the whole time).
+            now_t = time.time()
+            self._breaker_times = [t for t in self._breaker_times if now_t - t < 300.0]
+            self._breaker_times.append(now_t)
+            if len(self._breaker_times) >= 10:
+                self._breaker_times = []
+                try:
+                    hold_flag = "/data/tmp/ble-hold-" + str(address).replace(":", "").lower()
+                    os.makedirs("/data/tmp", exist_ok=True)
+                    with open(hold_flag, "w") as f:
+                        f.write("auto")
+                    logger.error(f"BLE [{address}] breaker storm (10 engagements <5min) — AUTO-HOLD: 20min radio quiet, fallback keeps serving")
+                except Exception as e:
+                    logger.warning(f"BLE [{address}] auto-hold flag write failed: {repr(e)}")
             await asyncio.sleep(10.0)
         if adapters and self._handoff_fails < 3:
             path = await self._connect_device_no_scan(address, adapters[0])
@@ -434,12 +457,17 @@ class Syncron_Ble:
     write_characteristic = None
     read_characteristic = None
 
-    def __init__(self, address, read_characteristic, write_characteristic):
+    def __init__(self, address, read_characteristic, write_characteristic, connect_wait=10):
         """
         address: the address of the bluetooth device to read and write to
         read_characteristic: the id of bluetooth LE characteristic that will send a
         notification when there is new data to read.
         write_characteristic: the id of the bluetooth LE characteristic that the class writes messages to
+        connect_wait: seconds to block startup waiting for the first BLE
+        connection. Drivers that can register from a disk snapshot (and
+        serve a fallback sensor immediately) pass a small value so a BMS
+        that is away does not delay service registration - the daemon
+        thread keeps connecting in the background either way.
         """
 
         self.write_characteristic = write_characteristic
@@ -453,7 +481,7 @@ class Syncron_Ble:
         ble_async_thread.start()
 
         thread_start_ok = self.ble_async_thread_ready.wait(2)
-        connected_ok = self.ble_connection_ready.wait(10)
+        connected_ok = self.ble_connection_ready.wait(connect_wait)
         if not thread_start_ok:
             logger.error("bluetooh LE thread took to long to start")
         if not connected_ok:
@@ -461,10 +489,44 @@ class Syncron_Ble:
         else:
             self.connected = True
 
-    def initiate_ble_thread_main(self):
-        asyncio.run(self.async_main(self.address))
+    def initiate_ble_thread_main(self, generation=0):
+        asyncio.run(self.async_main(self.address, generation))
 
-    async def async_main(self, address):
+    def rebuild_ble_thread(self):
+        """Abandon a wedged BLE thread and start a fresh one in-process.
+
+        The supervision layer's remedy for a deadlocked reconnect loop used
+        to be exiting the whole process - which takes the dbus service,
+        fallback serving, and RAM state down with it (observed causing
+        Multi 'BMS connection lost' alarms). Rebuilding just the BLE thread
+        keeps everything the system depends on alive. The old thread, if
+        merely slow rather than hung, exits at its next loop iteration via
+        the generation check; a truly hung one is abandoned (daemon thread).
+        """
+        try:
+            self._ble_thread_generation = getattr(self, "_ble_thread_generation", 0) + 1
+            gen = self._ble_thread_generation
+            self.ble_async_thread_ready = threading.Event()
+            self.ble_connection_ready = threading.Event()
+            self.ble_async_thread_event_loop = False
+            self.connected = False
+            self.backend = get_ble_backend()  # fresh backend state
+            self.last_connect_cycle = time.time()
+            t = threading.Thread(
+                name=f"BMS_bluetooth_async_thread_gen{gen}",
+                target=self.initiate_ble_thread_main,
+                args=(gen,),
+                daemon=True,
+            )
+            t.start()
+            ok = self.ble_async_thread_ready.wait(5)
+            logger.error(f"BLE thread rebuild for {self.address}: generation {gen} {'started' if ok else 'FAILED TO START'}")
+            return ok
+        except Exception as e:
+            logger.error(f"BLE thread rebuild for {self.address} failed: {repr(e)}")
+            return False
+
+    async def async_main(self, address, generation=0):
         self.ble_async_thread_event_loop = asyncio.get_event_loop()
         self.ble_async_thread_ready.set()
 
@@ -481,8 +543,19 @@ class Syncron_Ble:
         # quiet without the bank-wide alarms that killing the driver
         # process causes (DVCC sees the service vanish).
         hold_flag = "/data/tmp/ble-hold-" + self.address.replace(":", "").lower()
-        while self.main_thread.is_alive():
+        while self.main_thread.is_alive() and generation == getattr(self, "_ble_thread_generation", 0):
             if os.path.exists(hold_flag):
+                # auto-holds expire on their own after 20 minutes; manual
+                # holds (empty/other content) persist until removed
+                try:
+                    with open(hold_flag) as f:
+                        auto = f.read().strip() == "auto"
+                    if auto and time.time() - os.path.getmtime(hold_flag) > 1200.0:
+                        os.remove(hold_flag)
+                        logger.info(f"BLE hold for {self.address} auto-expired — resuming connection attempts")
+                        continue
+                except Exception:
+                    pass
                 # keep the liveness heartbeat advancing: a hold is deliberate
                 # quiet, not parked machinery - without this the supervision
                 # layer restarts the driver 10 minutes into every hold

@@ -369,7 +369,16 @@ class HumsiENK_Ble(Battery):
              in the meantime.
         """
         try:
-            self.ble_handle = HumsiENK_Syncron_Ble(self.address, read_characteristic=self.BLE_RX_UUID, write_characteristic=self.BLE_TX_UUID)
+            # Fallback-first startup: with a disk snapshot to register from
+            # (and the fallback sensor to serve live data), don't let an
+            # absent BMS delay service registration - wait only 2s for the
+            # first connection instead of 10 and let the daemon thread keep
+            # chasing in the background. A mid-outage driver restart then
+            # serves shunt data within seconds instead of half a minute.
+            connect_wait = 2 if os.path.exists(self._state_file) else 10
+            if connect_wait == 2:
+                logger.info("HumsiENK: disk snapshot present — fast startup, BLE connects in background")
+            self.ble_handle = HumsiENK_Syncron_Ble(self.address, read_characteristic=self.BLE_RX_UUID, write_characteristic=self.BLE_TX_UUID, connect_wait=connect_wait)
             # Initialize frame time so the 9-minute emergency reconnect doesn't fire immediately
             self._last_frame_time = time.time()
             self._connection_start_time = time.time()

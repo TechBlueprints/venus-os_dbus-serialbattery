@@ -1195,6 +1195,8 @@ class DbusHelper:
                 # leave fallback mode, live values are available again
                 if self.fallback_mode:
                     self.fallback_mode = False
+                    # a real recovery resets the rebuild escalation ladder
+                    self._ble_thread_rebuilds = 0
                     # data provably resumed - clear the stale-data escalation
                     # BEFORE the next publish, or the one cycle between
                     # fallback exit and the fresh-data reset publishes a
@@ -1385,11 +1387,28 @@ class DbusHelper:
                         # fallback data) — exit so the supervisor restarts the driver.
                         last_cycle = getattr(getattr(self.battery, "ble_handle", None), "last_connect_cycle", None)
                         if last_cycle is not None and time() - last_cycle > 600:
-                            logger.error(
-                                ">>> Reconnect machinery stalled: no BLE connect attempt completed in "
-                                + f"{time() - last_cycle:.0f}s while serving fallback data. Exiting so the driver restarts. <<<"
-                            )
-                            recovery_failed = True
+                            # First remedy: rebuild the BLE thread in-process.
+                            # Exiting the whole process takes the dbus service
+                            # and fallback serving down with it (observed as
+                            # bank-wide Multi alarms); a wedged thread does
+                            # not deserve that blast radius. Process exit
+                            # remains the last resort after two rebuilds
+                            # fail to get attempts flowing again.
+                            rebuilds = getattr(self, "_ble_thread_rebuilds", 0)
+                            handle = getattr(self.battery, "ble_handle", None)
+                            if rebuilds < 2 and handle is not None and hasattr(handle, "rebuild_ble_thread"):
+                                logger.error(
+                                    ">>> Reconnect machinery stalled: no BLE connect attempt completed in "
+                                    + f"{time() - last_cycle:.0f}s — rebuilding BLE thread in-process (attempt {rebuilds + 1}/2) <<<"
+                                )
+                                self._ble_thread_rebuilds = rebuilds + 1
+                                handle.rebuild_ble_thread()
+                            else:
+                                logger.error(
+                                    ">>> Reconnect machinery stalled: no BLE connect attempt completed in "
+                                    + f"{time() - last_cycle:.0f}s and in-process rebuilds exhausted. Exiting so the driver restarts. <<<"
+                                )
+                                recovery_failed = True
                         if fallback_alive:
                             self.fallback_last_alive = time()
                         elif utils.FALLBACK_STOP_MINUTES > 0 and time() - self.fallback_last_alive >= utils.FALLBACK_STOP_MINUTES * 60:
