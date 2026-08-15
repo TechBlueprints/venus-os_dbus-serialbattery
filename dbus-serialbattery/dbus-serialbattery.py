@@ -13,6 +13,7 @@ from gi.repository import GLib
 
 from battery import Battery
 from dbushelper import DbusHelper
+from fallback_battery import FallbackBattery
 from utils import (
     BATTERY_ADDRESSES,
     BMS_TYPE,
@@ -24,11 +25,6 @@ from utils import (
     EXTERNAL_SENSOR_DBUS_PATH_SOC,
     EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE,
     EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE,
-    FALLBACK_SENSOR_DBUS_DEVICE,
-    FALLBACK_SENSOR_DBUS_PATH_CURRENT,
-    FALLBACK_SENSOR_DBUS_PATH_SOC,
-    FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE,
-    FALLBACK_SENSOR_DBUS_PATH_VOLTAGE,
     get_bms_detection_cache_key,
     get_venus_os_version,
     get_venus_os_image_type,
@@ -121,6 +117,27 @@ if CAPTURE_RAW_DATA:
     logger.warning("!!! flash wear and disk usage.                        !!!")
     logger.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     logger.warning("")
+
+
+def with_fallback(battery: Union[Battery, None]) -> Union[Battery, None]:
+    """
+    Wrap a battery in FallbackBattery when a fallback sensor is configured for it.
+
+    This is the fallback feature's only hook into the driver: everything the
+    feature does lives in fallback_battery.py, and an unwrapped battery behaves
+    exactly as it did before the feature existed.
+
+    :param battery: the freshly constructed battery, or None
+    :return: the battery, wrapped if a fallback sensor is mapped to it
+    """
+    if battery is None or isinstance(battery, FallbackBattery):
+        return battery
+    try:
+        if FallbackBattery.configured_for(battery):
+            return FallbackBattery(battery)
+    except Exception as e:
+        logger.error(f"Fallback sensor could not be set up for {battery.port}: {repr(e)}")
+    return battery
 
 
 # count loops
@@ -274,7 +291,7 @@ def main():
                 )
                 batteryClass = test["bms"]
                 baud = test["baud"] if "baud" in test else None
-                battery: Battery = batteryClass(port=_port, baud=baud, address=_bms_address)
+                battery: Battery = with_fallback(batteryClass(port=_port, baud=baud, address=_bms_address))
                 battery.set_can_transport_interface(can_transport_interface)
                 if battery.test_connection() and battery.validate_data():
                     logger.info("-- Connection established to " + battery.__class__.__name__)
@@ -449,7 +466,7 @@ def main():
             class_ = eval(port)
 
             # do not remove ble_ prefix, since the dbus service cannot be only numbers
-            testbms = class_("ble_" + ble_address.replace(":", "").lower(), 9600, ble_address)
+            testbms = with_fallback(class_("ble_" + ble_address.replace(":", "").lower(), 9600, ble_address))
 
             if testbms.test_connection():
                 logger.info("-- Connection established to " + testbms.__class__.__name__)
@@ -472,7 +489,7 @@ def main():
             ble_address = sys.argv[2]
 
             # do not remove ble_ prefix, since the dbus service cannot be only numbers
-            testbms = Generic_AioBmsBle(port.replace("aiobmsble_", ""), None, ble_address)
+            testbms = with_fallback(Generic_AioBmsBle(port.replace("aiobmsble_", ""), None, ble_address))
 
             if testbms.test_connection():
                 logger.info("-- Connection established to " + port)
@@ -576,7 +593,7 @@ def main():
             logger.info("MQTT topics: " + ", ".join(mqtt_topics))
 
             # do not remove mqtt_ prefix, since the dbus service cannot be only numbers
-            testbms = Generic_Mqtt("mqtt_0", None, mqtt_topics[0])
+            testbms = with_fallback(Generic_Mqtt("mqtt_0", None, mqtt_topics[0]))
 
             if testbms.test_connection():
                 logger.info("-- Connection established to " + testbms.__class__.__name__)
@@ -692,16 +709,6 @@ def main():
     ):
         for key_address in battery:
             battery[key_address].setup_external_sensor()
-
-    # check, if fallback sensor should be used
-    if FALLBACK_SENSOR_DBUS_DEVICE is not None and (
-        FALLBACK_SENSOR_DBUS_PATH_VOLTAGE is not None
-        or FALLBACK_SENSOR_DBUS_PATH_CURRENT is not None
-        or FALLBACK_SENSOR_DBUS_PATH_TEMPERATURE is not None
-        or FALLBACK_SENSOR_DBUS_PATH_SOC is not None
-    ):
-        for key_address in battery:
-            battery[key_address].setup_fallback_sensor()
 
     # Run the main loop
     try:
