@@ -1,5 +1,6 @@
 import threading
 import asyncio
+import os
 import time
 import subprocess
 import sys
@@ -474,7 +475,16 @@ class Syncron_Ble:
         # for over a minute resets the ramp.
         backoff = [1, 3, 6]
         failures = 0
+        # Operator hold: while this flag file exists, make no connection
+        # attempts at all but keep the process (and its dbus service +
+        # fallback serving) alive. Gives a degraded BMS radio extended
+        # quiet without the bank-wide alarms that killing the driver
+        # process causes (DVCC sees the service vanish).
+        hold_flag = "/data/tmp/ble-hold-" + self.address.replace(":", "").lower()
         while self.main_thread.is_alive():
+            if os.path.exists(hold_flag):
+                await asyncio.sleep(5)
+                continue
             attempt_started = time.time()
             await self.connect_to_bms(self.address)
             if time.time() - attempt_started > 60.0:
