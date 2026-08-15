@@ -8,10 +8,48 @@ from bleak import BleakClient
 from time import sleep
 from utils import (
     logger,
+    BLUETOOTH_ADAPTERS,
     BLUETOOTH_CONNECTION_BACKEND,
     BLUETOOTH_FORCE_RESET_BLE_STACK,
     capture_raw_data,
 )
+
+
+def parse_adapter_entries(entries):
+    """
+    Split BLUETOOTH_ADAPTERS into pinned devices and the shared pool.
+
+    Entries of the form MAC@hciX pin that device to exactly that adapter: no
+    rotation and no fallback to any other adapter. Plain hciX entries form the
+    pool used by every device that is not pinned. Returns (pins, pool), with
+    pins keyed by upper case MAC address.
+    """
+    pins = {}
+    pool = []
+    for entry in entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "@" in entry:
+            mac, _, adapter = entry.rpartition("@")
+            mac = mac.strip().upper()
+            adapter = adapter.strip()
+            if mac and adapter:
+                pins[mac] = adapter
+            else:
+                logger.warning(f"Ignoring malformed BLUETOOTH_ADAPTERS entry '{entry}'")
+        else:
+            pool.append(entry)
+    return pins, pool
+
+
+BLUETOOTH_ADAPTER_PINS, BLUETOOTH_ADAPTER_POOL = parse_adapter_entries(BLUETOOTH_ADAPTERS)
+
+
+def adapters_for(address):
+    """Pinned adapter (as a single-element list) for this device, or None."""
+    pin = BLUETOOTH_ADAPTER_PINS.get(str(address).strip().upper())
+    return [pin] if pin else None
 
 
 # Hold flag: while the flag file for a device exists, the reconnect loop makes
@@ -72,13 +110,40 @@ class BleakBackend(BleConnectionBackend):
     """
     Default backend: connects directly with bleak, matching the historical
     behavior of this driver.
+
+    If BLUETOOTH_ADAPTERS is set, connections are made only via the listed
+    adapters: a device pinned with MAC@hciX always uses that adapter, every
+    other device takes the next entry of the shared pool after a failed
+    attempt. An empty list uses the system default adapter.
     """
 
+    def __init__(self):
+        self.adapter_index = 0
+        self.current_adapter = None
+
     def create_client(self, address, disconnected_callback):
-        return BleakClient(address, disconnected_callback=disconnected_callback)
+        kwargs = {}
+        pinned = adapters_for(address)
+        if pinned:
+            self.current_adapter = pinned[0]
+        elif BLUETOOTH_ADAPTER_POOL:
+            self.current_adapter = BLUETOOTH_ADAPTER_POOL[self.adapter_index % len(BLUETOOTH_ADAPTER_POOL)]
+        if self.current_adapter:
+            kwargs["adapter"] = self.current_adapter
+        return BleakClient(address, disconnected_callback=disconnected_callback, **kwargs)
 
     async def establish(self, client, address, notify_char, notify_callback):
-        logger.info("initiating BLE connection to: " + address)
+        try:
+            return await self._establish(client, address, notify_char, notify_callback)
+        except Exception:
+            # rotate to the next pool adapter for the next attempt; pinned
+            # devices never rotate, and an all-pinned config has an empty pool
+            if BLUETOOTH_ADAPTER_POOL:
+                self.adapter_index += 1
+            raise
+
+    async def _establish(self, client, address, notify_char, notify_callback):
+        logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
         await client.connect()
         logger.info("connected to bluetooh device" + address)
         await client.start_notify(notify_char, notify_callback)
