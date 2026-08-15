@@ -77,6 +77,11 @@ _GATE_TOLERANCE = 1e-9
 # threshold, so freshness watchers (VRM, GUI) can tell the service is alive.
 PUBLISH_HEARTBEAT_S = 900
 
+# The Victron ESS settings below /Settings/CGwacs change rarely, but reading
+# them is a recursive D-Bus introspection walk (an Introspect plus a GetValue
+# per child, dozens of calls). Re-read them at most this often.
+CGWACS_SETTINGS_CACHE_S = 300
+
 
 def _is_gateable_number(value) -> bool:
     """True for real numbers only.
@@ -256,6 +261,14 @@ class DbusHelper:
         self.last_seen_saved_last_time: int = 0
         """
         Last time the LastSeen dbus setting was refreshed.
+        """
+        self.cgwacs_settings_cache: tuple = None
+        """
+        Cached (BatteryLife, Hub4Mode) settings read from com.victronenergy.settings.
+        """
+        self.cgwacs_settings_cache_time: int = 0
+        """
+        Timestamp of the last /Settings/CGwacs read, see CGWACS_SETTINGS_CACHE_S.
         """
         self.telemetry_upload_error_count: int = 0
         self.telemetry_upload_interval: int = 60 * 60 * 3  # 3 hours
@@ -1472,17 +1485,22 @@ class DbusHelper:
                 # Update TimeToGo item
                 if utils.TIME_TO_GO_ENABLE and percent_per_seconds is not None:
 
-                    # Get settings from dbus
-                    settings_battery_life = self.get_settings_with_values(
-                        get_bus(VICTRON_SETTINGS_DBUS_NAME),
-                        VICTRON_SETTINGS_DBUS_NAME,
-                        "/Settings/CGwacs/BatteryLife",
-                    )
-                    settings_hub4mode = self.get_settings_with_values(
-                        get_bus(VICTRON_SETTINGS_DBUS_NAME),
-                        VICTRON_SETTINGS_DBUS_NAME,
-                        "/Settings/CGwacs/Hub4Mode",
-                    )
+                    # Get settings from dbus, cached for CGWACS_SETTINGS_CACHE_S
+                    if self.cgwacs_settings_cache is None or int(time()) - self.cgwacs_settings_cache_time >= CGWACS_SETTINGS_CACHE_S:
+                        self.cgwacs_settings_cache = (
+                            self.get_settings_with_values(
+                                get_bus(VICTRON_SETTINGS_DBUS_NAME),
+                                VICTRON_SETTINGS_DBUS_NAME,
+                                "/Settings/CGwacs/BatteryLife",
+                            ),
+                            self.get_settings_with_values(
+                                get_bus(VICTRON_SETTINGS_DBUS_NAME),
+                                VICTRON_SETTINGS_DBUS_NAME,
+                                "/Settings/CGwacs/Hub4Mode",
+                            ),
+                        )
+                        self.cgwacs_settings_cache_time = int(time())
+                    settings_battery_life, settings_hub4mode = self.cgwacs_settings_cache
 
                     hub4mode = int(settings_hub4mode["Settings"]["CGwacs"]["Hub4Mode"]) if "Settings" in settings_hub4mode else None
                     state = (
