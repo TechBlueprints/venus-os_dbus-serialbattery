@@ -483,6 +483,10 @@ class Syncron_Ble:
         hold_flag = "/data/tmp/ble-hold-" + self.address.replace(":", "").lower()
         while self.main_thread.is_alive():
             if os.path.exists(hold_flag):
+                # keep the liveness heartbeat advancing: a hold is deliberate
+                # quiet, not parked machinery - without this the supervision
+                # layer restarts the driver 10 minutes into every hold
+                self.last_connect_cycle = time.time()
                 await asyncio.sleep(5)
                 continue
             attempt_started = time.time()

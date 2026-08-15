@@ -196,6 +196,7 @@ class DbusHelper:
         self.disconnect_threshold: int = None
         self.bms_cable_alarm: int = 0
         self.fallback_mode: bool = False
+        self.fallback_dark_since = None
         self.fallback_alive: bool = False
         """Whether the fallback sensor delivered a live value this cycle; drives the /Mgmt/Connection suffix."""
         self.fallback_last_alive: float = None
@@ -1195,6 +1196,13 @@ class DbusHelper:
                 # leave fallback mode, live values are available again
                 if self.fallback_mode:
                     self.fallback_mode = False
+                    # data provably resumed - clear the stale-data escalation
+                    # BEFORE the next publish, or the one cycle between
+                    # fallback exit and the fresh-data reset publishes a
+                    # spurious InternalFailure alarm (observed on VRM at
+                    # every hold-release recovery)
+                    if hasattr(self.battery, "protection") and self.battery.protection is not None:
+                        self.battery.protection.internal_failure = 0
                     logger.info(">>> Battery responds again, leaving fallback mode <<<")
                 self.fallback_last_alive = None
                 self.fallback_concluded_at = None
@@ -1415,7 +1423,18 @@ class DbusHelper:
                     # user-actionable degradation, so the warning is held back longer; but
                     # when the fallback goes dark too (or the fallback phase has concluded),
                     # both instruments are gone — that is a real fault, alarm immediately
-                    if (self.fallback_mode and not fallback_alive) or self.fallback_concluded_at is not None:
+                    if not fallback_alive:
+                        if self.fallback_dark_since is None:
+                            self.fallback_dark_since = time()
+                    else:
+                        self.fallback_dark_since = None
+                    # 30s grace before the both-instruments-dark alarm: a
+                    # freshly (re)started driver engages fallback seconds
+                    # before its shunt objects resolve, and that gap fired
+                    # spurious BmsCable alarms (observed on VRM). A genuine
+                    # dual-instrument failure still alarms within a minute.
+                    dark_long_enough = self.fallback_dark_since is not None and (time() - self.fallback_dark_since) > 30.0
+                    if (self.fallback_mode and dark_long_enough) or self.fallback_concluded_at is not None:
                         self.bms_cable_alarm = 2
                     else:
                         bms_cable_warn_seconds = utils.FALLBACK_BMS_CABLE_WARN_MINUTES * 60 if self.fallback_mode else 60
