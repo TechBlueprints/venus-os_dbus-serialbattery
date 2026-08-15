@@ -31,6 +31,7 @@
 * Added: dbus caching to reduce writes and therefore CPU consumption with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/397 by @cgoudie
 * Added: Device state and mode values by @mr-manuel
 * Added: Disable serial starter if not needed by @mr-manuel
+* Added: `EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE` and `EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE` to read the published battery voltage and temperature from an external sensor, e.g. a SmartShunt, extending the existing `EXTERNAL_SENSOR_DBUS_PATH_CURRENT` and `EXTERNAL_SENSOR_DBUS_PATH_SOC` options. The external voltage is also used for the power calculation, so voltage, current and power come from the same instrument. If the external sensor is unavailable, the BMS values are used by @cgoudie
 * Added: Generic MQTT BMS by @mr-manuel
 * Added: Health check for batteries which are using the callback by @mr-manuel
 * Added: JBD CAN protocol support with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/363 by @dmitrych5

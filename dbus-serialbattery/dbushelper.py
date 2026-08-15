@@ -944,7 +944,10 @@ class DbusHelper:
 
             # Check if external sensor is still connected
             if utils.EXTERNAL_SENSOR_DBUS_DEVICE is not None and (
-                utils.EXTERNAL_SENSOR_DBUS_PATH_CURRENT is not None or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None
+                utils.EXTERNAL_SENSOR_DBUS_PATH_VOLTAGE is not None
+                or utils.EXTERNAL_SENSOR_DBUS_PATH_CURRENT is not None
+                or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None
+                or utils.EXTERNAL_SENSOR_DBUS_PATH_TEMPERATURE is not None
             ):
                 # Check if external sensor was and is still connected
                 if self.battery.dbus_external_objects is not None and utils.EXTERNAL_SENSOR_DBUS_DEVICE not in get_bus(self._dbusname).list_names():
@@ -1137,7 +1140,7 @@ class DbusHelper:
         else:
             self._dbusservice["/Soc"] = round(self.battery.soc_calc, 2) if self.battery.soc is not None else None
         self._dbusservice["/Soh"] = round(self.battery.soh, 2) if self.battery.soh is not None else None
-        self._dbusservice["/Dc/0/Voltage"] = round(self.battery.voltage, 2) if self.battery.voltage is not None else None
+        self._dbusservice["/Dc/0/Voltage"] = round(self.battery.voltage_calc, 2) if self.battery.voltage_calc is not None else None
         self._dbusservice["/Dc/0/Current"] = round(self.battery.current_calc, 2) if self.battery.current_calc is not None else None
         self._dbusservice["/Dc/0/Power"] = round(self.battery.power_calc, 2) if self.battery.power_calc is not None else None
         self._dbusservice["/Dc/0/Temperature"] = self.battery.get_temperature()
