@@ -1192,27 +1192,41 @@ class DbusHelper:
 
                 self.battery.online = True
 
-                # leave fallback mode, live values are available again
-                if self.fallback_mode:
-                    self.fallback_mode = False
-                    # a real recovery resets the rebuild escalation ladder
-                    self._ble_thread_rebuilds = 0
-                    # data provably resumed - clear the stale-data escalation
-                    # BEFORE the next publish, or the one cycle between
-                    # fallback exit and the fresh-data reset publishes a
-                    # spurious InternalFailure alarm (observed on VRM at
-                    # every hold-release recovery)
-                    if hasattr(self.battery, "protection") and self.battery.protection is not None:
-                        self.battery.protection.internal_failure = 0
-                    logger.info(">>> Battery responds again, leaving fallback mode <<<")
-                self.fallback_last_alive = None
-                self.fallback_concluded_at = None
-                self.fallback_cell_snapshot = None
-                self.fallback_projection_valid = False
-                self.fallback_charge_blocked = False
-                self.fallback_discharge_blocked = False
+                # leave fallback mode / clear the fallback state only when the BMS
+                # data is actually FRESH again. refresh_data() returning True proves
+                # the link, not the payload: the humsienk driver returns True while
+                # serving stale RAM cache during a half-connect, and exiting here on
+                # that destroyed the cell snapshot while the published values still
+                # came from the shunt. use_fallback_values() is the single
+                # source-selection truth — freshness-override drivers report data
+                # age; base-class drivers report (online is False), and online was
+                # just set True above, so classic drivers exit exactly as before.
+                if not self.battery.use_fallback_values():
+                    if self.fallback_mode:
+                        self.fallback_mode = False
+                        # a real recovery resets the rebuild escalation ladder
+                        self._ble_thread_rebuilds = 0
+                        # data provably resumed - clear the stale-data escalation
+                        # BEFORE the next publish, or the one cycle between
+                        # fallback exit and the fresh-data reset publishes a
+                        # spurious InternalFailure alarm (observed on VRM at
+                        # every hold-release recovery)
+                        if hasattr(self.battery, "protection") and self.battery.protection is not None:
+                            self.battery.protection.internal_failure = 0
+                        logger.info(">>> Battery responds again, leaving fallback mode <<<")
+                    self.fallback_last_alive = None
+                    self.fallback_concluded_at = None
+                    self.fallback_cell_snapshot = None
+                    self.fallback_projection_valid = False
+                    self.fallback_charge_blocked = False
+                    self.fallback_discharge_blocked = False
 
-                if self.error["count"] > 0:
+                if self.battery.use_fallback_values():
+                    # link up but data stale (half-connect): the published values
+                    # still come from the fallback sensor — say so instead of a
+                    # bare "Connected"
+                    self.battery.connection_info = "Connected (BMS data stale, serving fallback sensor)"
+                elif self.error["count"] > 0:
                     seconds_since_first_error = int(time()) - self.error["timestamp_first"]
                     self.battery.connection_info = (
                         f"Connected ({self.error['count']} errors in the last {self.battery.get_seconds_to_string(seconds_since_first_error, 3)})"
@@ -1357,11 +1371,18 @@ class DbusHelper:
                             self.fallback_projection_valid = False
                             self.fallback_charge_blocked = False
                             self.fallback_discharge_blocked = False
-                            # mark the battery offline explicitly: on the never-online path
-                            # (data only during init, dropped before any main-loop success)
-                            # online is still None, and get_value_from_fallback_sensor only
-                            # serves when online is False — without this the fallback would
-                            # silently serve nothing while the log promises live V/I/T
+                            # mark the battery offline explicitly. Still load-bearing
+                            # three ways even under freshness-based source selection:
+                            # (1) base-class drivers gate serving on (online is False),
+                            #     and on the never-online path (data only during init,
+                            #     dropped before any main-loop success) online is still
+                            #     None — the fallback would silently serve nothing;
+                            # (2) freshness-override drivers revert to that same classic
+                            #     gating when their fallback proxies are unresolved
+                            #     (dbus_fallback_objects is None);
+                            # (3) the ">>> Battery does not respond <<<" init/reset block
+                            #     above runs behind the once-only "online and cleared"
+                            #     gate, which this stamp closes until real recovery.
                             self.battery.online = False
                             logger.warning(
                                 "    Entering fallback mode instead of resetting values: voltage/current/temperature live from the "
@@ -1379,7 +1400,14 @@ class DbusHelper:
                     # (the BmsCable warning still fires on its own schedule)
                     fallback_alive = False
                     if self.fallback_mode:
-                        fallback_alive = self.battery.get_value_from_fallback_sensor("Voltage") is not None
+                        # gate-free probe: liveness asks whether the shunt answers,
+                        # not whether its values are currently being served. Probing
+                        # through the serving gate made a healthy shunt read None in
+                        # the engagement-before-freshness gap (fallback_mode engaged
+                        # while the last BMS frame was still fresh), producing a
+                        # spurious both-dark BmsCable=2 and a wrong "holding, shunt
+                        # dark" suffix.
+                        fallback_alive = self.battery.read_fallback_sensor("Voltage") is not None
                         # reconnect-machinery liveness: while serving fallback data the
                         # BLE daemon must keep attempting reconnects. If its heartbeat
                         # stops advancing, a stalled await has parked the loop (observed
@@ -1588,12 +1616,26 @@ class DbusHelper:
         # https://github.com/victronenergy/veutil/blob/master/src/qt/bms_error.cpp
         self._dbusservice["/ErrorCode"] = self.battery.error_code
         self._dbusservice["/ConnectionInformation"] = self.battery.connection_info
+        # Actual serving state, decided ONCE for this publish so the suffix and
+        # the alarm suppression below cannot disagree mid-cycle:
+        # use_fallback_values() is the source-selection truth (data freshness for
+        # override drivers, classic online-gating for the rest); the gate-free
+        # probe answers whether the shunt is actually delivering. fallback_mode
+        # engagement is deliberately NOT part of this — the freshness override
+        # serves the shunt without engaging the state machine (e.g. a
+        # half-connect delivering stale RAM cache), and engagement keeps
+        # governing only alarms/snapshot/ChargeMode.
+        fallback_serving_needed = self.battery.use_fallback_values()
+        fallback_delivering = self.battery.read_fallback_sensor("Voltage") is not None
+
         # surface the fallback state where every stock GUI already shows it: the
-        # "Connection" row of the Device page (and the VRM device list)
-        if self.fallback_mode:
-            self._dbusservice["/Mgmt/Connection"] = self.battery.connection_name() + (
-                " - FALLBACK: on shunt" if self.fallback_alive else " - FALLBACK: holding, shunt dark"
-            )
+        # "Connection" row of the Device page (and the VRM device list) — keyed
+        # on the actual serving state, so the GUI tells the truth during
+        # freshness-serving without engagement
+        if fallback_serving_needed and fallback_delivering:
+            self._dbusservice["/Mgmt/Connection"] = self.battery.connection_name() + " - FALLBACK: on shunt"
+        elif fallback_serving_needed and (self.fallback_mode or self.battery.dbus_fallback_objects is not None):
+            self._dbusservice["/Mgmt/Connection"] = self.battery.connection_name() + " - FALLBACK: holding, shunt dark"
         else:
             self._dbusservice["/Mgmt/Connection"] = self.battery.connection_name()
 
@@ -1753,7 +1795,12 @@ class DbusHelper:
         # stale-data InternalFailure escalation predates fallback mode and
         # just duplicates it as alarm noise (observed: "Internal failure"
         # notifications for both packs during routine covered outages).
-        if self.fallback_mode and self.fallback_alive:
+        # Keyed on the ACTUAL serving state (freshness says serve fallback AND
+        # the shunt is delivering), because the freshness override serves
+        # without engaging fallback_mode; the engaged case is kept as well so
+        # suppression survives the one cycle where the state machine is ahead
+        # of the per-publish probe.
+        if (fallback_serving_needed and fallback_delivering) or (self.fallback_mode and self.fallback_alive):
             self._dbusservice["/Alarms/InternalFailure"] = 0
         else:
             self._dbusservice["/Alarms/InternalFailure"] = self.battery.protection.internal_failure

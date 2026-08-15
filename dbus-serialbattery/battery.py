@@ -2324,6 +2324,27 @@ class Battery(ABC):
         """
         return self.online is False
 
+    def read_fallback_sensor(self, key: str) -> Union[float, None]:
+        """
+        Read a value straight from the resolved fallback sensor proxy,
+        bypassing the use_fallback_values() serving gate. This is the
+        liveness/darkness probe: "is the shunt answering right now?" is a
+        different question from "should the published values come from
+        it?" — probing through the serving gate made a healthy shunt look
+        dark whenever the gate happened to be closed (e.g. fallback_mode
+        engaged while the BMS data was still fresh).
+
+        :param key: The item key ("Voltage", "Current", "Temperature" or "Soc")
+        :return: The value from the fallback sensor, or None if the proxies
+            are unresolved, the key is not mapped, or the read fails
+        """
+        if self.dbus_fallback_objects is None or key not in self.dbus_fallback_objects or self.dbus_fallback_objects[key] is None:
+            return None
+        try:
+            return self.dbus_fallback_objects[key].get_value()
+        except Exception:
+            return None
+
     def get_value_from_fallback_sensor(self, key: str) -> Union[float, None]:
         """
         Read a value from the fallback sensor while the BMS data is not
@@ -2334,12 +2355,7 @@ class Battery(ABC):
         """
         if not self.use_fallback_values():
             return None
-        if self.dbus_fallback_objects is None or key not in self.dbus_fallback_objects or self.dbus_fallback_objects[key] is None:
-            return None
-        try:
-            return self.dbus_fallback_objects[key].get_value()
-        except Exception:
-            return None
+        return self.read_fallback_sensor(key)
 
     def get_voltage(self) -> Union[float, None]:
         """

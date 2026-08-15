@@ -3,14 +3,27 @@
 
 import os
 import sys
+import time as time_module
+import types
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery", "ext", "velib_python"))
 
+# bms.humsienk_ble subclasses utils_ble.Syncron_Ble at class-definition time;
+# stub the BLE plumbing so the real freshness-override logic imports on hosts
+# without bleak. (tests/bms/test_litime_ble.py stubs the same module with
+# Syncron_Ble=None, which cannot be subclassed — upgrade it to a class.)
+_utils_ble = sys.modules.get("utils_ble")
+if _utils_ble is None:
+    sys.modules["utils_ble"] = types.SimpleNamespace(Syncron_Ble=type("Syncron_Ble", (), {}))
+elif not isinstance(getattr(_utils_ble, "Syncron_Ble", None), type):
+    _utils_ble.Syncron_Ble = type("Syncron_Ble", (), {})
+
 import utils  # noqa: E402
 from battery import Battery  # noqa: E402
+from bms.humsienk_ble import HumsiENK_Ble  # noqa: E402
 from dbushelper import DbusHelper  # noqa: E402
 
 
@@ -552,3 +565,213 @@ class TestNeverOnlineFallbackEngagement:
         assert helper.bms_cable_alarm == 0
         # dark grace not yet expired: no exit, values not reset yet
         assert loop.quit_called is False
+
+    def test_healthy_shunt_is_alive_even_while_bms_data_still_fresh(self, monkeypatch):
+        # Engagement-before-freshness gap: fallback_mode engages while the
+        # last BMS frame is still fresh, so the SERVING gate is closed — but
+        # the shunt itself answers. Liveness must use the gate-free probe, or
+        # a healthy shunt reads as dark (spurious both-dark BmsCable=2 and a
+        # wrong "holding, shunt dark" suffix).
+        helper = self._make_helper(monkeypatch)
+        # freshness override verdict: BMS data still fresh, do not serve fallback
+        helper.battery.use_fallback_values = lambda: False
+        loop = self._FakeLoop()
+
+        helper.publish_battery(loop)
+        assert helper.fallback_mode is True
+        assert helper.fallback_alive is True
+        assert helper.bms_cable_alarm == 0
+
+
+class TestFreshnessSourceSelection:
+    """The real HumsiENK_Ble.use_fallback_values override: with fallback
+    proxies configured, the value source is a pure function of data age
+    (_last_live_frame_time vs FALLBACK_FRESHNESS_SECONDS), indifferent to
+    the online flag; without proxies it reverts to the classic gating."""
+
+    def _make_humsienk(self, fallback_objects, online=None, last_live_frame_time=0.0):
+        battery = HumsiENK_Ble.__new__(HumsiENK_Ble)
+        battery.voltage = 26.0
+        battery.dbus_external_objects = None
+        battery.dbus_fallback_objects = fallback_objects
+        battery.online = online
+        battery._last_live_frame_time = last_live_frame_time
+        return battery
+
+    def test_fresh_process_serves_shunt_regardless_of_online(self):
+        # a fresh process has no live frames yet (_last_live_frame_time = 0):
+        # it serves shunt data from its very first publish cycle, even if the
+        # framework thinks the battery is online
+        for online in (None, True, False):
+            battery = self._make_humsienk({"Voltage": _FakeDbusItem(25.5)}, online=online, last_live_frame_time=0.0)
+            assert battery.use_fallback_values() is True, f"online={online}"
+            assert battery.get_voltage() == 25.5, f"online={online}"
+
+    def test_fresh_frame_serves_bms_even_when_offline(self):
+        battery = self._make_humsienk({"Voltage": _FakeDbusItem(25.5)}, online=False, last_live_frame_time=time_module.time())
+        assert battery.use_fallback_values() is False
+        assert battery.get_voltage() == 26.0
+
+    def test_frame_within_freshness_window_serves_bms(self):
+        battery = self._make_humsienk({"Voltage": _FakeDbusItem(25.5)}, online=False, last_live_frame_time=time_module.time() - 10.0)
+        assert battery.use_fallback_values() is False
+        assert battery.get_voltage() == 26.0
+
+    def test_stale_frame_serves_shunt_even_when_online(self):
+        battery = self._make_humsienk({"Voltage": _FakeDbusItem(25.5)}, online=True, last_live_frame_time=time_module.time() - 16.0)
+        assert battery.use_fallback_values() is True
+        assert battery.get_voltage() == 25.5
+
+    def test_objects_none_reverts_to_classic_gating(self):
+        battery = self._make_humsienk(None, online=True, last_live_frame_time=0.0)
+        assert battery.use_fallback_values() is False
+        battery.online = False
+        assert battery.use_fallback_values() is True
+
+    def test_capacity_remain_follows_source_selection(self, monkeypatch):
+        monkeypatch.setattr(utils, "SOC_CALCULATION", False)
+        battery = self._make_humsienk({"Voltage": _FakeDbusItem(25.5)}, online=True, last_live_frame_time=time_module.time() - 16.0)
+        battery.capacity = 300.0
+        battery.soc_calc = 93.4
+        battery.capacity_remain = 291.0
+        # stale: derive from the served SoC, not the frozen BMS Ah
+        assert battery.get_capacity_remain() == 300.0 * 93.4 / 100
+        # fresh again: the BMS-reported remaining capacity wins
+        battery._last_live_frame_time = time_module.time()
+        assert battery.get_capacity_remain() == 291.0
+
+
+class TestReadFallbackSensor:
+    """The gate-free probe: answers regardless of the serving decision,
+    None only when the proxies are unresolved/unmapped/dark."""
+
+    def test_reads_regardless_of_freshness(self):
+        battery = HumsiENK_Ble.__new__(HumsiENK_Ble)
+        battery.dbus_external_objects = None
+        battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(25.5)}
+        battery.online = True
+        battery._last_live_frame_time = time_module.time()  # BMS fresh: serving gate closed
+        assert battery.get_value_from_fallback_sensor("Voltage") is None  # gated
+        assert battery.read_fallback_sensor("Voltage") == 25.5  # gate-free
+
+    def test_reads_while_bms_online_classic_gating(self):
+        battery = _make_battery()  # online=True: classic serving gate closed
+        battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(25.5)}
+        assert battery.get_value_from_fallback_sensor("Voltage") is None
+        assert battery.read_fallback_sensor("Voltage") == 25.5
+
+    def test_returns_none_when_unresolved(self):
+        battery = _make_battery()
+        battery.online = False
+        assert battery.read_fallback_sensor("Voltage") is None
+
+    def test_returns_none_for_unmapped_key(self):
+        battery = _make_battery()
+        battery.dbus_fallback_objects = {"Current": _FakeDbusItem(-0.2)}
+        assert battery.read_fallback_sensor("Voltage") is None
+
+    def test_resolved_but_dark_returns_none(self):
+        battery = _make_battery()
+        battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(None)}
+        assert battery.read_fallback_sensor("Voltage") is None
+
+
+class TestHalfConnectFallbackExit:
+    """refresh_data() returning True proves the link is up, not that the data
+    moved: the humsienk driver returns True while serving stale RAM cache
+    during a half-connect. Exiting fallback_mode on that destroyed the cell
+    snapshot while the published values still came from the shunt. The exit
+    must require actually-fresh data (not use_fallback_values())."""
+
+    class _FakeLoop:
+        def __init__(self):
+            self.quit_called = False
+
+        def quit(self):
+            self.quit_called = True
+
+    def _make_helper(self, monkeypatch, use_fallback):
+        from time import time as now
+
+        monkeypatch.setattr(utils, "FALLBACK_STOP_MINUTES", 480.0)
+        monkeypatch.setattr(utils, "BLOCK_ON_DISCONNECT", False)
+        monkeypatch.setattr(utils, "FALLBACK_BMS_CABLE_WARN_MINUTES", 480.0)
+        monkeypatch.setattr(utils, "EXTERNAL_SENSOR_DBUS_DEVICE", None)
+        monkeypatch.setattr(utils, "FALLBACK_SENSOR_DBUS_DEVICE", None)
+
+        battery = _make_battery()
+        battery.online = False
+        battery.port = "/ble_test"
+        battery.cells = []
+        battery.cell_count = 4
+        battery.current = 0.0
+        battery.charge_mode = None
+        battery.state = 1
+        battery.temperature_1 = None
+        battery.temperature_2 = None
+        battery.temperature_3 = None
+        battery.temperature_4 = None
+        battery.temperature_mos = None
+        battery.error_code_last_reset_check = int(now())
+        battery.dbus_fallback_objects = {"Voltage": _FakeDbusItem(26.1)}
+        battery.refresh_data = lambda: True  # link up (payload possibly stale)
+        battery.last_refresh_duration = 0.0
+        battery.use_fallback_values = lambda: use_fallback  # freshness verdict
+        battery.set_calculated_data = lambda: None
+        battery.manage_charge_voltage = lambda: None
+        battery.manage_charge_and_discharge_current = lambda: None
+        battery.get_allow_to_charge = lambda: True
+        battery.get_allow_to_discharge = lambda: True
+
+        helper = DbusHelper.__new__(DbusHelper)
+        helper.battery = battery
+        helper.fallback_mode = True
+        helper.fallback_alive = True
+        helper.fallback_last_alive = now()
+        helper.fallback_concluded_at = None
+        helper.fallback_cell_snapshot = [3.30, 3.31, 3.29, 3.35]
+        helper.fallback_projection_valid = True
+        helper.fallback_charge_blocked = False
+        helper.fallback_discharge_blocked = False
+        helper.cell_voltages_good = None
+        helper.disconnect_threshold = None
+        helper.bms_cable_alarm = 0
+        helper.error = {"count": 0, "timestamp_first": None, "timestamp_last": None, "cleared": False}
+        helper.publish_dbus = lambda: None
+        helper.telemetry_upload = lambda: None
+        return helper
+
+    def test_half_connect_keeps_fallback_engaged_and_snapshot(self, monkeypatch):
+        helper = self._make_helper(monkeypatch, use_fallback=True)
+        loop = self._FakeLoop()
+
+        helper.publish_battery(loop)
+        assert helper.fallback_mode is True
+        assert helper.fallback_cell_snapshot == [3.30, 3.31, 3.29, 3.35]
+        # the GUI must not claim a plain "Connected" while serving the shunt
+        assert "serving fallback" in helper.battery.connection_info
+        assert loop.quit_called is False
+
+    def test_fresh_data_exits_fallback_and_clears_state(self, monkeypatch):
+        helper = self._make_helper(monkeypatch, use_fallback=False)
+        loop = self._FakeLoop()
+
+        helper.publish_battery(loop)
+        assert helper.fallback_mode is False
+        assert helper.fallback_cell_snapshot is None
+        assert helper.fallback_projection_valid is False
+        assert helper.battery.connection_info == "Connected"
+        assert loop.quit_called is False
+
+    def test_base_class_gating_still_exits_on_success(self, monkeypatch):
+        # base-class drivers: online=True is stamped on the success path before
+        # the exit check, so (online is False) is False and fallback exits —
+        # classic behavior, no circularity
+        helper = self._make_helper(monkeypatch, use_fallback=False)
+        del helper.battery.use_fallback_values  # use the real base-class method
+        loop = self._FakeLoop()
+
+        helper.publish_battery(loop)
+        assert helper.battery.online is True
+        assert helper.fallback_mode is False
+        assert helper.fallback_cell_snapshot is None

@@ -402,7 +402,11 @@ class HumsiENK_Ble(Battery):
             if connect_wait == 2:
                 logger.info("HumsiENK: disk snapshot present — fast startup, BLE connects in background")
             self.ble_handle = HumsiENK_Syncron_Ble(self.address, read_characteristic=self.BLE_RX_UUID, write_characteristic=self.BLE_TX_UUID, connect_wait=connect_wait)
-            # Initialize frame time so the 9-minute emergency reconnect doesn't fire immediately
+            # Seed the frame clock so the first handshake-resend and the stale/
+            # heartbeat logs run on their normal cadence instead of firing
+            # immediately at startup. Deliberately does NOT touch
+            # _last_live_frame_time: freshness-based source selection
+            # (use_fallback_values) only trusts checksum-verified radio frames.
             self._last_frame_time = time.time()
             self._connection_start_time = time.time()
 
