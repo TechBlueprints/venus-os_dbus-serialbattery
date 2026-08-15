@@ -1017,8 +1017,12 @@ class FallbackBattery:
         :return: None
         """
         if self._cells_unread():
-            if self.battery.control_voltage is None and self.battery.max_battery_voltage is not None:
-                self.battery.control_voltage = round(self.battery.max_battery_voltage, 2)
+            if self.battery.control_voltage is None:
+                ceiling = self.battery.max_battery_voltage
+                if ceiling is None and self.battery.cell_count:
+                    ceiling = utils.MAX_CELL_VOLTAGE * self.battery.cell_count
+                if ceiling is not None:
+                    self.battery.control_voltage = round(ceiling, 2)
             return
         self.battery.manage_charge_voltage()
 
