@@ -934,6 +934,9 @@ class DbusHelper:
         RETRY_CYCLE_SHORT_COUNT = 10
         RETRY_CYCLE_LONG_COUNT = 60
         recovery_failed = False
+        # a battery can request a restart while refresh_data() is still
+        # succeeding, where the disconnect branch below never ran
+        time_since_first_error = 0
 
         try:
             # Call the battery's refresh_data function
@@ -1034,11 +1037,16 @@ class DbusHelper:
 
                     # check if the cell voltages are good to go for some minutes
                     if self.cell_voltages_good is None:
+                        # unread cell voltages (None) count as not-good: a battery
+                        # that registered its service without ever reaching the BMS
+                        # has no basis to run blind past the recovery window
+                        min_cell_voltage = self.battery.get_min_cell_voltage()
+                        max_cell_voltage = self.battery.get_max_cell_voltage()
                         self.cell_voltages_good = (
-                            True
-                            if self.battery.get_min_cell_voltage() > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN
-                            and self.battery.get_max_cell_voltage() < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX
-                            else False
+                            min_cell_voltage is not None
+                            and max_cell_voltage is not None
+                            and min_cell_voltage > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN
+                            and max_cell_voltage < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX
                         )
 
                     # set disconnect threshold time
@@ -1066,17 +1074,21 @@ class DbusHelper:
                                     + ("" if self.cell_voltages_good else " NOT")
                                     + " in a safe threshold to proceed with charging/discharging without communication to the battery."
                                 )
+                                # same None-safety as above: unread cells must not
+                                # crash the log line that explains the situation
+                                min_cell_voltage = self.battery.get_min_cell_voltage()
+                                max_cell_voltage = self.battery.get_max_cell_voltage()
                                 logger.error(
                                     "    |- "
-                                    + f"Min cell voltage: {self.battery.get_min_cell_voltage():.3f} > "
+                                    + f"Min cell voltage: {'unread' if min_cell_voltage is None else f'{min_cell_voltage:.3f}'} > "
                                     + f"Min Threshold: {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN:.3f} --> "
-                                    + ("OK" if self.battery.get_min_cell_voltage() > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN else "NOT OK")
+                                    + ("OK" if min_cell_voltage is not None and min_cell_voltage > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN else "NOT OK")
                                 )
                                 logger.error(
                                     "    |- "
-                                    + f"Max cell voltage: {self.battery.get_max_cell_voltage():.3f} < "
+                                    + f"Max cell voltage: {'unread' if max_cell_voltage is None else f'{max_cell_voltage:.3f}'} < "
                                     + f"Max threshold: {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX:.3f} --> "
-                                    + ("OK" if self.battery.get_max_cell_voltage() < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX else "NOT OK")
+                                    + ("OK" if max_cell_voltage is not None and max_cell_voltage < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX else "NOT OK")
                                 )
 
                             self.battery.init_values()
@@ -1113,6 +1125,11 @@ class DbusHelper:
             # upload telemetry data
             self.telemetry_upload()
 
+            # a battery can ask for a driver restart when its own recovery
+            # ladder is exhausted, even while it still has values to publish
+            if getattr(self.battery, "restart_requested", False):
+                recovery_failed = True
+
             # check if recovery failed and exit the loop to restart the driver
             # do this after publishing to dbus to set the alert from warning to error state
             if recovery_failed:
@@ -1135,9 +1152,14 @@ class DbusHelper:
             # add original SOC for comparing
             self._dbusservice["/SocBms"] = round(self.battery.soc, 2) if self.battery.soc is not None else None
         else:
-            self._dbusservice["/Soc"] = round(self.battery.soc_calc, 2) if self.battery.soc is not None else None
+            # guard on the value that is actually published: soc_calc mirrors
+            # soc here, unless a battery serves the SoC from somewhere else
+            self._dbusservice["/Soc"] = round(self.battery.soc_calc, 2) if self.battery.soc_calc is not None else None
         self._dbusservice["/Soh"] = round(self.battery.soh, 2) if self.battery.soh is not None else None
-        self._dbusservice["/Dc/0/Voltage"] = round(self.battery.voltage, 2) if self.battery.voltage is not None else None
+        # published through the getter, like current, SoC and temperature, so a
+        # battery can source the voltage from somewhere other than the BMS
+        voltage = self.battery.get_voltage()
+        self._dbusservice["/Dc/0/Voltage"] = round(voltage, 2) if voltage is not None else None
         self._dbusservice["/Dc/0/Current"] = round(self.battery.current_calc, 2) if self.battery.current_calc is not None else None
         self._dbusservice["/Dc/0/Power"] = round(self.battery.power_calc, 2) if self.battery.power_calc is not None else None
         self._dbusservice["/Dc/0/Temperature"] = self.battery.get_temperature()
@@ -1184,6 +1206,9 @@ class DbusHelper:
         # https://github.com/victronenergy/veutil/blob/master/src/qt/bms_error.cpp
         self._dbusservice["/ErrorCode"] = self.battery.error_code
         self._dbusservice["/ConnectionInformation"] = self.battery.connection_info
+        # re-published every cycle, not only at setup: a battery can change what
+        # it is connected to at runtime (a fallback sensor taking over and back)
+        self._dbusservice["/Mgmt/Connection"] = self.battery.connection_name()
 
         self._dbusservice["/History/DeepestDischarge"] = (
             abs(self.battery.history.deepest_discharge) * -1 if self.battery.history.deepest_discharge is not None else None
@@ -1297,7 +1322,10 @@ class DbusHelper:
         self._dbusservice["/Alarms/LowChargeTemperature"] = self.battery.protection.low_charge_temperature
         self._dbusservice["/Alarms/HighTemperature"] = self.battery.protection.high_temperature
         self._dbusservice["/Alarms/LowTemperature"] = self.battery.protection.low_temperature
-        self._dbusservice["/Alarms/BmsCable"] = self.bms_cable_alarm if utils.BMS_CABLE_ALARM else 0
+        # a battery can raise a cable alarm of its own: while a fallback sensor
+        # is serving, values keep arriving and this helper sees no error at all
+        bms_cable_alarm = max(self.bms_cable_alarm, getattr(self.battery, "bms_cable_alarm", 0) or 0)
+        self._dbusservice["/Alarms/BmsCable"] = bms_cable_alarm if utils.BMS_CABLE_ALARM else 0
         self._dbusservice["/Alarms/HighInternalTemperature"] = self.battery.protection.high_internal_temperature
         self._dbusservice["/Alarms/FuseBlown"] = self.battery.protection.fuse_blown
 
