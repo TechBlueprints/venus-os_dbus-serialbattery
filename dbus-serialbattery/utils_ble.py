@@ -104,6 +104,9 @@ class Syncron_Ble:
         self.read_characteristic = read_characteristic
         self.address = address
         self.backend = get_ble_backend()
+        # Only the BLE thread of the current generation keeps running; see
+        # rebuild_ble_thread()
+        self._ble_thread_generation = 0
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
@@ -119,10 +122,43 @@ class Syncron_Ble:
         else:
             self.connected = True
 
-    def initiate_ble_thread_main(self):
-        asyncio.run(self.async_main(self.address))
+    def initiate_ble_thread_main(self, generation=0):
+        asyncio.run(self.async_main(self.address, generation))
 
-    async def async_main(self, address):
+    def rebuild_ble_thread(self):
+        """Abandon a wedged BLE thread and start a fresh one in-process.
+
+        The remedy for a deadlocked reconnect loop used to be exiting the
+        whole process, which takes the dbus service and the in-RAM state
+        down with it and makes the inverter raise 'BMS connection lost'.
+        Rebuilding just the BLE thread keeps everything the rest of the
+        system depends on alive. The old thread, if merely slow rather than
+        hung, exits at its next loop iteration via the generation check; a
+        truly hung one is abandoned (it is a daemon thread).
+        """
+        try:
+            self._ble_thread_generation += 1
+            generation = self._ble_thread_generation
+            self.ble_async_thread_ready = threading.Event()
+            self.ble_connection_ready = threading.Event()
+            self.ble_async_thread_event_loop = False
+            self.connected = False
+            self.backend = get_ble_backend()  # fresh backend state
+            ble_async_thread = threading.Thread(
+                name=f"BMS_bluetooth_async_thread_gen{generation}",
+                target=self.initiate_ble_thread_main,
+                args=(generation,),
+                daemon=True,
+            )
+            ble_async_thread.start()
+            started = self.ble_async_thread_ready.wait(5)
+            logger.error(f"BLE thread rebuild for {self.address}: generation {generation} {'started' if started else 'FAILED TO START'}")
+            return started
+        except Exception as e:
+            logger.error(f"BLE thread rebuild for {self.address} failed: {repr(e)}")
+            return False
+
+    async def async_main(self, address, generation=0):
         self.ble_async_thread_event_loop = asyncio.get_event_loop()
         self.ble_async_thread_ready.set()
 
@@ -133,7 +169,7 @@ class Syncron_Ble:
         # for over a minute resets the ramp.
         backoff = [1, 3, 6]
         failures = 0
-        while self.main_thread.is_alive():
+        while self.main_thread.is_alive() and generation == self._ble_thread_generation:
             attempt_started = time.time()
             await self.connect_to_bms(self.address)
             if time.time() - attempt_started > 60.0:
