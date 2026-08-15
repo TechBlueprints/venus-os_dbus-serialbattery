@@ -846,6 +846,29 @@ class TestTestConnection:
         assert wrapper.battery.charge_mode != "Error, please check the logs!"
         assert wrapper.battery.error_code is None
 
+    def test_unread_cells_publish_configured_currents_without_errors(self, monkeypatch, tmp_path):
+        # The cell-voltage and temperature limiters raise on unread cells and
+        # each raises error code 8 while falling back to configured currents.
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=False)
+        for cell in wrapper.battery.cells:
+            cell.voltage = None
+        wrapper.battery.max_battery_charge_current = 50.0
+        wrapper.battery.max_battery_discharge_current = 60.0
+        wrapper.battery.error_code = None
+
+        wrapper.manage_charge_and_discharge_current()
+
+        assert wrapper.battery.control_charge_current == 50.0
+        assert wrapper.battery.control_discharge_current == 60.0
+        assert wrapper.battery.error_code is None
+
+    def test_real_cells_still_run_the_current_limiter(self, monkeypatch, tmp_path):
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT)
+        ran = []
+        wrapper.battery.manage_charge_and_discharge_current = lambda: ran.append(True)
+        wrapper.manage_charge_and_discharge_current()
+        assert ran == [True]
+
     def test_real_cells_still_run_the_state_machine(self, monkeypatch, tmp_path):
         wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT)
         ran = []
