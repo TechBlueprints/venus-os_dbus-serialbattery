@@ -638,6 +638,12 @@ def main():
         # Calculate the initial values for the battery
         battery[key_address].set_calculated_data()
 
+        # Publish them immediately: setup_vedbus() adds every value path as
+        # None, and without this the service advertises None until the first
+        # poll tick. Consumers that react to value changes sample exactly
+        # that leading edge, so the window is reachable in practice.
+        helper[key_address].publish_dbus()
+
     # get first key from battery dict
     first_key = list(battery.keys())[0]
 
