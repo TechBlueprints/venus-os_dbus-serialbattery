@@ -280,12 +280,30 @@ class FallbackBattery:
             raise AttributeError(name)
         return getattr(battery, name)
 
+    # DbusHelper re-applies TEMPERATURE_*_ADJUST to these attributes on every
+    # success cycle. While the fallback serves, the driver never refreshes
+    # them, so each pass would adjust the previous pass's output - the values
+    # would compound without bound over a long outage. Dropping the writes
+    # while serving freezes them at the last live reading, exactly what the
+    # pre-wrapper fallback did by skipping the adjustment during an outage.
+    _FROZEN_WHILE_SERVING = frozenset(
+        (
+            "temperature_1",
+            "temperature_2",
+            "temperature_3",
+            "temperature_4",
+            "temperature_mos",
+        )
+    )
+
     def __setattr__(self, name, value):
         # DbusHelper writes to the battery (state, temperatures, online,
         # connection_info, history values, ...). Those must reach the driver
         # instance, or nothing else that reads it directly sees them.
         if name in FallbackBattery._WRAPPER_ATTRS:
             object.__setattr__(self, name, value)
+        elif name in FallbackBattery._FROZEN_WHILE_SERVING and getattr(self, "_serving", False):
+            pass
         else:
             setattr(self.battery, name, value)
 
@@ -531,6 +549,15 @@ class FallbackBattery:
                 # fallback and the next BMS read publishes a spurious
                 # InternalFailure alarm.
                 self._clear_internal_failure()
+                # Undo the projection: put the measured basis voltages back
+                # into the cells. Freshness proves core values resumed, not
+                # that a cell frame arrived yet - without this, a partial
+                # frame lets the next engagement snapshot our own synthetic
+                # voltages as if they were measurements.
+                if self._cell_snapshot is not None:
+                    for index, voltage in enumerate(self._cell_snapshot):
+                        if index < len(self.battery.cells):
+                            self.battery.cells[index].voltage = voltage
             self._fallback_mode = False
             self._fallback_since = None
             self._cell_snapshot = None
@@ -744,7 +771,9 @@ class FallbackBattery:
             with open(self._stash_path, "r") as stash_file:
                 self._stash = json.load(stash_file)
         except Exception as e:
-            logger.debug(f"Fallback stash could not be read: {repr(e)}")
+            # Loud: without the stash a boot with no BMS contact cannot
+            # register, which is the very scenario the stash exists for.
+            logger.warning(f"Fallback stash could not be read: {repr(e)}")
             self._stash = {}
             return
 
@@ -800,8 +829,13 @@ class FallbackBattery:
         if not self._stash:
             return
         try:
-            with open(self._stash_path, "w") as stash_file:
+            # Atomic: a power cut mid-write must never truncate the stash -
+            # a corrupt stash silently loses the boot-without-BMS registration
+            # this file exists to provide.
+            temporary_path = self._stash_path + ".tmp"
+            with open(temporary_path, "w") as stash_file:
                 json.dump(self._stash, stash_file)
+            os.replace(temporary_path, self._stash_path)
             self._stash_written = time()
             logger.debug(f"Fallback stash written to {self._stash_path}")
         except Exception as e:
@@ -981,8 +1015,15 @@ class FallbackBattery:
 
     @property
     def charge_mode(self):
-        """Charge mode string, replaced by the fallback state while engaged."""
-        if not self._fallback_mode:
+        """Charge mode string, replaced by the fallback state while SERVING.
+
+        Gated on _serving, not _fallback_mode: when the shunt also stops
+        answering, fallback_mode stays engaged (it guards the projection
+        basis) but DbusHelper's stock disconnect ladder takes over the
+        user-visible story - a "Fallback" label next to its "Disconnect in:"
+        countdown would be contradictory.
+        """
+        if not self._fallback_mode or not self._serving:
             return self.battery.charge_mode
         if not self._projection_valid:
             return "Fallback - no cell projection (limits unchanged, BMS self-protects)"

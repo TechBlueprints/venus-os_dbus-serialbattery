@@ -603,15 +603,6 @@ class Battery(ABC):
             self.control_voltage = round(self.max_battery_voltage, 2)
             self.charge_mode = "Keep always max voltage"
 
-        # If battery is actively discharging, override the charge mode label
-        # so the UI reflects the actual state instead of showing a misleading
-        # charging label (e.g. "Bulk") while the battery is being drained.
-        # Direction comes from the served current (current_calc), matching
-        # the battery-state derivation.
-        current_direction = self.current_calc if self.current_calc is not None else self.current
-        if current_direction is not None and current_direction < 0:
-            self.charge_mode = "Discharging"
-
     def soc_calculation(self) -> float:
         """
         Calculates the SoC based on the coulomb counting method.
@@ -2307,12 +2298,12 @@ class Battery(ABC):
             soc_external = round(self.dbus_external_objects["Soc"].get_value(), 3)
             logger.debug(f"soc: {self.soc} - soc_external: {soc_external}")
             return soc_external
-
         # get calculated value
-        if utils.SOC_CALCULATION:
+        elif utils.SOC_CALCULATION:
             return self.soc_calculation()
         # get value from battery
-        return self.soc
+        else:
+            return self.soc
 
     def set_calculated_data(self) -> None:
         """

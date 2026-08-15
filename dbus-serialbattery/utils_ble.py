@@ -58,7 +58,9 @@ def apply_supervision_timeout(address, adapters=None):
     if not BLUETOOTH_SUPERVISION_TIMEOUT:
         return
     mac = str(address).upper()
-    for adapter in adapters or BLUETOOTH_ADAPTERS or ["hci0"]:
+    # This device's pin, then the plain-entry pool - never the raw
+    # BLUETOOTH_ADAPTERS list, whose MAC@hciX entries are not adapter names
+    for adapter in adapters or adapters_for(address) or BLUETOOTH_ADAPTER_POOL or ["hci0"]:
         try:
             con = subprocess.run(["hcitool", "-i", adapter, "con"], capture_output=True, text=True, timeout=5)
             for line in con.stdout.splitlines():
@@ -158,8 +160,9 @@ class BleakBackend(BleConnectionBackend):
             adapters = [self.current_adapter] if self.current_adapter else None
             await asyncio.get_event_loop().run_in_executor(None, apply_supervision_timeout, address, adapters)
         except Exception:
-            # rotate to the next configured adapter for the next attempt
-            if BLUETOOTH_ADAPTERS:
+            # rotate to the next pool adapter for the next attempt (pinned
+            # devices never rotate; an all-pinned config has an empty pool)
+            if BLUETOOTH_ADAPTER_POOL:
                 self.adapter_index += 1
             raise
         return client
@@ -457,17 +460,12 @@ class Syncron_Ble:
     write_characteristic = None
     read_characteristic = None
 
-    def __init__(self, address, read_characteristic, write_characteristic, connect_wait=10):
+    def __init__(self, address, read_characteristic, write_characteristic):
         """
         address: the address of the bluetooth device to read and write to
         read_characteristic: the id of bluetooth LE characteristic that will send a
         notification when there is new data to read.
         write_characteristic: the id of the bluetooth LE characteristic that the class writes messages to
-        connect_wait: seconds to block startup waiting for the first BLE
-        connection. Drivers that can register from a disk snapshot (and
-        serve a fallback sensor immediately) pass a small value so a BMS
-        that is away does not delay service registration - the daemon
-        thread keeps connecting in the background either way.
         """
 
         self.write_characteristic = write_characteristic
@@ -481,7 +479,7 @@ class Syncron_Ble:
         ble_async_thread.start()
 
         thread_start_ok = self.ble_async_thread_ready.wait(2)
-        connected_ok = self.ble_connection_ready.wait(connect_wait)
+        connected_ok = self.ble_connection_ready.wait(10)
         if not thread_start_ok:
             logger.error("bluetooh LE thread took to long to start")
         if not connected_ok:
@@ -511,7 +509,6 @@ class Syncron_Ble:
             self.ble_async_thread_event_loop = False
             self.connected = False
             self.backend = get_ble_backend()  # fresh backend state
-            self.last_connect_cycle = time.time()
             t = threading.Thread(
                 name=f"BMS_bluetooth_async_thread_gen{gen}",
                 target=self.initiate_ble_thread_main,
@@ -556,10 +553,6 @@ class Syncron_Ble:
                         continue
                 except Exception:
                     pass
-                # keep the liveness heartbeat advancing: a hold is deliberate
-                # quiet, not parked machinery - without this the supervision
-                # layer restarts the driver 10 minutes into every hold
-                self.last_connect_cycle = time.time()
                 await asyncio.sleep(5)
                 continue
             attempt_started = time.time()
@@ -574,8 +567,6 @@ class Syncron_Ble:
         logger.error(f"bluetooh device with address: {self.address} disconnected")
 
     async def connect_to_bms(self, address):
-        # reconnect-liveness heartbeat, see supervision check in dbushelper
-        self.last_connect_cycle = time.time()
         self.client = self.backend.create_client(address, self.client_disconnected)
         try:
             # outer belt-and-braces timeout: the backend's internal timeouts

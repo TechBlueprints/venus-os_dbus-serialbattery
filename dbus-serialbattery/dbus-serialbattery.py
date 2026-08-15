@@ -291,11 +291,15 @@ def main():
                 )
                 batteryClass = test["bms"]
                 baud = test["baud"] if "baud" in test else None
-                battery: Battery = with_fallback(batteryClass(port=_port, baud=baud, address=_bms_address))
+                # The candidate is probed UNWRAPPED: the wrapper's stash-backed
+                # test_connection() would accept whichever BMS class happens to
+                # be probed first while the BMS is unreachable. Only the class
+                # that genuinely answered gets wrapped.
+                battery: Battery = batteryClass(port=_port, baud=baud, address=_bms_address)
                 battery.set_can_transport_interface(can_transport_interface)
                 if battery.test_connection() and battery.validate_data():
                     logger.info("-- Connection established to " + battery.__class__.__name__)
-                    return battery
+                    return with_fallback(battery)
             except KeyboardInterrupt:
                 raise
             except Exception:

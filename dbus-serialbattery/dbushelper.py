@@ -1066,7 +1066,6 @@ class DbusHelper:
                     logger.info(">>> Battery reconnected <<<")
 
                 self.battery.online = True
-
                 if self.error["count"] > 0:
                     seconds_since_first_error = int(time()) - self.error["timestamp_first"]
                     self.battery.connection_info = (
@@ -1265,8 +1264,9 @@ class DbusHelper:
             # add original SOC for comparing
             self._dbusservice["/SocBms"] = round(self.battery.soc, 2) if self.battery.soc is not None else None
         else:
-            # gate on the served value itself: soc_calc can be live (e.g. from
-            # the fallback sensor) while the BMS-reported soc is still None
+            # gate on the value actually being published (upstream guards on
+            # battery.soc; in this branch soc_calc mirrors it, so this only
+            # fixes the latent guard/value mismatch)
             self._dbusservice["/Soc"] = round(self.battery.soc_calc, 2) if self.battery.soc_calc is not None else None
         self._dbusservice["/Soh"] = round(self.battery.soh, 2) if self.battery.soh is not None else None
         self._dbusservice["/Dc/0/Voltage"] = round(self.battery.voltage_calc, 2) if self.battery.voltage_calc is not None else None

@@ -584,7 +584,7 @@ Poll interval in milliseconds
 """
 PUBLISH_CONFIG_VALUES: bool = get_bool_from_config("DEFAULT", "PUBLISH_CONFIG_VALUES")
 PUBLISH_BATTERY_DATA_AS_JSON: bool = get_bool_from_config("DEFAULT", "PUBLISH_BATTERY_DATA_AS_JSON")
-BATTERY_CELL_DATA_FORMAT: int = get_int_from_config("DEFAULT", "BATTERY_CELL_DATA_FORMAT", 3)
+BATTERY_CELL_DATA_FORMAT: int = get_int_from_config("DEFAULT", "BATTERY_CELL_DATA_FORMAT", 1)
 MIDPOINT_ENABLE: bool = get_bool_from_config("DEFAULT", "MIDPOINT_ENABLE")
 TEMPERATURE_SOURCE_BATTERY: List[int] = get_list_from_config("DEFAULT", "TEMPERATURE_SOURCE_BATTERY", int)
 TEMPERATURE_1_NAME: str = config["DEFAULT"]["TEMPERATURE_1_NAME"]

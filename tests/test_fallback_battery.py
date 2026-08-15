@@ -240,6 +240,77 @@ class TestObservationalStaleness:
         assert wrapper._serving is True
 
 
+class TestAuditFixes:
+    """Regression coverage for the accountability-audit findings."""
+
+    def test_temperature_writes_are_frozen_while_serving(self, monkeypatch):
+        # B5: DbusHelper re-applies TEMPERATURE_*_ADJUST to the stored value
+        # each success cycle; during an outage that compounds without bound
+        # unless the wrapper drops the writes.
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.temperature_1 = 20.0
+        _serve(wrapper)
+        assert wrapper._serving is True
+        wrapper.temperature_1 = 21.5  # DbusHelper's adjusted write-back
+        assert wrapper.battery.temperature_1 == 20.0
+        wrapper.battery.ble_handle.connected = True
+        wrapper.refresh_data()
+        assert wrapper._serving is False
+        wrapper.temperature_1 = 21.5
+        assert wrapper.battery.temperature_1 == 21.5
+
+    def test_projection_is_undone_when_leaving_fallback(self, monkeypatch):
+        # B6: without the undo, a partial frame (core values but no cell
+        # frame) lets the next engagement snapshot our own synthetic
+        # voltages as if they were measurements.
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MIN", 2.7)
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MAX", 3.55)
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        measured = [cell.voltage for cell in wrapper.battery.cells]
+        _serve(wrapper)
+        assert wrapper._projection_valid is True
+        assert [cell.voltage for cell in wrapper.battery.cells] != measured
+        wrapper.battery.ble_handle.connected = True
+        wrapper.refresh_data()
+        assert wrapper._fallback_mode is False
+        assert [cell.voltage for cell in wrapper.battery.cells] == measured
+
+    def test_stash_write_is_atomic(self, monkeypatch, tmp_path):
+        # B3: a truncated stash silently loses the boot-without-BMS
+        # registration; the write must go through a temp file + rename.
+        import json as json_module
+
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=True)
+        real_dump = json_module.dump
+        observed = {}
+
+        def dump_and_check(obj, fh, *args, **kwargs):
+            observed["path"] = fh.name
+            return real_dump(obj, fh, *args, **kwargs)
+
+        monkeypatch.setattr("fallback_battery.json.dump", dump_and_check)
+        wrapper.refresh_data()
+        assert os.path.exists(wrapper._stash_path)
+        assert observed["path"] != wrapper._stash_path
+        with open(wrapper._stash_path) as stash_file:
+            assert json_module.load(stash_file)["cell_count"] == 8
+
+    def test_charge_mode_reverts_to_the_driver_when_not_serving(self, monkeypatch):
+        # B7: in the both-dark state the stock disconnect ladder owns the
+        # user-visible story; a lingering "Fallback" label contradicts it.
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.charge_mode = "Bulk"
+        _serve(wrapper)
+        assert "Fallback" in wrapper.charge_mode
+        for item in wrapper.dbus_fallback_objects.values():
+            item.value = None
+        wrapper.battery.refresh_result = False
+        _serve(wrapper)
+        assert wrapper._serving is False
+        assert wrapper._fallback_mode is True
+        assert wrapper.charge_mode == "Bulk"
+
+
 class TestTransparencyWhenShuntIsDark:
     """D2: no invented both-dark handling — the wrapper simply steps aside."""
 
