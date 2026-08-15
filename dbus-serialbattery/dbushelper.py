@@ -1710,7 +1710,15 @@ class DbusHelper:
         self._dbusservice["/Alarms/HighChargeCurrent"] = self.battery.protection.high_charge_current
         self._dbusservice["/Alarms/HighDischargeCurrent"] = self.battery.protection.high_discharge_current
         self._dbusservice["/Alarms/CellImbalance"] = self.battery.protection.cell_imbalance
-        self._dbusservice["/Alarms/InternalFailure"] = self.battery.protection.internal_failure
+        # While the fallback sensor is actively serving, the outage's one
+        # designated voice is the (delayed) BmsCable warning - the driver's
+        # stale-data InternalFailure escalation predates fallback mode and
+        # just duplicates it as alarm noise (observed: "Internal failure"
+        # notifications for both packs during routine covered outages).
+        if self.fallback_mode and self.fallback_alive:
+            self._dbusservice["/Alarms/InternalFailure"] = 0
+        else:
+            self._dbusservice["/Alarms/InternalFailure"] = self.battery.protection.internal_failure
         self._dbusservice["/Alarms/HighChargeTemperature"] = self.battery.protection.high_charge_temperature
         self._dbusservice["/Alarms/LowChargeTemperature"] = self.battery.protection.low_charge_temperature
         self._dbusservice["/Alarms/HighTemperature"] = self.battery.protection.high_temperature
