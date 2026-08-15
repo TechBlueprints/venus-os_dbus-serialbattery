@@ -1001,6 +1001,27 @@ class FallbackBattery:
         """
         return False if self._discharge_is_blocked() else self.battery.get_allow_to_discharge()
 
+    def manage_charge_voltage(self) -> None:
+        """
+        Run the CVL state machine only when there are cell voltages to run it on.
+
+        Registering from the stash produces a battery whose cells exist but
+        were never read. The state machine subtracts the minimum cell voltage
+        from the maximum without guarding for that, and its own TypeError
+        handler treats the result as a fault: CVL collapses to the float
+        voltage and error code 8 lights up the GUI - for what is a legitimate
+        state, on every restart that cannot reach the BMS. Publish the
+        configured ceiling instead and let the state machine start when real
+        cell voltages do.
+
+        :return: None
+        """
+        if self.battery.get_max_cell_voltage() is None or self.battery.get_min_cell_voltage() is None:
+            if self.battery.control_voltage is None and self.battery.max_battery_voltage is not None:
+                self.battery.control_voltage = round(self.battery.max_battery_voltage, 2)
+            return
+        self.battery.manage_charge_voltage()
+
     @property
     def control_charge_current(self):
         """Charge current limit; zero only when the projection says so.

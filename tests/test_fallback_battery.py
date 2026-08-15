@@ -829,6 +829,30 @@ class TestTestConnection:
         wrapper._stash = {"cell_count": 8}
         assert wrapper.test_connection() is False
 
+    def test_unread_cells_do_not_raise_error_code_eight(self, monkeypatch, tmp_path):
+        # Observed live: a stash-registered battery has cells that exist but
+        # were never read, and manage_charge_voltage's cell-diff subtraction
+        # raised TypeError -> CVL collapsed to float + manage_error_code(8).
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=False)
+        for cell in wrapper.battery.cells:
+            cell.voltage = None
+        wrapper.battery.control_voltage = None
+        wrapper.battery.max_battery_voltage = 14.6
+        wrapper.battery.error_code = None
+
+        wrapper.manage_charge_voltage()
+
+        assert wrapper.battery.control_voltage == 14.6
+        assert wrapper.battery.charge_mode != "Error, please check the logs!"
+        assert wrapper.battery.error_code is None
+
+    def test_real_cells_still_run_the_state_machine(self, monkeypatch, tmp_path):
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT)
+        ran = []
+        wrapper.battery.manage_charge_voltage = lambda: ran.append(True)
+        wrapper.manage_charge_voltage()
+        assert ran == [True]
+
     def test_stash_registration_serves_before_the_service_exists(self, monkeypatch, tmp_path):
         # The paths are added as None by setup_vedbus; a consumer that
         # recomputes on value change samples that leading edge. Values must
