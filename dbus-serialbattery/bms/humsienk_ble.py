@@ -605,6 +605,38 @@ class HumsiENK_Ble(Battery):
             return
 
         values = [int.from_bytes(data[i : i + 2], "little") for i in range(0, 44, 2)]
+
+        # DIAGNOSTIC, merge branch only, do not port to the driver PR.
+        # Chasing a pack overvoltage warning (status bit 12) that appears near
+        # 14.2 V on a 4S pack whose cell OVP is 3.65 V. Nothing in the fields
+        # we read can produce that, so dump every field with the vendor app's
+        # own names to find what does. Remove once the threshold is known.
+        _CONFIG_FIELD_NAMES = (
+            "battery_count",
+            "battery_capacity_0.01Ah",
+            "overvoltage_protection_mV",
+            "overvoltage_recovery_mV",
+            "overvoltage_delay_s",
+            "undervoltage_protection_mV",
+            "undervoltage_recovery_mV",
+            "undervoltage_delay_s",
+            "charge_ocp_0.1A",
+            "charge_ocp_delay_s",
+            "discharge_ocp1_0.1A",
+            "discharge_ocp1_delay_s",
+            "discharge_ocp2_0.1A",
+            "discharge_ocp2_delay_s",
+            "charge_high_temp_protection",
+            "charge_high_temp_recovery",
+            "charge_low_temp_protection",
+            "charge_low_temp_recovery",
+            "discharge_high_temp_protection",
+            "discharge_high_temp_recovery",
+            "discharge_low_temp_protection",
+            "discharge_low_temp_recovery",
+        )
+        logger.info("HumsiENK: config frame raw: " + " ".join(f"[{index}]{name}={value}" for index, (name, value) in enumerate(zip(_CONFIG_FIELD_NAMES, values))))
+
         cell_count = values[0]
         capacity = values[1] / 100
         cell_max_voltage = values[2] / 1000
