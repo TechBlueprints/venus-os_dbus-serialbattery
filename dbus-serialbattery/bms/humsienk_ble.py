@@ -174,6 +174,7 @@ class HumsiENK_Ble(Battery):
         self._last_handshake_time = 0.0
         self._deadline = None  # caps a run of requests, see _request()
         self._bms_uptime_minutes = None  # DIAGNOSTIC, see _parse_status
+        self._bms_uptime_logged = None
 
         logger.info("Init of HumsiENK_Ble at " + address)
 
@@ -568,8 +569,13 @@ class HumsiENK_Ble(Battery):
         uptime_minutes = int.from_bytes(data[0:2], "little") * 1440 + data[2] * 60 + data[3]
         if self._bms_uptime_minutes is not None and uptime_minutes < self._bms_uptime_minutes:
             logger.warning(f"HumsiENK: BMS uptime went backwards, {self._bms_uptime_minutes} -> {uptime_minutes} minutes: the BMS restarted")
-        elif self._bms_uptime_minutes is None:
-            logger.info(f"HumsiENK: BMS uptime at first status frame: {uptime_minutes} minutes")
+            self._bms_uptime_logged = None
+        # Also report it periodically, because a counter stuck at zero and one
+        # counting up are the same silence otherwise, and which of those it is
+        # decides whether the reading means anything at all.
+        if self._bms_uptime_logged is None or uptime_minutes - self._bms_uptime_logged >= 15:
+            logger.info(f"HumsiENK: BMS uptime {uptime_minutes} minutes")
+            self._bms_uptime_logged = uptime_minutes
         self._bms_uptime_minutes = uptime_minutes
 
         self.charge_fet = bool(status & (1 << 7))
