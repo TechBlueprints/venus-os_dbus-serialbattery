@@ -528,7 +528,28 @@ class BCMBackend(BleConnectionBackend):
         logger.info(f"BLE [{address}] connected via BCM")
 
         try:
-            await asyncio.wait_for(client.start_notify(notify_char, notify_callback), timeout=10.0)
+            # Same GATT discovery race BleakBackend guards against: connect can
+            # return before every characteristic is resolved, and the notify
+            # characteristic then reads as missing although it exists. Without
+            # the retry the connection is scrapped and rebuilt into the same
+            # race, which on this backend loops indefinitely - observed for
+            # 7 minutes and 24 failed attempts on live hardware, with the
+            # oscillation breaker counting up and never helping, because the
+            # link is not the problem.
+            for attempt in range(3):
+                try:
+                    await asyncio.wait_for(client.start_notify(notify_char, notify_callback), timeout=10.0)
+                    break
+                except BleakCharacteristicNotFoundError:
+                    if attempt == 2:
+                        raise
+                    logger.warning(f"BLE [{address}] characteristic {notify_char} not resolved yet, re-running service discovery")
+                    # bleak exposes no public way to redo discovery on a live
+                    # client; dropping the cached services makes the next call
+                    # fetch them again
+                    client._backend.services = None
+                    await client._backend._get_services()
+                    await asyncio.sleep(0.5)
         except Exception as e:
             logger.warning(f"BLE [{address}] start_notify failed: {repr(e)}")
             # A stale BlueZ cache entry produces a client that reports itself

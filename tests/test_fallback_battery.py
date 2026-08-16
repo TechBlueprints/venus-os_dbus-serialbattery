@@ -459,6 +459,62 @@ class TestServedValues:
         assert wrapper.get_current() == 0.0
 
 
+class TestUnreadFetStates:
+    """A service registered from the stash has never read the FET states. The
+    base class reads unset as not-allowed, which would have it publish full
+    configured limits while telling DVCC the battery can do neither."""
+
+    def test_unread_fets_do_not_assert_a_block_while_serving(self, monkeypatch):
+        # a configured safe zone the projection sits inside, so governance is
+        # not the thing blocking and the FET state is what is under test
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MIN", 2.70)
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MAX", 3.55)
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.charge_fet = None
+        wrapper.battery.discharge_fet = None
+        wrapper.battery.control_allow_charge = True
+        wrapper.battery.control_allow_discharge = True
+        _serve(wrapper)
+
+        assert wrapper.get_allow_to_charge() is True
+        assert wrapper.get_allow_to_discharge() is True
+
+    def test_a_fet_the_bms_reported_open_is_still_honoured(self, monkeypatch):
+        # unknown is not the same as known-open: a real report must win
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MIN", 2.70)
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MAX", 3.55)
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.charge_fet = False
+        wrapper.battery.discharge_fet = False
+        wrapper.battery.control_allow_charge = True
+        wrapper.battery.control_allow_discharge = True
+        _serve(wrapper)
+
+        assert wrapper.get_allow_to_charge() is False
+        assert wrapper.get_allow_to_discharge() is False
+
+    def test_unread_fets_are_not_overridden_when_not_serving(self, monkeypatch):
+        # with the BMS answering, an unread FET is the base class's business
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=True)
+        wrapper.battery.charge_fet = None
+        wrapper.battery.control_allow_charge = True
+        wrapper.refresh_data()
+
+        assert wrapper._serving is False
+        assert wrapper.get_allow_to_charge() is False
+
+    def test_the_drivers_own_control_decision_still_applies(self, monkeypatch):
+        # only the FET term is substituted, not the limiter's decision
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MIN", 2.70)
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MAX", 3.55)
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.charge_fet = None
+        wrapper.battery.control_allow_charge = False
+        _serve(wrapper)
+
+        assert wrapper.get_allow_to_charge() is False
+
+
 class TestSocAnchoring:
     """The served SoC is the BMS reading moved by the shunt's travel, not the
     shunt's own absolute estimate. Two instruments disagree on absolute SoC by
