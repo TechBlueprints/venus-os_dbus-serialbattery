@@ -1147,23 +1147,45 @@ class FallbackBattery:
 
     def manage_charge_and_discharge_current(self) -> None:
         """
-        Skip the cell-based current limiting when there are no cell voltages.
+        Skip the current limiters while their inputs have not been read.
 
-        The cell-voltage and temperature limiters raise on unread cells too.
-        They land on the configured current, which is the right answer, but
-        each one raises error code 8 on the way there - so the same startup
-        window that produced a bad CVL also produced repeated GUI errors from
-        three more paths. Publish the configured limits directly instead.
+        The limiter suite assumes a full BMS dataset. Run against a partial
+        one it still lands on the configured current, which is the right
+        answer, but noisily: unread cells raise error code 8 on the way
+        there, and unread temperatures make the temperature limiter log a
+        warning on every single cycle - observed at two per second for the
+        whole registration-without-BMS-contact window, on a device that
+        logs to flash. Publish the configured limits directly until the
+        BMS has delivered what the limiters consume.
+
+        Cells count as read once a projection basis is written onto them,
+        so a mid-outage restart with a restored basis runs the limiters
+        normally - but temperatures are never projected, so those wait for
+        a real frame.
 
         :return: None
         """
-        if self._cells_unread():
+        if self._cells_unread() or self._temperatures_unread():
             charge_limit = self.battery.max_battery_charge_current
             discharge_limit = self.battery.max_battery_discharge_current
             self.battery.control_charge_current = charge_limit if charge_limit is not None else utils.MAX_BATTERY_CHARGE_CURRENT
             self.battery.control_discharge_current = discharge_limit if discharge_limit is not None else utils.MAX_BATTERY_DISCHARGE_CURRENT
             return
         self.battery.manage_charge_and_discharge_current()
+
+    def _temperatures_unread(self) -> bool:
+        """
+        Whether the temperature limiters would run against unread sensors.
+
+        Only meaningful when temperature-based limiting is enabled; with it
+        disabled the limiters never consult the sensors and there is nothing
+        to wait for.
+
+        :return: whether enabled temperature limiting lacks its inputs
+        """
+        if not (utils.CCCM_T_ENABLE or utils.DCCM_T_ENABLE):
+            return False
+        return self.battery.get_max_temperature() is None or self.battery.get_min_temperature() is None
 
     def _cells_unread(self) -> bool:
         """

@@ -61,6 +61,8 @@ class _FakeBattery(_ConcreteBattery):
         self.cells = [Cell(False) for _ in range(8)]
         for cell in self.cells:
             cell.voltage = 3.25
+        self.temperature_1 = 20.0
+        self.temperature_2 = 21.0
         self.online = True
 
     def test_connection(self):
@@ -1056,6 +1058,42 @@ class TestTestConnection:
         ran = []
         wrapper.battery.manage_charge_and_discharge_current = lambda: ran.append(True)
         wrapper.manage_charge_and_discharge_current()
+        assert ran == [True]
+
+    def test_unread_temperatures_publish_configured_currents_without_warnings(self, monkeypatch, tmp_path):
+        # The temperature limiter logs a warning on every cycle its inputs
+        # are None - observed at two per second for a whole registration
+        # window, on a device that logs to flash. Cells being readable is not
+        # enough: temperatures are never projected, so the limiter suite must
+        # wait for a real frame.
+        monkeypatch.setattr(utils, "CCCM_T_ENABLE", True)
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT)
+        wrapper.battery.temperature_1 = None
+        wrapper.battery.temperature_2 = None
+        wrapper.battery.max_battery_charge_current = 50.0
+        wrapper.battery.max_battery_discharge_current = 60.0
+        ran = []
+        wrapper.battery.manage_charge_and_discharge_current = lambda: ran.append(True)
+
+        wrapper.manage_charge_and_discharge_current()
+
+        assert ran == []
+        assert wrapper.battery.control_charge_current == 50.0
+        assert wrapper.battery.control_discharge_current == 60.0
+
+    def test_disabled_temperature_limiting_does_not_wait_for_temperatures(self, monkeypatch, tmp_path):
+        # With temperature limiting off the limiters never consult the
+        # sensors, so unread temperatures are no reason to hold back.
+        monkeypatch.setattr(utils, "CCCM_T_ENABLE", False)
+        monkeypatch.setattr(utils, "DCCM_T_ENABLE", False)
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT)
+        wrapper.battery.temperature_1 = None
+        wrapper.battery.temperature_2 = None
+        ran = []
+        wrapper.battery.manage_charge_and_discharge_current = lambda: ran.append(True)
+
+        wrapper.manage_charge_and_discharge_current()
+
         assert ran == [True]
 
     def test_real_cells_still_run_the_state_machine(self, monkeypatch, tmp_path):
