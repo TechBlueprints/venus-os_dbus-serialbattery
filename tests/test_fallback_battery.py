@@ -970,6 +970,12 @@ class _FakeDbusService(dict):
     def __exit__(self, *exc):
         return False
 
+    def add_path(self, path, value, **kwargs):
+        self[path] = value
+
+    def register(self):
+        self.registered = True
+
 
 class _FakeLoop:
     def __init__(self):
@@ -1010,6 +1016,42 @@ class TestPublishCycleThroughDbusHelper:
         helper.last_seen_saved_last_time = int(_now())
         helper.telemetry_upload = lambda: None
         return helper
+
+    def test_a_fallback_served_soc_still_registers_the_bms_comparison_paths(self, monkeypatch):
+        # The live configuration sets FALLBACK_SENSOR_DBUS_PATH_SOC and
+        # neither SOC_CALCULATION nor EXTERNAL_SENSOR_DBUS_PATH_SOC, so
+        # gating these three paths on the other two alone deletes them from
+        # the running service and the documented BMS-vs-shunt comparison
+        # disappears without a word.
+        monkeypatch.setattr(utils, "SOC_CALCULATION", False)
+        monkeypatch.setattr(utils, "EXTERNAL_SENSOR_DBUS_PATH_SOC", None)
+        monkeypatch.setattr(utils, "FALLBACK_SENSOR_DBUS_PATH_SOC", "/Soc")
+        monkeypatch.setattr(utils, "PUBLISH_CONFIG_VALUES", False)
+        monkeypatch.setattr(utils, "BATTERY_CELL_DATA_FORMAT", 0)
+
+        helper = self._helper(monkeypatch)
+        helper.setup_instance = lambda: True
+        helper._dbusname = "com.victronenergy.battery.ble_test"
+        helper.bms_id = "ble_test"
+        helper.instance = 1
+        helper.settings = {"CustomName": "Test"}
+        helper._dbusservice = _FakeDbusService()
+
+        assert helper.setup_vedbus() is True
+
+        service = helper._dbusservice
+        assert "/SocBms" in service
+        assert "/CapacityBms" in service
+        assert "/ConsumedAmphoursBms" in service
+
+        # and the publish cycle fills them with the BMS's own values rather
+        # than the shunt-served ones
+        helper.battery.battery.capacity_remain = 170.0
+        helper.battery._last_fresh_time = _now() - 100
+        helper.publish_battery(_FakeLoop())
+        assert service["/SocBms"] == round(helper.battery.battery.soc, 2)
+        assert service["/SocBms"] != service["/Soc"]
+        assert service["/CapacityBms"] == 170.0
 
     def test_a_cell_blind_battery_never_publishes_an_invalid_charge_limit(self, monkeypatch):
         # velib maps a None publish to *invalid* rather than refusing it, and

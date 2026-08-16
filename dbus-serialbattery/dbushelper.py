@@ -690,8 +690,8 @@ class DbusHelper:
             writeable=True,
             gettextcallback=lambda p, v: "{:0.0f}Ah".format(v),
         )
-        # add original BMS capacity values for comparing when SOC_CALCULATION overrides them
-        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
+        # add original BMS capacity values for comparing when SOC_CALCULATION or a sensor overrides them
+        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None or utils.FALLBACK_SENSOR_DBUS_PATH_SOC is not None:
             self._dbusservice.add_path(
                 "/CapacityBms",
                 None,
@@ -707,8 +707,9 @@ class DbusHelper:
 
         # Create SOC, DC and System items
         self._dbusservice.add_path("/Soc", None, writeable=True)
-        # add original SOC for comparing
-        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
+        # add original SOC for comparing (also when the fallback sensor can
+        # take over SoC serving, so the BMS-vs-shunt step stays visible)
+        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None or utils.FALLBACK_SENSOR_DBUS_PATH_SOC is not None:
             self._dbusservice.add_path("/SocBms", None, writeable=True)
 
         self._dbusservice.add_path("/Soh", None, writeable=True)
@@ -1147,7 +1148,7 @@ class DbusHelper:
         Publishes the battery data to dbus and refresh it.
         """
         self._dbusservice["/System/NrOfCellsPerBattery"] = self.battery.cell_count
-        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
+        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None or utils.FALLBACK_SENSOR_DBUS_PATH_SOC is not None:
             self._dbusservice["/Soc"] = round(self.battery.soc_calc, 2) if self.battery.soc_calc is not None else None
             # add original SOC for comparing
             self._dbusservice["/SocBms"] = round(self.battery.soc, 2) if self.battery.soc is not None else None
@@ -1165,7 +1166,7 @@ class DbusHelper:
         self._dbusservice["/Dc/0/Temperature"] = self.battery.get_temperature()
         self._dbusservice["/Capacity"] = self.battery.get_capacity_remain()
         self._dbusservice["/ConsumedAmphours"] = self.battery.get_capacity_consumed()
-        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None:
+        if utils.SOC_CALCULATION or utils.EXTERNAL_SENSOR_DBUS_PATH_SOC is not None or utils.FALLBACK_SENSOR_DBUS_PATH_SOC is not None:
             self._dbusservice["/CapacityBms"] = self.battery.get_capacity_remain_bms()
             self._dbusservice["/ConsumedAmphoursBms"] = self.battery.get_capacity_consumed_bms()
 
