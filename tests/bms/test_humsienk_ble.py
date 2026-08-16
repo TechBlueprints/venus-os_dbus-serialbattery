@@ -358,17 +358,48 @@ def test_whether_balancing_is_allowed_is_never_claimed():
     assert [cell.balance for cell in bms.cells] == [True, False, True, False]
 
 
-def test_discharge_cutoff_is_reported_as_a_low_cell_voltage():
-    # Bit 22, "end discharge" in the vendor app, sits with the discharge
-    # protections. Pack undervoltage is bit 21 and is reported separately.
+def test_cell_voltage_alarms_come_from_the_cell_bits_not_the_stop_bits():
+    # Cell undervoltage is the 19/27 pair. Bit 22 is "discharging stopped",
+    # a state the BMS reaches on a normal cutoff, so routing it to a cell
+    # undervoltage alarm would raise a fault every time a pack ran down.
     bms = make_bms()
     bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 22))))
 
-    assert bms.protection.low_cell_voltage == 2
+    assert bms.protection.low_cell_voltage == 0
     assert bms.protection.low_voltage == 0
 
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 27))))
+    assert bms.protection.low_cell_voltage == 1
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 19))))
+    assert bms.protection.low_cell_voltage == 2
+
+
+def test_cell_overvoltage_and_imbalance_are_published():
+    # bit 11 is the one bit in this group observed on real hardware: it was
+    # asserted through the top of charge on both packs and released well down
+    # the discharge, which is what a warning below its protection does.
+    bms = make_bms()
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 11))))
+    assert bms.protection.high_cell_voltage == 1
+
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 3))))
+    assert bms.protection.high_cell_voltage == 2
+
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 13))))
+    assert bms.protection.cell_imbalance == 1
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 14))))
+    assert bms.protection.cell_imbalance == 2
+
+
+def test_an_analogue_front_end_fault_is_an_internal_failure():
+    # The AFE is what measures the cells, so a fault there makes every reading
+    # untrustworthy: the same class of problem as a disconnected cell.
+    bms = make_bms()
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 5))))
+    assert bms.protection.internal_failure == 2
+
     bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=0)))
-    assert bms.protection.low_cell_voltage == 0
+    assert bms.protection.internal_failure == 0
 
 
 def test_status_alarm_bits_map_to_alarms_and_warnings():
@@ -663,17 +694,18 @@ def test_the_handshake_acknowledgement_is_not_treated_as_a_discovery(caplog):
 
 
 def test_movement_in_the_unmapped_status_bits_is_reported(caplog):
-    # Nine bits are never displayed by the vendor app and never read by us.
-    # The only way they ever become known is by noticing them move.
+    # What is left unmapped is charging stopped, discharging stopped and the
+    # pre-discharge FET: documented states with no D-Bus path. The only way
+    # anything is ever learned about them is by noticing them move.
     bms = make_bms()
     bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 7))))
 
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 7) | (1 << 11))))
+        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 7) | (1 << 6))))
 
-    assert "unmapped status bits moved [11]" in caplog.text
-    assert "now set [11]" in caplog.text
+    assert "unmapped status bits moved [6]" in caplog.text
+    assert "now set [6]" in caplog.text
 
 
 def test_movement_in_mapped_bits_is_not_reported_as_unmapped(caplog):
