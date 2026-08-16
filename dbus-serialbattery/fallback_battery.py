@@ -41,8 +41,12 @@ What it does
 * **Persistence.** The wrapper stashes the little that D-Bus service
   registration needs (cell count, capacity, limits) to ``/data`` every
   five minutes, so a driver restart during an outage can register and
-  serve shunt values without ever reaching the BMS. Cell voltages are
-  never persisted and never restored as serving values.
+  serve shunt values without ever reaching the BMS. It also stashes the
+  last real per-cell voltages **as a projection basis**, stamped with the
+  age of the data rather than of the write, so a restarted process
+  recomputes a current limit from the live shunt instead of serving a
+  remembered one. A restored basis is an *input* only: it is never
+  written into ``battery.cells`` and never published as a measurement.
 """
 
 import json
@@ -135,6 +139,7 @@ class FallbackBattery:
             "_fallback_since",
             "_cell_snapshot",
             "_cell_snapshot_time",
+            "_cell_snapshot_restored",
             "_projection_valid",
             "_charge_blocked",
             "_discharge_blocked",
@@ -227,6 +232,10 @@ class FallbackBattery:
         self._fallback_since: float = None
         self._cell_snapshot: list = None
         self._cell_snapshot_time: float = None
+        self._cell_snapshot_restored: bool = False
+        """Whether the current basis came off disk rather than from this
+        process. A restored basis is an input to the projection only: it
+        must never be written back into the cells as a measurement."""
         self._projection_valid: bool = False
         self._charge_blocked: bool = False
         self._discharge_blocked: bool = False
@@ -563,14 +572,18 @@ class FallbackBattery:
                 # that a cell frame arrived yet - without this, a partial
                 # frame lets the next engagement snapshot our own synthetic
                 # voltages as if they were measurements.
+                # A restored basis is not this process's measurement, so it
+                # is put back as *unread* rather than as a reading: nothing
+                # off disk may reach a published cell voltage.
                 if self._cell_snapshot is not None:
                     for index, voltage in enumerate(self._cell_snapshot):
                         if index < len(self.battery.cells):
-                            self.battery.cells[index].voltage = voltage
+                            self.battery.cells[index].voltage = None if self._cell_snapshot_restored else voltage
             self._fallback_mode = False
             self._fallback_since = None
             self._cell_snapshot = None
             self._cell_snapshot_time = None
+            self._cell_snapshot_restored = False
             self._projection_valid = False
             self._charge_blocked = False
             self._discharge_blocked = False
@@ -591,23 +604,47 @@ class FallbackBattery:
 
     def _take_cell_snapshot(self) -> None:
         """
-        Capture the last-known per-cell voltages as the projection basis,
-        together with the age of the data they came from. Leaves the snapshot
-        unset (projection unavailable) if any cell is unread.
+        Capture the projection basis at engagement, in order of preference:
+
+        1. this process's own cell readings, if every cell is readable and
+           the data behind them is within SNAPSHOT_MAX_AGE_SECONDS;
+        2. otherwise an existing basis, if there is one and it is still
+           within that age — this is the mid-outage restart, where the basis
+           came off disk and the live cells are all unread precisely because
+           restored cells are deliberately left that way;
+        3. otherwise nothing, and the projection is unavailable.
+
+        Reading the live cells unconditionally would destroy a restored basis
+        the moment the shunt engaged, which is the whole point of stashing it.
 
         :return: None
         """
         cell_count = self.battery.cell_count if self.battery.cell_count is not None else 0
         cells = [cell.voltage for cell in self.battery.cells[:cell_count]]
-        if cells and all(voltage is not None for voltage in cells):
+        # The basis is as old as the data the cells came from, which is the
+        # last observed live refresh — zero for a process that has never seen
+        # one, so live cells cannot pass this in a mid-outage restart.
+        if cells and all(voltage is not None for voltage in cells) and self._basis_within_age(self._last_fresh_time):
             self._cell_snapshot = cells
-            # The basis is as old as the data the cells came from, which is
-            # the last observed live refresh — zero for a process that never
-            # saw one, so a mid-outage restart can never acquire a basis.
             self._cell_snapshot_time = self._last_fresh_time
-        else:
-            self._cell_snapshot = None
-            self._cell_snapshot_time = None
+            self._cell_snapshot_restored = False
+            return
+
+        if self._cell_snapshot is not None and self._basis_within_age(self._cell_snapshot_time):
+            return
+
+        self._cell_snapshot = None
+        self._cell_snapshot_time = None
+        self._cell_snapshot_restored = False
+
+    def _basis_within_age(self, basis_time: Union[float, None]) -> bool:
+        """
+        :param basis_time: when the data behind a basis was observed
+        :return: whether a basis of that age may still be projected from
+        """
+        if not basis_time:
+            return False
+        return (time() - basis_time) <= self.SNAPSHOT_MAX_AGE_SECONDS
 
     def project_cells(self, shunt_voltage: Union[float, None]) -> Union[list, None]:
         """
@@ -626,7 +663,7 @@ class FallbackBattery:
         """
         if self._cell_snapshot is None or shunt_voltage is None:
             return None
-        if self._cell_snapshot_time is None or (time() - self._cell_snapshot_time) > self.SNAPSHOT_MAX_AGE_SECONDS:
+        if not self._basis_within_age(self._cell_snapshot_time):
             return None
         delta_per_cell = (shunt_voltage - sum(self._cell_snapshot)) / len(self._cell_snapshot)
         if abs(delta_per_cell) > self.PROJECTION_MAX_DELTA:
@@ -766,10 +803,18 @@ class FallbackBattery:
         Load the registration stash and apply it to the wrapped battery, so
         the dbus service can be registered without ever reaching the BMS.
 
-        Deliberately carries no live values: cell voltages, voltage, current
-        and SoC are never persisted and never restored. Restored cells exist
+        Carries no served values: voltage, current, SoC and the cell
+        voltages are never restored onto the battery. Restored cells exist
         (the per-cell dbus paths are built once, at registration) but are
-        unread, so they can never become a projection basis either.
+        left unread, so nothing can publish a persisted number as a
+        measurement.
+
+        The stashed cell voltages are restored to a different place: they
+        seed the projection *basis*, an input to project_cells(). That is
+        what lets a mid-outage restart compute a current limit from the live
+        shunt rather than serve the pack's persisted rating - a limit that
+        was computed self-clears when conditions change, a persisted one is
+        a latch with no input that could ever revise it.
 
         :return: None
         """
@@ -800,8 +845,32 @@ class FallbackBattery:
                 while len(self.battery.cells) < cell_count:
                     self.battery.cells.append(Cell(False))
                 del self.battery.cells[cell_count:]
+            self._restore_projection_basis(cell_count)
         except Exception as e:
             logger.debug(f"Fallback stash could not be applied: {repr(e)}")
+
+    def _restore_projection_basis(self, cell_count: int) -> None:
+        """
+        Seed the projection basis from the stash, without touching the cells.
+
+        The voltages land in _cell_snapshot, never in battery.cells: they are
+        an input to project_cells(), not a reading. The recorded time is the
+        age of the DATA, so the ordinary SNAPSHOT_MAX_AGE_SECONDS check
+        refuses a basis from an outage the process slept through.
+
+        :param cell_count: the restored cell count, 0 if unknown
+        :return: None
+        """
+        cells = self._stash.get("cells")
+        basis_time = self._stash.get("cells_time")
+        if not cells or not basis_time or any(voltage is None for voltage in cells):
+            return
+        if cell_count and len(cells) != cell_count:
+            return
+        self._cell_snapshot = list(cells)
+        self._cell_snapshot_time = basis_time
+        self._cell_snapshot_restored = True
+        logger.info(f"Fallback projection basis restored ({time() - basis_time:.0f}s old): limits will be computed, not remembered")
 
     def _update_stash(self, fresh: bool) -> None:
         """
@@ -814,6 +883,7 @@ class FallbackBattery:
         """
         if not fresh or self.battery.cell_count is None:
             return
+        previous = self._stash or {}
         self._stash = {
             "timestamp": time(),
             "cell_count": self.battery.cell_count,
@@ -824,9 +894,39 @@ class FallbackBattery:
             "max_battery_discharge_current": self.battery.max_battery_discharge_current,
             "hardware_version": self.battery.hardware_version,
         }
+        self._stash_projection_basis(previous)
         if time() - self._stash_written < self.STASH_INTERVAL_SECONDS:
             return
         self._write_stash()
+
+    def _stash_projection_basis(self, previous: dict) -> None:
+        """
+        Carry the projection basis into the rebuilt stash.
+
+        What is persisted is the *input* to the limit calculation, not the
+        limit: a restarted process projects it against the live shunt and
+        arrives at a current answer that self-clears when conditions change.
+        A persisted limit could not - it would latch, which is how a zeroed
+        CCL once propagated bank-wide with nothing able to revise it.
+
+        Only measurements qualify. Projected voltages are this wrapper's own
+        arithmetic, so nothing is taken while fallback mode is engaged; a
+        cycle that cannot offer a full frame carries the previous basis
+        forward rather than dropping it, on the same principle that stops an
+        outage overwriting a good stash.
+
+        :param previous: the stash contents before this refresh
+        :return: None
+        """
+        cells = [cell.voltage for cell in self.battery.cells[: self.battery.cell_count]]
+        if not self._fallback_mode and cells and all(voltage is not None for voltage in cells):
+            self._stash["cells"] = cells
+            # Stamped with the age of the data, not of the write, so the
+            # recorded age survives the restart meaningfully.
+            self._stash["cells_time"] = self._last_fresh_time
+        elif previous.get("cells") and previous.get("cells_time"):
+            self._stash["cells"] = previous["cells"]
+            self._stash["cells_time"] = previous["cells_time"]
 
     def _write_stash(self) -> None:
         """
@@ -1063,7 +1163,18 @@ class FallbackBattery:
 
     def _cells_unread(self) -> bool:
         """
-        :return: whether the pack's cell voltages have never been read
+        Whether there is nothing to compute a limit from.
+
+        Deliberately asked of the cells rather than of the link: a usable
+        projection basis has already been written onto them by
+        _update_projection() before DbusHelper calls the managers, so a
+        mid-outage restart with a restored basis computes its limits from
+        the live shunt like any other serving cycle. The configured rating
+        is taken only when there is neither a reading nor a projection -
+        which is a statement about the cells, and the cells are where both
+        arrive.
+
+        :return: whether the pack has no cell voltages at all
         """
         return self.battery.get_max_cell_voltage() is None or self.battery.get_min_cell_voltage() is None
 

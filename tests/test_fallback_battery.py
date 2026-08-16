@@ -797,11 +797,13 @@ class TestStash:
         assert restarted.battery.max_battery_voltage == 29.2
 
     def test_restored_cells_are_unread(self, monkeypatch, tmp_path):
+        # The stash carries cell voltages as a projection *basis*; no served
+        # value is persisted, and the basis is never restored onto the cells.
         wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=True)
         wrapper.refresh_data()
         with open(wrapper._stash_path) as stash_file:
             stash = json.load(stash_file)
-        assert "cells" not in stash and "voltage" not in stash and "soc" not in stash
+        assert "voltage" not in stash and "soc" not in stash and "current" not in stash
 
         battery = _FakeBattery()
         battery.cells = []
@@ -829,6 +831,133 @@ class TestStash:
         wrapper._stash_written = _now() - (FallbackBattery.STASH_INTERVAL_SECONDS + 1)
         wrapper.refresh_data()
         assert wrapper._stash_written > first
+
+
+class TestPersistedProjectionBasis:
+    """What survives a restart is the projection BASIS, not a limit.
+
+    A limit computed from a live projection revises itself when conditions
+    change; a persisted limit is a latch, with no input that could ever
+    revise it. So the input is what gets written to disk.
+    """
+
+    def _restart(self, monkeypatch, tmp_path, shunt=_LIVE_SHUNT, **battery_attributes):
+        """A process that starts mid-outage: stash on disk, BMS unreachable."""
+        battery = _FakeBattery()
+        battery.cells = []
+        battery.cell_count = None
+        for name, value in battery_attributes.items():
+            setattr(battery, name, value)
+        return _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=shunt, connected=False, battery=battery)
+
+    def test_the_stash_carries_the_cells_and_the_age_of_the_data(self, monkeypatch, tmp_path):
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=True)
+        wrapper.refresh_data()
+
+        # a later cycle that brings no new observation: the recorded age must
+        # follow the data, not the moment of writing
+        wrapper._stash_written = 0.0
+        wrapper._last_fresh_time = _now() - 5
+        wrapper.battery.voltage = None
+        wrapper.refresh_data()
+
+        with open(wrapper._stash_path) as stash_file:
+            stash = json.load(stash_file)
+        assert stash["cells"] == [3.25] * 8
+        assert stash["cells_time"] == wrapper._last_fresh_time
+        assert stash["timestamp"] - stash["cells_time"] >= 5
+
+    def test_projected_voltages_never_become_the_stashed_basis(self, monkeypatch, tmp_path):
+        # A link that drops while its last frame is still fresh engages the
+        # projection and refreshes the stash in the same cycle. Only
+        # measurements may be a basis - projected cells are our own
+        # arithmetic, and stashing them would compound it across restarts.
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=dict(_LIVE_SHUNT, Voltage=24.0), connected=True)
+        wrapper.refresh_data()
+        wrapper._stash_written = 0.0
+
+        wrapper.battery.ble_handle.connected = False
+        wrapper.refresh_data()
+
+        assert wrapper._serving is True and wrapper._projection_valid is True
+        assert wrapper.battery.cells[0].voltage == 3.0
+        with open(wrapper._stash_path) as stash_file:
+            assert json.load(stash_file)["cells"] == [3.25] * 8
+
+    def test_a_restart_restores_the_basis_and_leaves_the_cells_unread(self, monkeypatch, tmp_path):
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=True)
+        wrapper.refresh_data()
+
+        restarted = self._restart(monkeypatch, tmp_path)
+
+        assert restarted._cell_snapshot == [3.25] * 8
+        assert restarted._cell_snapshot_restored is True
+        # the basis is an input, never a reading
+        assert all(cell.voltage is None for cell in restarted.battery.cells)
+
+    def test_engagement_does_not_clobber_the_restored_basis(self, monkeypatch, tmp_path):
+        # every live cell is unread on a restored process - which is exactly
+        # the state the old snapshot rule threw the basis away for
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=True)
+        wrapper.refresh_data()
+
+        restarted = self._restart(monkeypatch, tmp_path)
+        _serve(restarted)
+
+        assert restarted._cell_snapshot == [3.25] * 8
+        assert restarted._projection_valid is True
+
+    def test_a_basis_older_than_the_window_is_refused(self, monkeypatch, tmp_path):
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=True)
+        wrapper.refresh_data()
+        with open(wrapper._stash_path) as stash_file:
+            stash = json.load(stash_file)
+        stash["cells_time"] = _now() - (FallbackBattery.SNAPSHOT_MAX_AGE_SECONDS + 1)
+        with open(wrapper._stash_path, "w") as stash_file:
+            json.dump(stash, stash_file)
+
+        restarted = self._restart(monkeypatch, tmp_path, max_battery_charge_current=50.0)
+        _serve(restarted)
+
+        assert restarted._projection_valid is False
+        assert restarted._cell_snapshot is None
+        # nothing to compute from: the configured rating, as before
+        restarted.manage_charge_and_discharge_current()
+        assert restarted.control_charge_current == 50.0
+
+    def test_a_computed_zero_clears_itself_when_the_shunt_moves(self, monkeypatch, tmp_path):
+        # The property the whole change exists for. A limit derived from the
+        # basis every cycle comes back on its own; a persisted limit would
+        # latch until a restart, which is how a zeroed CCL once propagated
+        # bank-wide through the aggregate into DVCC.
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MIN", 3.05)
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MAX", 3.55)
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=True)
+        wrapper.refresh_data()
+
+        # 24.0 V over 8 cells projects to 3.00 V/cell: below the safe zone
+        restarted = self._restart(monkeypatch, tmp_path, shunt=dict(_LIVE_SHUNT, Voltage=24.0), control_discharge_current=60)
+        _serve(restarted)
+        assert restarted._projection_valid is True
+        assert restarted.control_discharge_current == 0
+
+        # the pack recovers; no restart, no BMS data, no new basis
+        restarted.dbus_fallback_objects["Voltage"].value = 25.2
+        _serve(restarted)
+        assert restarted.control_discharge_current == 60
+
+    def test_a_restored_basis_is_never_published_as_a_cell_measurement(self, monkeypatch, tmp_path):
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=True)
+        wrapper.refresh_data()
+
+        restarted = self._restart(monkeypatch, tmp_path)
+        _serve(restarted)
+        # the BMS answers again: the projection is undone, and a basis that
+        # came off disk is put back as unread rather than as a reading
+        restarted.battery.ble_handle.connected = True
+        restarted.refresh_data()
+
+        assert all(cell.voltage is None for cell in restarted.battery.cells)
 
 
 class TestStashIdentifier:
