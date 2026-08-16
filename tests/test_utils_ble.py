@@ -82,20 +82,20 @@ def test_pool_order_is_preserved():
 
 def test_mac_at_adapter_entries_pin_and_stay_out_of_the_pool():
     pins, pool = utils_ble.parse_adapter_entries(["C8:47:8C:00:00:00@hci1", "C8:47:8C:00:00:11@hci2"])
-    assert pins == {"C8:47:8C:00:00:00": "hci1", "C8:47:8C:00:00:11": "hci2"}
+    assert pins == {"C8:47:8C:00:00:00": ["hci1"], "C8:47:8C:00:00:11": ["hci2"]}
     # a pinned MAC is not an adapter name and must never be handed to bleak
     assert pool == []
 
 
 def test_pins_and_pool_can_be_mixed():
     pins, pool = utils_ble.parse_adapter_entries(["hci0", "C8:47:8C:00:00:00@hci1"])
-    assert pins == {"C8:47:8C:00:00:00": "hci1"}
+    assert pins == {"C8:47:8C:00:00:00": ["hci1"]}
     assert pool == ["hci0"]
 
 
 def test_entries_are_whitespace_and_case_normalized():
     pins, pool = utils_ble.parse_adapter_entries([" c8:47:8c:00:00:00 @ hci1 ", " hci0 "])
-    assert pins == {"C8:47:8C:00:00:00": "hci1"}
+    assert pins == {"C8:47:8C:00:00:00": ["hci1"]}
     assert pool == ["hci0"]
 
 
@@ -119,7 +119,7 @@ def test_config_default_adapters_is_empty_so_the_default_adapter_is_used():
 
 def test_adapters_for_matches_a_pinned_device_regardless_of_case():
     original = utils_ble.BLUETOOTH_ADAPTER_PINS
-    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": "hci1"}
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": ["hci1"]}
     try:
         assert utils_ble.adapters_for("c8:47:8c:00:00:00") == ["hci1"]
         assert utils_ble.adapters_for("C8:47:8C:00:00:00") == ["hci1"]
@@ -148,3 +148,17 @@ def test_backends_implement_the_connection_interface():
         assert issubclass(cls, utils_ble.BleConnectionBackend)
         for method in ("create_client", "establish", "release"):
             assert getattr(cls, method) is not getattr(utils_ble.BleConnectionBackend, method)
+
+
+def test_a_mac_repeated_pins_several_adapters_in_priority_order():
+    # first entry is the primary, the rest are only tried if it cannot resolve
+    pins, pool = utils_ble.parse_adapter_entries(["AA:BB@hci4", "CC:DD@hci5", "AA:BB@hci2"])
+
+    assert pins == {"AA:BB": ["hci4", "hci2"], "CC:DD": ["hci5"]}
+    assert pool == []
+
+
+def test_a_repeated_pin_to_the_same_adapter_is_not_duplicated():
+    pins, _ = utils_ble.parse_adapter_entries(["AA:BB@hci4", "AA:BB@hci4"])
+
+    assert pins == {"AA:BB": ["hci4"]}
