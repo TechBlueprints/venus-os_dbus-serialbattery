@@ -384,3 +384,53 @@ def test_a_repeated_pin_to_the_same_adapter_is_not_duplicated():
     pins, _ = utils_ble.parse_adapter_entries(["AA:BB@hci4", "AA:BB@hci4"])
 
     assert pins == {"AA:BB": ["hci4"]}
+
+
+# ── post-connect validation ──────────────────────────────────────────────
+#
+# The manager calls this after connecting and re-reads GATT services when it
+# answers False, so what it reports decides whether a half-resolved client is
+# used or torn down. The manager's own retry ladder needs a real radio and is
+# not exercised here.
+
+
+class _FakeServices:
+    def __init__(self, characteristics):
+        self._characteristics = characteristics
+
+    def get_characteristic(self, uuid):
+        return self._characteristics.get(uuid)
+
+
+class _FakeClient:
+    def __init__(self, services):
+        self.services = services
+
+
+NOTIFY_UUID = "00000003-0000-1000-8000-00805f9b34fb"
+
+
+def test_a_resolved_notify_characteristic_validates():
+    client = _FakeClient(_FakeServices({NOTIFY_UUID: object()}))
+
+    assert utils_ble.notify_characteristic_present(client, NOTIFY_UUID) is True
+
+
+def test_an_unresolved_notify_characteristic_does_not_validate():
+    # GATT discovery finished for other characteristics but not this one
+    client = _FakeClient(_FakeServices({"0000ffff-0000-1000-8000-00805f9b34fb": object()}))
+
+    assert utils_ble.notify_characteristic_present(client, NOTIFY_UUID) is False
+
+
+def test_services_not_populated_at_all_does_not_validate():
+    # connect() returned before any service discovery completed
+    assert utils_ble.notify_characteristic_present(_FakeClient(None), NOTIFY_UUID) is False
+
+
+def test_a_client_that_raises_on_lookup_does_not_validate():
+    class _Raising:
+        def get_characteristic(self, uuid):
+            raise RuntimeError("not connected")
+
+    assert utils_ble.notify_characteristic_present(_FakeClient(_Raising()), NOTIFY_UUID) is False

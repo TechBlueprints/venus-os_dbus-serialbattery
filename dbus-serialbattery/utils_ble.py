@@ -61,6 +61,28 @@ def adapters_for(address):
     return list(pins) if pins else None
 
 
+def notify_characteristic_present(client, notify_char):
+    """
+    Whether the notification characteristic is resolved on this client.
+
+    connect() can return before GATT discovery has finished, and the
+    characteristic then reads as missing although the device does have it.
+    This is the same lookup start_notify() performs, so a True here means
+    the notification channel can be opened.
+
+    Anything unexpected counts as absent: the caller's remedy for a client
+    that cannot answer is the remedy for one that answers no.
+
+    :param client: a connected BleakClient
+    :param notify_char: UUID of the characteristic notifications arrive on
+    :return: True when the characteristic is resolved
+    """
+    try:
+        return client.services.get_characteristic(notify_char) is not None
+    except Exception:
+        return False
+
+
 # Hold flag: while the flag file for a device exists, the reconnect loop makes
 # no connection attempts for that device at all, giving a degraded BMS radio
 # extended quiet. The driver, its dbus service and its published data stay up,
@@ -506,6 +528,9 @@ class BCMBackend(BleConnectionBackend):
             self._handoff_fails += 1
             raise Exception(f"device not resolvable on allowed adapters {adapters} (scan and ConnectDevice both failed)")
 
+        async def validate(candidate):
+            return notify_characteristic_present(candidate, notify_char)
+
         try:
             client = await establish_connection(
                 BleakClient,
@@ -518,6 +543,13 @@ class BCMBackend(BleConnectionBackend):
                 escalation_policy=escalation,
                 overall_timeout=240.0,
                 timeout=15.0,
+                # connect() can return before GATT discovery has finished, and
+                # the notify characteristic then reads as missing although it
+                # exists. Reporting that here rather than after the fact lets
+                # the manager run its own wait, service re-read and re-validate
+                # ladder, and move to another adapter when that does not help.
+                # A client that never validates is torn down, not returned.
+                validate_connection=validate,
             )
         except Exception:
             self._handoff_fails += 1
@@ -535,28 +567,10 @@ class BCMBackend(BleConnectionBackend):
         logger.info(f"BLE [{address}] connected via BCM")
 
         try:
-            # Same GATT discovery race BleakBackend guards against: connect can
-            # return before every characteristic is resolved, and the notify
-            # characteristic then reads as missing although it exists. Without
-            # the retry the connection is scrapped and rebuilt into the same
-            # race, which on this backend loops indefinitely - observed for
-            # 7 minutes and 24 failed attempts on live hardware, with the
-            # oscillation breaker counting up and never helping, because the
-            # link is not the problem.
-            for attempt in range(3):
-                try:
-                    await asyncio.wait_for(client.start_notify(notify_char, notify_callback), timeout=10.0)
-                    break
-                except BleakCharacteristicNotFoundError:
-                    if attempt == 2:
-                        raise
-                    logger.warning(f"BLE [{address}] characteristic {notify_char} not resolved yet, re-running service discovery")
-                    # bleak exposes no public way to redo discovery on a live
-                    # client; dropping the cached services makes the next call
-                    # fetch them again
-                    client._backend.services = None
-                    await client._backend._get_services()
-                    await asyncio.sleep(0.5)
+            # The GATT discovery race is handled by validate_connection above,
+            # inside the manager, where it can also re-read services and change
+            # adapter. Reaching here means the characteristic was resolved.
+            await asyncio.wait_for(client.start_notify(notify_char, notify_callback), timeout=10.0)
         except Exception as e:
             logger.warning(f"BLE [{address}] start_notify failed: {repr(e)}")
             # A stale BlueZ cache entry produces a client that reports itself
