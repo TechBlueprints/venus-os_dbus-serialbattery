@@ -62,6 +62,11 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
         self._notification_queue = deque(maxlen=256)
         self._notification_signal = threading.Condition()
         self._watchdog_last_fed = time.time()
+        # DIAGNOSTIC: called once when an established link is lost. The
+        # layer above stops calling the driver's refresh_data() the moment
+        # this class reports the link down, so the driver has no way to
+        # notice a drop on its own.
+        self.on_link_lost = kwargs.pop("on_link_lost", None)
         super().__init__(*args, **kwargs)
 
     def feed_watchdog(self) -> None:
@@ -110,7 +115,16 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
                             break
                         await asyncio.sleep(0.1)
             finally:
+                was_connected = self.connected
                 self.connected = False
+                # DIAGNOSTIC: only for a link that was actually up, so a
+                # failed connection attempt does not look like a drop. Guarded
+                # because nothing diagnostic may break reconnection.
+                if was_connected and self.on_link_lost is not None:
+                    try:
+                        self.on_link_lost()
+                    except Exception as e:
+                        logger.debug(f"HumsiENK: on_link_lost raised: {repr(e)}")
                 if self.client:
                     try:
                         await asyncio.wait_for(self.backend.release(self.client), timeout=BLE_RELEASE_TIMEOUT)
@@ -197,7 +211,12 @@ class HumsiENK_Ble(Battery):
         """
         result = False
         try:
-            self.ble_handle = HumsiENK_Syncron_Ble(self.address, read_characteristic=self.BLE_RX_UUID, write_characteristic=self.BLE_TX_UUID)
+            self.ble_handle = HumsiENK_Syncron_Ble(
+                self.address,
+                read_characteristic=self.BLE_RX_UUID,
+                write_characteristic=self.BLE_TX_UUID,
+                on_link_lost=self._on_link_lost,  # DIAGNOSTIC
+            )
 
             if not self.ble_handle.connected:
                 logger.error("HumsiENK_Ble: could not connect to " + self.address)
@@ -492,7 +511,23 @@ class HumsiENK_Ble(Battery):
             else:
                 runs.append([status, stamp, 1])
         trace = " -> ".join(f"0x{status:08X}@-{last - stamp:.0f}s" + (f" x{count}" if count > 1 else "") for status, stamp, count in runs)
-        logger.warning(f"HumsiENK: link stale for {stale_seconds:.0f} s, last {len(self._status_history)} status words: {trace}")
+        logger.warning(f"HumsiENK: link lost, {stale_seconds:.0f} s since the last frame, last {len(self._status_history)} status words: {trace}")
+        # Consumed, so whichever trigger arrives second finds nothing to say.
+        self._status_history.clear()
+
+    def _on_link_lost(self) -> None:
+        """
+        DIAGNOSTIC, merge branch only, do not port to the driver PR.
+
+        Dump the trace when the BLE layer reports an established link gone.
+        This is the trigger that actually fires on a real drop: the layer
+        above stops calling refresh_data() as soon as the handle reports the
+        link down, which on a link BlueZ notices quickly happens before the
+        data is stale enough for the driver to spot it.
+
+        :return: None
+        """
+        self._dump_status_history(time.time() - self._last_frame_time)
 
     def _log_unsolicited(self, command: int, data: bytes) -> None:
         """

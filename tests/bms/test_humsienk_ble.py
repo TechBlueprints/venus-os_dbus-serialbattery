@@ -703,7 +703,7 @@ def test_the_last_status_words_are_dumped_when_the_link_goes_stale(caplog):
         bms._last_frame_time = time.time() - 60  # link has gone quiet
         assert bms.refresh_data() is False
 
-    assert "link stale for 60 s" in caplog.text
+    assert "link lost, 60 s since the last frame" in caplog.text
     assert "0x00000080" in caplog.text and "x2" in caplog.text, "identical words must collapse into a run"
     assert "0x00008080" in caplog.text
 
@@ -721,4 +721,32 @@ def test_the_stale_dump_happens_once_per_outage(caplog):
         for _ in range(5):
             bms.refresh_data()
 
-    assert "link stale" not in caplog.text, "the dump must fire on the edge, not every cycle while down"
+    assert "link lost" not in caplog.text, "the dump must fire once, not every cycle while down"
+
+
+def test_the_ble_layer_reports_a_lost_link_to_the_driver():
+    # The fallback wrapper stops calling refresh_data() as soon as the handle
+    # reports the link down, so the driver cannot see a drop by itself. The
+    # BLE layer has to tell it, or the trace is never dumped on a real outage.
+    bms = make_bms()
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=0x00808080)))
+    assert len(bms._status_history) == 1
+
+    bms._on_link_lost()
+
+    assert not bms._status_history, "the trace is consumed, so a second trigger stays quiet"
+
+
+def test_a_dump_is_not_repeated_by_the_second_trigger(caplog):
+    bms = make_bms()
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload()))
+    bms._on_link_lost()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        bms._on_link_lost()
+        bms._last_frame_time = time.time() - 60
+        bms._link_was_fresh = True
+        bms.refresh_data()
+
+    assert "link lost" not in caplog.text
