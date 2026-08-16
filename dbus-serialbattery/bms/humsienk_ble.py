@@ -421,6 +421,10 @@ class HumsiENK_Ble(Battery):
             self._parse_config(data)
         elif command == self.CMD_VERSION:
             self._parse_version(data)
+        elif command == self.CMD_HANDSHAKE:
+            # The BMS acknowledges the handshake with an empty frame. Nothing
+            # to parse, but it is solicited, so it is not a discovery.
+            logger.debug("HumsiENK: handshake acknowledged")
         else:
             self._log_unsolicited(command, data)
 

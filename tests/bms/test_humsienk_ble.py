@@ -675,3 +675,15 @@ def test_an_unsolicited_frame_is_rate_limited_per_command(caplog):
     assert "unsolicited 0x55" not in caplog.text  # already reported 3 times
     assert "unsolicited 0x56 frame #1" in caplog.text  # a different code still reports
     assert bms._unsolicited_seen[0x55][0] == 23
+
+
+def test_the_handshake_acknowledgement_is_not_treated_as_a_discovery(caplog):
+    # The BMS answers the handshake with an empty 0x00 frame. It is solicited,
+    # so reporting it as unprompted would be wrong and would repeat forever.
+    bms = make_bms()
+
+    with caplog.at_level(logging.INFO):
+        bms._parse_and_update(frame(HumsiENK_Ble.CMD_HANDSHAKE, b""))
+
+    assert "unsolicited" not in caplog.text
+    assert HumsiENK_Ble.CMD_HANDSHAKE not in bms._unsolicited_seen
