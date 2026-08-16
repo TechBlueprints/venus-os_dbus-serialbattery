@@ -141,6 +141,8 @@ class FallbackBattery:
             "_last_fresh_time",
             "_fallback_mode",
             "_fallback_since",
+            "_soc_anchor",
+            "_shunt_soc_anchor",
             "_cell_snapshot",
             "_cell_snapshot_time",
             "_cell_snapshot_restored",
@@ -234,6 +236,8 @@ class FallbackBattery:
 
         self._fallback_mode: bool = False
         self._fallback_since: float = None
+        self._soc_anchor: float = None
+        self._shunt_soc_anchor: float = None
         self._cell_snapshot: list = None
         self._cell_snapshot_time: float = None
         self._cell_snapshot_restored: bool = False
@@ -585,6 +589,8 @@ class FallbackBattery:
                             self.battery.cells[index].voltage = None if self._cell_snapshot_restored else voltage
             self._fallback_mode = False
             self._fallback_since = None
+            self._soc_anchor = None
+            self._shunt_soc_anchor = None
             self._cell_snapshot = None
             self._cell_snapshot_time = None
             self._cell_snapshot_restored = False
@@ -600,11 +606,45 @@ class FallbackBattery:
             self._fallback_since = time()
             self._charge_blocked = False
             self._discharge_blocked = False
+            self._take_soc_anchor()
             self._take_cell_snapshot()
             logger.warning(
                 "    Entering fallback mode: voltage/current/temperature/SoC live from the fallback sensor, "
                 "cell voltages projected from the last live reading"
             )
+
+    def _take_soc_anchor(self) -> None:
+        """
+        Record the pair of readings the served SoC will be built from.
+
+        The BMS and the fallback sensor rarely agree on absolute SoC: they
+        are two independent estimates of the same pack, and a couple of
+        points apart is normal. Publishing the sensor's absolute value on
+        engagement therefore steps the SoC, and publishing the BMS value
+        again on recovery steps it back. On a system that loses its BMS link
+        a few times an hour that is a sawtooth on every consumer that reads
+        it, including the ESS minimum-SoC comparison.
+
+        Anchoring fixes that without inventing a number: hold the BMS's last
+        reading, and move it by how far the sensor's own reading travels
+        during the outage. The travel is the sensor's coulomb count, which is
+        a measurement; only its absolute value is an estimate, and that is
+        the part being discarded.
+
+        Both readings are needed for the pair to mean anything. Without them
+        the served SoC falls back to the sensor's absolute value, which is
+        what a process that has never reached the BMS has to do anyway.
+
+        :return: None
+        """
+        bms_soc = self.battery.soc
+        shunt_soc = self._shunt.get("Soc")
+        if bms_soc is None or shunt_soc is None:
+            self._soc_anchor = None
+            self._shunt_soc_anchor = None
+            return
+        self._soc_anchor = bms_soc
+        self._shunt_soc_anchor = shunt_soc
 
     def _take_cell_snapshot(self) -> None:
         """
@@ -1046,7 +1086,17 @@ class FallbackBattery:
         if not self._serving or self._external_active("Soc"):
             return soc
         shunt = self._shunt.get("Soc")
-        return round(shunt, 3) if shunt is not None else soc
+        if shunt is None:
+            return soc
+        if self._soc_anchor is None or self._shunt_soc_anchor is None:
+            # No anchor pair, so the sensor's absolute value is all there is
+            return round(shunt, 3)
+        # Anchored: the BMS reading at engagement, moved by how far the
+        # sensor has travelled since. Clamped, because the sum of two
+        # readings from different instruments can leave the range even when
+        # each is in it.
+        anchored = self._soc_anchor + (shunt - self._shunt_soc_anchor)
+        return round(min(100.0, max(0.0, anchored)), 3)
 
     def get_temperature(self) -> Union[float, None]:
         """
