@@ -11,6 +11,7 @@ import configparser
 import importlib.util
 import os
 import sys
+import time
 import types
 
 DRIVER_DIR = os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery")
@@ -62,9 +63,50 @@ def test_backend_lookup_falls_back_to_bleak_for_unknown_name():
 
 
 def test_every_supported_backend_is_selectable_by_its_class_name():
-    """The registry is keyed by class name, so every entry must resolve to itself."""
+    """The registry is keyed by class name, so every entry must resolve to itself.
+
+    A backend whose optional dependencies are missing on this machine degrades
+    to BleakBackend rather than raising - see the fallback test below. That is
+    the case for BCMBackend here, which needs a real bleak and BlueZ.
+    """
     for cls in utils_ble.supported_ble_backends:
-        assert type(utils_ble.get_ble_backend(cls.__name__)) is cls
+        resolved = utils_ble.get_ble_backend(cls.__name__)
+        assert type(resolved) is cls or type(resolved) is utils_ble.BleakBackend
+
+
+def test_bcm_backend_is_registered_and_reachable_by_name():
+    """BCMBackend must be selectable by config, whether or not it loads here."""
+    assert utils_ble.BCMBackend in utils_ble.supported_ble_backends
+    assert issubclass(utils_ble.BCMBackend, utils_ble.BleConnectionBackend)
+
+
+def test_an_unloadable_backend_degrades_to_bleak_instead_of_killing_the_driver():
+    """A backend whose dependency is missing must not take the driver down.
+
+    BCMBackend raises ImportError when bleak_connection_manager is not
+    importable; the selector has to survive that, because it runs inside
+    Syncron_Ble.__init__ on a GX device where a raised ImportError means no
+    dbus service at all.
+    """
+
+    class UnloadableBackend(utils_ble.BleConnectionBackend):
+        def __init__(self):
+            raise ImportError("dependency missing")
+
+    utils_ble.supported_ble_backends.append(UnloadableBackend)
+    try:
+        assert type(utils_ble.get_ble_backend("UnloadableBackend")) is utils_ble.BleakBackend
+    finally:
+        utils_ble.supported_ble_backends.remove(UnloadableBackend)
+
+
+def test_bcm_backend_constructs_when_its_dependency_is_importable():
+    """Where bleak_connection_manager does import, selection must return it."""
+    if not utils_ble._HAS_BCM:
+        import pytest
+
+        pytest.skip("bleak_connection_manager not importable in this environment")
+    assert type(utils_ble.get_ble_backend("BCMBackend")) is utils_ble.BCMBackend
 
 
 def test_config_default_backend_name_resolves_without_falling_back():
@@ -146,6 +188,180 @@ def test_hold_flag_path_normalizes_the_mac_address():
 
 def test_hold_flag_paths_differ_per_device():
     assert utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00") != utils_ble.ble_hold_flag_path("C8:47:8C:00:00:11")
+
+
+def _bcm():
+    """A BCMBackend with its dependency check bypassed.
+
+    Only the pure adapter-selection logic is exercised through it; nothing
+    here touches bleak_connection_manager or a radio.
+    """
+    return object.__new__(utils_ble.BCMBackend)
+
+
+def test_bcm_adapter_selection_honors_a_pin_and_ignores_the_pool():
+    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": "hci1"}
+    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci0", "hci2"]
+    try:
+        # a pinned battery may use exactly one adapter, never the pool
+        assert _bcm()._adapters("C8:47:8C:00:00:00") == ["hci1"]
+    finally:
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+
+
+def test_bcm_adapter_selection_spreads_unpinned_devices_across_the_pool():
+    """Preference order is rotated per device, but stays a permutation of the pool."""
+    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {}
+    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci0", "hci1", "hci2"]
+    try:
+        backend = _bcm()
+        orders = {addr: backend._adapters(addr) for addr in ("C8:47:8C:00:00:00", "C8:47:8C:00:00:01", "C8:47:8C:00:00:02")}
+        for order in orders.values():
+            # every allowed adapter is still tried, only the preference moves
+            assert sorted(order) == ["hci0", "hci1", "hci2"]
+        # the rotation is by address, so different devices lead with different adapters
+        assert len({tuple(order) for order in orders.values()}) == 3
+        # and it is stable: the same address always yields the same order
+        assert backend._adapters("C8:47:8C:00:00:00") == orders["C8:47:8C:00:00:00"]
+    finally:
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+
+
+def test_bluez_device_path_is_built_the_way_bluez_names_objects():
+    assert utils_ble._bluez_device_path("hci1", "c8:47:8c:00:00:00") == "/org/bluez/hci1/dev_C8_47_8C_00_00_00"
+
+
+def test_adapter_of_recovers_the_adapter_a_resolved_device_lives_under():
+    """The allow-list check depends on this, so a wrong answer connects via a banned adapter."""
+
+    class FakeDevice:
+        details = {"path": "/org/bluez/hci2/dev_C8_47_8C_00_00_00"}
+
+    assert utils_ble._adapter_of(FakeDevice()) == "hci2"
+
+
+def test_adapter_of_returns_none_when_the_path_is_not_a_bluez_device_path():
+    class NoPath:
+        details = {}
+
+    assert utils_ble._adapter_of(NoPath()) is None
+    assert utils_ble._adapter_of(object()) is None
+
+
+def test_breaker_only_trips_after_consecutive_half_connects():
+    backend = _bcm()
+    backend._handoff_fails = 0
+    for _ in range(utils_ble.BLE_HANDOFF_BREAKER_THRESHOLD - 1):
+        assert not backend._breaker_tripped()
+        backend._handoff_fails += 1
+    assert not backend._breaker_tripped()
+    backend._handoff_fails += 1
+    assert backend._breaker_tripped()
+
+
+def test_a_successful_handoff_clears_the_breaker_count():
+    """The count is of *consecutive* failures - one good session resets it."""
+    backend = _bcm()
+    backend._handoff_fails = utils_ble.BLE_HANDOFF_BREAKER_THRESHOLD + 2
+    assert backend._breaker_tripped()
+    backend._handoff_fails = 0
+    assert not backend._breaker_tripped()
+
+
+def _hold_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(utils_ble, "BLE_HOLD_FLAG_DIR", str(tmp_path / "tmp"))
+    return utils_ble
+
+
+def test_auto_hold_is_written_only_once_the_engagement_threshold_is_reached(tmp_path, monkeypatch):
+    _hold_dir(tmp_path, monkeypatch)
+    backend = _bcm()
+    backend._breaker_times = []
+    address = "C8:47:8C:00:00:00"
+    flag = utils_ble.ble_hold_flag_path(address)
+
+    for engagement in range(1, utils_ble.BLE_AUTO_HOLD_THRESHOLD):
+        assert backend._engage_breaker(address, now=1000.0 + engagement) is False
+        assert not os.path.exists(flag), f"held after only {engagement} engagements"
+
+    assert backend._engage_breaker(address, now=1000.0 + utils_ble.BLE_AUTO_HOLD_THRESHOLD) is True
+    assert os.path.exists(flag)
+
+
+def test_engagements_older_than_the_window_do_not_count_towards_a_storm(tmp_path, monkeypatch):
+    """A slow trickle of engagements is not the failure this is meant to catch."""
+    _hold_dir(tmp_path, monkeypatch)
+    backend = _bcm()
+    backend._breaker_times = []
+    address = "C8:47:8C:00:00:00"
+    spacing = utils_ble.BLE_AUTO_HOLD_WINDOW  # each engagement ages the previous one out
+    for engagement in range(utils_ble.BLE_AUTO_HOLD_THRESHOLD * 2):
+        assert backend._engage_breaker(address, now=1000.0 + engagement * spacing) is False
+    assert not os.path.exists(utils_ble.ble_hold_flag_path(address))
+
+
+def test_a_written_hold_starts_a_fresh_window(tmp_path, monkeypatch):
+    """Once held, earlier engagements must not immediately re-trigger a hold."""
+    _hold_dir(tmp_path, monkeypatch)
+    backend = _bcm()
+    backend._breaker_times = []
+    address = "C8:47:8C:00:00:00"
+    for engagement in range(1, utils_ble.BLE_AUTO_HOLD_THRESHOLD + 1):
+        held = backend._engage_breaker(address, now=1000.0 + engagement)
+    assert held is True
+    assert backend._breaker_times == []
+    assert backend._engage_breaker(address, now=1000.0 + utils_ble.BLE_AUTO_HOLD_THRESHOLD + 1) is False
+
+
+def test_auto_hold_writes_a_self_expiring_flag_the_reconnect_loop_recognizes(tmp_path, monkeypatch):
+    _hold_dir(tmp_path, monkeypatch)
+    address = "C8:47:8C:00:00:00"
+    assert utils_ble.write_ble_auto_hold(address) is True
+
+    flag = utils_ble.ble_hold_flag_path(address)
+    assert os.path.dirname(flag) == utils_ble.BLE_HOLD_FLAG_DIR
+    with open(flag) as f:
+        assert f.read().strip() == utils_ble.BLE_HOLD_AUTO_MARKER
+
+    # a hold that has just been written must hold, not expire immediately
+    assert utils_ble.ble_hold_expired(flag) is False
+    # and it must release itself once it has aged past the expiry
+    assert utils_ble.ble_hold_expired(flag, now=time.time() + utils_ble.BLE_HOLD_AUTO_EXPIRY + 1) is True
+
+
+def test_an_operator_hold_never_expires_by_itself(tmp_path, monkeypatch):
+    """Only automatic holds self-release; a hand-written one persists until removed."""
+    _hold_dir(tmp_path, monkeypatch)
+    address = "C8:47:8C:00:00:00"
+    flag = utils_ble.ble_hold_flag_path(address)
+    os.makedirs(utils_ble.BLE_HOLD_FLAG_DIR, exist_ok=True)
+    with open(flag, "w") as f:
+        f.write("held by clint, radio is sick")
+
+    assert utils_ble.ble_hold_expired(flag) is False
+    assert utils_ble.ble_hold_expired(flag, now=time.time() + utils_ble.BLE_HOLD_AUTO_EXPIRY * 100) is False
+
+
+def test_an_empty_hold_flag_is_treated_as_an_operator_hold(tmp_path, monkeypatch):
+    _hold_dir(tmp_path, monkeypatch)
+    flag = utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00")
+    os.makedirs(utils_ble.BLE_HOLD_FLAG_DIR, exist_ok=True)
+    open(flag, "w").close()
+    assert utils_ble.ble_hold_expired(flag, now=time.time() + utils_ble.BLE_HOLD_AUTO_EXPIRY * 100) is False
+
+
+def test_an_unwritable_hold_directory_is_reported_rather_than_raised(tmp_path, monkeypatch):
+    """The auto-hold is a best effort; failing to write it must not kill the attempt."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    monkeypatch.setattr(utils_ble, "BLE_HOLD_FLAG_DIR", str(blocker / "tmp"))
+    assert utils_ble.write_ble_auto_hold("C8:47:8C:00:00:00") is False
 
 
 def test_backends_implement_the_connection_interface():
