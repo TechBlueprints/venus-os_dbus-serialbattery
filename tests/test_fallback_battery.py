@@ -931,7 +931,13 @@ class TestStash:
         assert restarted.battery.cell_count == 8
         assert len(restarted.battery.cells) == 8
         assert restarted.battery.capacity == 280.0
-        assert restarted.battery.max_battery_voltage == 29.2
+        # The stash carries the voltage, for installations where it came from
+        # the BMS, but with USE_BMS_DVCC_VALUES off it is config times the cell
+        # count, and battery.py derives it from the config as it reads today.
+        # See test_an_edited_limit_reaches_a_registration_made_without_bms_contact.
+        with open(restarted._stash_path) as stash_file:
+            assert json.load(stash_file)["max_battery_voltage"] == 29.2
+        assert restarted.battery.max_battery_voltage is None
 
     def test_restored_cells_are_unread(self, monkeypatch, tmp_path):
         # The stash carries cell voltages as a projection *basis*; no served
@@ -1020,6 +1026,70 @@ class TestPersistedProjectionBasis:
         assert wrapper.battery.cells[0].voltage == 3.0
         with open(wrapper._stash_path) as stash_file:
             assert json.load(stash_file)["cells"] == [3.25] * 8
+
+    def _seed_stash(self, tmp_path, **overrides):
+        """Write a stash as an earlier process would have left it on disk."""
+        stash = {
+            "timestamp": _now(),
+            "cell_count": 8,
+            "capacity": 280.0,
+            "max_battery_voltage": 27.6,  # an earlier MAX_CELL_VOLTAGE of 3.45
+            "min_battery_voltage": 23.2,
+            "max_battery_charge_current": 111.0,
+            "max_battery_discharge_current": 222.0,
+        }
+        stash.update(overrides)
+        # _FakeBattery's port "ble_test" does not spell out its address "AA:BB"
+        path = tmp_path / "fallback_state_ble_test_AA_BB.json"
+        path.write_text(json.dumps(stash))
+        return path
+
+    def test_an_edited_limit_reaches_a_registration_made_without_bms_contact(self, monkeypatch, tmp_path):
+        # The four DVCC values are config, or config times the cell count.
+        # Restoring them pinned whatever the config said when the stash was
+        # written: a stash holding 27.6 V survived a config raised to 3.60 per
+        # cell, because battery.py derives the voltage only while it is still
+        # None. Observed live as a CVL stuck at 13.8 on a 4S pack configured
+        # for 14.4, across reconnects, until the stash was deleted.
+        monkeypatch.setattr(utils, "USE_BMS_DVCC_VALUES", False)
+        monkeypatch.setattr(utils, "MAX_CELL_VOLTAGE", 3.60)
+        monkeypatch.setattr(utils, "MAX_BATTERY_CHARGE_CURRENT", 250.0)
+        monkeypatch.setattr(utils, "MAX_BATTERY_DISCHARGE_CURRENT", 250.0)
+        self._seed_stash(tmp_path)
+
+        wrapper = self._restart(monkeypatch, tmp_path)
+
+        # left for battery.py to derive from the cell count and today's config
+        assert wrapper.battery.max_battery_voltage is None
+        assert wrapper.battery.min_battery_voltage is None
+        assert wrapper.battery.max_battery_charge_current == 250.0
+        assert wrapper.battery.max_battery_discharge_current == 250.0
+        # capacity has no config equivalent, so it is still restored
+        assert wrapper.battery.capacity == 280.0
+        assert wrapper.battery.cell_count == 8
+
+        # and the derivation now produces the edited number, not the stashed one
+        for cell in wrapper.battery.cells:
+            cell.voltage = 3.25
+        wrapper.battery.soc_calc = 55.0  # the bulk/float logic reads it
+        wrapper.manage_charge_voltage()
+        assert wrapper.battery.max_battery_voltage == pytest.approx(28.8)
+
+    def test_bms_sourced_limits_are_still_restored(self, monkeypatch, tmp_path):
+        # With USE_BMS_DVCC_VALUES on the four values came from the BMS and no
+        # config can reproduce them, so a registration without BMS contact has
+        # nothing else to publish. Dropping the restore outright would leave
+        # those installations with no limits at all.
+        monkeypatch.setattr(utils, "USE_BMS_DVCC_VALUES", True)
+        monkeypatch.setattr(utils, "MAX_CELL_VOLTAGE", 3.60)
+        self._seed_stash(tmp_path)
+
+        wrapper = self._restart(monkeypatch, tmp_path)
+
+        assert wrapper.battery.max_battery_voltage == 27.6
+        assert wrapper.battery.min_battery_voltage == 23.2
+        assert wrapper.battery.max_battery_charge_current == 111.0
+        assert wrapper.battery.max_battery_discharge_current == 222.0
 
     def test_a_restart_restores_the_basis_and_leaves_the_cells_unread(self, monkeypatch, tmp_path):
         wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=True)

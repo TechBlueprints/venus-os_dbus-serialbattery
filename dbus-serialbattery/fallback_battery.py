@@ -878,9 +878,22 @@ class FallbackBattery:
         logger.info(f"Fallback stash loaded ({age:.0f}s old): registration without BMS contact is possible")
 
         try:
-            for name in ("capacity", "max_battery_voltage", "min_battery_voltage", "max_battery_charge_current", "max_battery_discharge_current"):
-                if self._stash.get(name) is not None:
-                    setattr(self.battery, name, self._stash[name])
+            # Capacity is a BMS reading with no config equivalent, so it is
+            # restored whatever the source.
+            if self._stash.get("capacity") is not None:
+                self.battery.capacity = self._stash["capacity"]
+
+            # The four DVCC values are restored only when they came from the
+            # BMS. With USE_BMS_DVCC_VALUES off they are config values, or
+            # config multiplied by the cell count, and the base class already
+            # applies them from the config as it reads today. Restoring them
+            # would pin whatever the config said when the stash was last
+            # written, so an edited limit would never reach a registration
+            # made without BMS contact.
+            if utils.USE_BMS_DVCC_VALUES:
+                for name in ("max_battery_voltage", "min_battery_voltage", "max_battery_charge_current", "max_battery_discharge_current"):
+                    if self._stash.get(name) is not None:
+                        setattr(self.battery, name, self._stash[name])
             if self._stash.get("hardware_version"):
                 self.battery.hardware_version = self._stash["hardware_version"]
             cell_count = self._stash.get("cell_count") or 0
