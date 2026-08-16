@@ -619,33 +619,6 @@ def test_the_driver_carries_no_fallback_machinery():
     assert "fallback" not in inspect.getsource(humsienk_ble).lower()
 
 
-def test_bms_uptime_going_backwards_is_reported_as_a_restart(caplog):
-    # The BMS reports its uptime in every status frame. Both packs drop their
-    # BLE link in the same second, and a restarting BMS is indistinguishable
-    # from a link fault by the disconnect reason alone, so a counter that goes
-    # backwards is the only evidence that separates them.
-    bms = make_bms()
-    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(days=3, hours=4, minutes=5)))
-    assert bms._bms_uptime_minutes == 3 * 1440 + 4 * 60 + 5
-
-    with caplog.at_level(logging.WARNING):
-        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(days=0, hours=0, minutes=1)))
-
-    assert bms._bms_uptime_minutes == 1
-    assert "the BMS restarted" in caplog.text
-
-
-def test_bms_uptime_moving_forward_is_not_reported(caplog):
-    bms = make_bms()
-    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(days=3, hours=4, minutes=5)))
-
-    with caplog.at_level(logging.WARNING):
-        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(days=3, hours=4, minutes=6)))
-
-    assert bms._bms_uptime_minutes == 3 * 1440 + 4 * 60 + 6
-    assert "restarted" not in caplog.text
-
-
 def test_frames_the_driver_never_requested_are_reported(caplog):
     # The vendor app has handlers for 0x12, 0x23, 0x55, 0x56 and 0xF3 and sends
     # none of them, so if they arrive they arrive unprompted. They were being
@@ -687,3 +660,65 @@ def test_the_handshake_acknowledgement_is_not_treated_as_a_discovery(caplog):
 
     assert "unsolicited" not in caplog.text
     assert HumsiENK_Ble.CMD_HANDSHAKE not in bms._unsolicited_seen
+
+
+def test_movement_in_the_unmapped_status_bits_is_reported(caplog):
+    # Nine bits are never displayed by the vendor app and never read by us.
+    # The only way they ever become known is by noticing them move.
+    bms = make_bms()
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 7))))
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 7) | (1 << 11))))
+
+    assert "unmapped status bits moved [11]" in caplog.text
+    assert "now set [11]" in caplog.text
+
+
+def test_movement_in_mapped_bits_is_not_reported_as_unmapped(caplog):
+    # Bit 4 is pack overvoltage and is already published as an alarm; it must
+    # not also be announced as an unexplained bit.
+    bms = make_bms()
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=0)))
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 4))))
+
+    assert "unmapped status bits" not in caplog.text
+
+
+def test_the_last_status_words_are_dumped_when_the_link_goes_stale(caplog):
+    bms = make_bms()
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=0x00000080)))
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=0x00000080)))
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=0x00008080)))
+    bms.ble_handle.connected = False
+    bms._last_frame_time = time.time()          # fresh, so the next cycle is the edge
+    assert bms.refresh_data() is True
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        bms._last_frame_time = time.time() - 60  # link has gone quiet
+        assert bms.refresh_data() is False
+
+    assert "link stale for 60 s" in caplog.text
+    assert "0x00000080" in caplog.text and "x2" in caplog.text, "identical words must collapse into a run"
+    assert "0x00008080" in caplog.text
+
+
+def test_the_stale_dump_happens_once_per_outage(caplog):
+    bms = make_bms()
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload()))
+    bms._last_frame_time = time.time()
+    bms.refresh_data()
+    bms._last_frame_time = time.time() - 60
+    bms.refresh_data()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        for _ in range(5):
+            bms.refresh_data()
+
+    assert "link stale" not in caplog.text, "the dump must fire on the edge, not every cycle while down"

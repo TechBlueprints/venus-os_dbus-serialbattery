@@ -173,9 +173,10 @@ class HumsiENK_Ble(Battery):
         self._last_poll_time = 0.0
         self._last_handshake_time = 0.0
         self._deadline = None  # caps a run of requests, see _request()
-        self._bms_uptime_minutes = None  # DIAGNOSTIC, see _parse_status
-        self._bms_uptime_logged = None
         self._unsolicited_seen = {}  # DIAGNOSTIC, see _log_unsolicited
+        self._status_history = deque(maxlen=20)  # DIAGNOSTIC, see _record_status
+        self._status_unbound = None
+        self._link_was_fresh = False
 
         logger.info("Init of HumsiENK_Ble at " + address)
 
@@ -281,7 +282,14 @@ class HumsiENK_Ble(Battery):
 
         # Report only what the radio delivered: values are published as current
         # or not at all, never republished as if they were fresh.
-        return (time.time() - self._last_frame_time) <= self.DATA_FRESHNESS_SECONDS
+        stale_seconds = time.time() - self._last_frame_time
+        fresh = stale_seconds <= self.DATA_FRESHNESS_SECONDS
+        # DIAGNOSTIC: dump the link's last moments on the edge into staleness,
+        # once per outage rather than on every cycle while it stays down.
+        if self._link_was_fresh and not fresh:
+            self._dump_status_history(stale_seconds)
+        self._link_was_fresh = fresh
+        return fresh
 
     def _build_command(self, command: int, data: list = None) -> bytes:
         """
@@ -427,6 +435,64 @@ class HumsiENK_Ble(Battery):
             logger.debug("HumsiENK: handshake acknowledged")
         else:
             self._log_unsolicited(command, data)
+
+    # DIAGNOSTIC. Status bits the vendor app never displays and we never map.
+    # The charge and discharge halves are near mirrors, which suggests 13/14
+    # are the charge-side MOSFET temperature pair and that 3/19 and 11/27 are
+    # protection-and-warning pairs, but that is inference from layout, not
+    # evidence. Nothing reads these; they are only reported when they move.
+    UNBOUND_STATUS_BITS = (3, 5, 6, 11, 13, 14, 19, 27, 31)
+
+    def _record_status(self, status: int) -> None:
+        """
+        DIAGNOSTIC, merge branch only, do not port to the driver PR.
+
+        Keep the recent status words so the link's last moments can be dumped
+        when it drops, and report any movement in the bits nothing reads.
+
+        Both packs lose their link several times an hour and about a fifth of
+        those drops land on both within the same second. Every explanation so
+        far rests on what the link did, because the disconnect reason is a
+        supervision timeout and the BMS says nothing. What we have never been
+        able to see is whether the BMS itself signalled anything in the
+        seconds beforehand. If a bit moves before a drop the cause is inside
+        the pack; if the word is unchanged to the last frame, it is not.
+
+        :param status: the 32 bit operation status word
+        :return: None
+        """
+        self._status_history.append((time.time(), status))
+
+        unbound = sum(1 << bit for bit in self.UNBOUND_STATUS_BITS if status & (1 << bit))
+        if self._status_unbound is not None and unbound != self._status_unbound:
+            moved = [bit for bit in self.UNBOUND_STATUS_BITS if (unbound ^ self._status_unbound) & (1 << bit)]
+            now_set = [bit for bit in moved if unbound & (1 << bit)]
+            logger.warning(f"HumsiENK: unmapped status bits moved {moved}, now set {now_set}, full word 0x{status:08X}")
+        self._status_unbound = unbound
+
+    def _dump_status_history(self, stale_seconds: float) -> None:
+        """
+        DIAGNOSTIC, merge branch only, do not port to the driver PR.
+
+        Print the recorded status words when the link goes stale, newest last,
+        with runs of an identical word collapsed. A trace that ends in a single
+        long run means the BMS was still reporting the same thing right up to
+        the moment it went quiet.
+
+        :param stale_seconds: how long the data has been stale
+        :return: None
+        """
+        if not self._status_history:
+            return
+        last = self._status_history[-1][0]
+        runs = []
+        for stamp, status in self._status_history:
+            if runs and runs[-1][0] == status:
+                runs[-1][2] += 1
+            else:
+                runs.append([status, stamp, 1])
+        trace = " -> ".join(f"0x{status:08X}@-{last - stamp:.0f}s" + (f" x{count}" if count > 1 else "") for status, stamp, count in runs)
+        logger.warning(f"HumsiENK: link stale for {stale_seconds:.0f} s, last {len(self._status_history)} status words: {trace}")
 
     def _log_unsolicited(self, command: int, data: bytes) -> None:
         """
@@ -592,25 +658,7 @@ class HumsiENK_Ble(Battery):
                 return 1
             return 0
 
-        # DIAGNOSTIC, merge branch only, do not port to the driver PR.
-        # The BMS reports its own uptime in every status frame and we have
-        # always discarded it. Both packs drop their BLE link in the same
-        # second, and the evidence for that being a link fault rather than a
-        # BMS restart is that the disconnect reason is a supervision timeout
-        # and both resume advertising about a second later. A restarting BMS
-        # would look exactly the same. This counter going backwards is what
-        # tells the two apart, and nothing else we read can.
-        uptime_minutes = int.from_bytes(data[0:2], "little") * 1440 + data[2] * 60 + data[3]
-        if self._bms_uptime_minutes is not None and uptime_minutes < self._bms_uptime_minutes:
-            logger.warning(f"HumsiENK: BMS uptime went backwards, {self._bms_uptime_minutes} -> {uptime_minutes} minutes: the BMS restarted")
-            self._bms_uptime_logged = None
-        # Also report it periodically, because a counter stuck at zero and one
-        # counting up are the same silence otherwise, and which of those it is
-        # decides whether the reading means anything at all.
-        if self._bms_uptime_logged is None or uptime_minutes - self._bms_uptime_logged >= 15:
-            logger.info(f"HumsiENK: BMS uptime {uptime_minutes} minutes")
-            self._bms_uptime_logged = uptime_minutes
-        self._bms_uptime_minutes = uptime_minutes
+        self._record_status(status)
 
         self.charge_fet = bool(status & (1 << 7))
         self.discharge_fet = bool(status & (1 << 23))
