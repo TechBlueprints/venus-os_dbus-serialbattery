@@ -1031,11 +1031,41 @@ class FallbackBattery:
 
         :return: None
         """
-        if self.battery.get_max_cell_voltage() is None or self.battery.get_min_cell_voltage() is None:
-            if self.battery.control_voltage is None and self.battery.max_battery_voltage is not None:
-                self.battery.control_voltage = round(self.battery.max_battery_voltage, 2)
+        if self._cells_unread():
+            if self.battery.control_voltage is None:
+                ceiling = self.battery.max_battery_voltage
+                if ceiling is None and self.battery.cell_count:
+                    ceiling = utils.MAX_CELL_VOLTAGE * self.battery.cell_count
+                if ceiling is not None:
+                    self.battery.control_voltage = round(ceiling, 2)
             return
         self.battery.manage_charge_voltage()
+
+    def manage_charge_and_discharge_current(self) -> None:
+        """
+        Skip the cell-based current limiting when there are no cell voltages.
+
+        The cell-voltage and temperature limiters raise on unread cells too.
+        They land on the configured current, which is the right answer, but
+        each one raises error code 8 on the way there - so the same startup
+        window that produced a bad CVL also produced repeated GUI errors from
+        three more paths. Publish the configured limits directly instead.
+
+        :return: None
+        """
+        if self._cells_unread():
+            charge_limit = self.battery.max_battery_charge_current
+            discharge_limit = self.battery.max_battery_discharge_current
+            self.battery.control_charge_current = charge_limit if charge_limit is not None else utils.MAX_BATTERY_CHARGE_CURRENT
+            self.battery.control_discharge_current = discharge_limit if discharge_limit is not None else utils.MAX_BATTERY_DISCHARGE_CURRENT
+            return
+        self.battery.manage_charge_and_discharge_current()
+
+    def _cells_unread(self) -> bool:
+        """
+        :return: whether the pack's cell voltages have never been read
+        """
+        return self.battery.get_max_cell_voltage() is None or self.battery.get_min_cell_voltage() is None
 
     @property
     def control_charge_current(self):

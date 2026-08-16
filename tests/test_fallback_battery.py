@@ -886,6 +886,49 @@ class TestTestConnection:
         assert wrapper.battery.charge_mode != "Error, please check the logs!"
         assert wrapper.battery.error_code is None
 
+    def test_unread_cells_without_a_stashed_ceiling_use_the_configured_cell_maximum(self, monkeypatch, tmp_path):
+        # A stash written before the BMS ever reported its pack limits leaves
+        # max_battery_voltage None, and publishing no CVL at all is the case
+        # velib turns into an *invalid* limit downstream.
+        monkeypatch.setattr(utils, "MAX_CELL_VOLTAGE", 3.45)
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=False)
+        for cell in wrapper.battery.cells:
+            cell.voltage = None
+        wrapper.battery.control_voltage = None
+        wrapper.battery.max_battery_voltage = None
+        wrapper.battery.cell_count = 8
+
+        wrapper.manage_charge_voltage()
+
+        assert wrapper.battery.control_voltage == pytest.approx(27.6)
+
+    def test_unread_cells_publish_configured_currents_without_errors(self, monkeypatch, tmp_path):
+        # The cell-voltage and temperature limiters raise on unread cells and
+        # each raises error code 8 while falling back to configured currents,
+        # so the limiter must not be entered at all. Not running it is what
+        # the untouched charge/discharge_limitation strings witness.
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=False)
+        for cell in wrapper.battery.cells:
+            cell.voltage = None
+        wrapper.battery.max_battery_charge_current = 50.0
+        wrapper.battery.max_battery_discharge_current = 60.0
+        wrapper.battery.error_code = None
+
+        wrapper.manage_charge_and_discharge_current()
+
+        assert wrapper.battery.control_charge_current == 50.0
+        assert wrapper.battery.control_discharge_current == 60.0
+        assert wrapper.battery.error_code is None
+        assert wrapper.battery.charge_limitation is None
+        assert wrapper.battery.discharge_limitation is None
+
+    def test_real_cells_still_run_the_current_limiter(self, monkeypatch, tmp_path):
+        wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT)
+        ran = []
+        wrapper.battery.manage_charge_and_discharge_current = lambda: ran.append(True)
+        wrapper.manage_charge_and_discharge_current()
+        assert ran == [True]
+
     def test_real_cells_still_run_the_state_machine(self, monkeypatch, tmp_path):
         wrapper = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT)
         ran = []
