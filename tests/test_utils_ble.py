@@ -549,3 +549,53 @@ def test_the_retry_connector_establish_is_aliased_against_shadowing():
     backend calling the right one, and no other test reaches the connect path.
     """
     assert utils_ble.retry_establish_connection is sys.modules["bleak_retry_connector"].establish_connection
+
+
+# ── post-connect validation ──────────────────────────────────────────────
+#
+# The manager calls this after connecting and re-reads GATT services when it
+# answers False, so what it reports decides whether a half-resolved client is
+# used or torn down. The manager's own retry ladder needs a real radio and is
+# not exercised here.
+
+
+class _FakeServices:
+    def __init__(self, characteristics):
+        self._characteristics = characteristics
+
+    def get_characteristic(self, uuid):
+        return self._characteristics.get(uuid)
+
+
+class _FakeClient:
+    def __init__(self, services):
+        self.services = services
+
+
+NOTIFY_UUID = "00000003-0000-1000-8000-00805f9b34fb"
+
+
+def test_a_resolved_notify_characteristic_validates():
+    client = _FakeClient(_FakeServices({NOTIFY_UUID: object()}))
+
+    assert utils_ble.notify_characteristic_present(client, NOTIFY_UUID) is True
+
+
+def test_an_unresolved_notify_characteristic_does_not_validate():
+    # GATT discovery finished for other characteristics but not this one
+    client = _FakeClient(_FakeServices({"0000ffff-0000-1000-8000-00805f9b34fb": object()}))
+
+    assert utils_ble.notify_characteristic_present(client, NOTIFY_UUID) is False
+
+
+def test_services_not_populated_at_all_does_not_validate():
+    # connect() returned before any service discovery completed
+    assert utils_ble.notify_characteristic_present(_FakeClient(None), NOTIFY_UUID) is False
+
+
+def test_a_client_that_raises_on_lookup_does_not_validate():
+    class _Raising:
+        def get_characteristic(self, uuid):
+            raise RuntimeError("not connected")
+
+    assert utils_ble.notify_characteristic_present(_FakeClient(_Raising()), NOTIFY_UUID) is False
