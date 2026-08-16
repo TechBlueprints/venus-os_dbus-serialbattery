@@ -1158,17 +1158,45 @@ class FallbackBattery:
             return False
         return self.zone_configured() and self._discharge_blocked
 
+    def _fet_never_read(self, fet) -> bool:
+        """
+        Whether a FET state is unknown rather than known to be open.
+
+        The base class reads an unset FET as "not allowed", which is right for
+        a battery that is talking and wrong for one that has never been
+        reached: a service registered from the stash would report both
+        directions blocked while publishing full configured limits, and a
+        blocked flag does not stay local, it reaches DVCC through any
+        aggregator that takes a minimum over the bank.
+
+        Reports, not cutoffs: the BMS opens its own FETs whether or not this
+        driver can see them, so an unread FET is not a reason to assert a
+        block. A FET the BMS has actually reported as open is honoured.
+
+        :param fet: the FET state as last read, or None if never read
+        :return: whether the state is unknown
+        """
+        return self._serving and fet is None
+
     def get_allow_to_charge(self) -> bool:
         """
         :return: whether charging is allowed
         """
-        return False if self._charge_is_blocked() else self.battery.get_allow_to_charge()
+        if self._charge_is_blocked():
+            return False
+        if self._fet_never_read(self.battery.charge_fet):
+            return bool(self.battery.control_allow_charge)
+        return self.battery.get_allow_to_charge()
 
     def get_allow_to_discharge(self) -> bool:
         """
         :return: whether discharging is allowed
         """
-        return False if self._discharge_is_blocked() else self.battery.get_allow_to_discharge()
+        if self._discharge_is_blocked():
+            return False
+        if self._fet_never_read(self.battery.discharge_fet):
+            return bool(self.battery.control_allow_discharge)
+        return self.battery.get_allow_to_discharge()
 
     def manage_charge_voltage(self) -> None:
         """
