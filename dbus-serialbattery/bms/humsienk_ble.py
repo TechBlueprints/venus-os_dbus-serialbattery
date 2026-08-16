@@ -173,6 +173,7 @@ class HumsiENK_Ble(Battery):
         self._last_poll_time = 0.0
         self._last_handshake_time = 0.0
         self._deadline = None  # caps a run of requests, see _request()
+        self._bms_uptime_minutes = None  # DIAGNOSTIC, see _parse_status
 
         logger.info("Init of HumsiENK_Ble at " + address)
 
@@ -555,6 +556,21 @@ class HumsiENK_Ble(Battery):
             if warning_bit is not None and status & (1 << warning_bit):
                 return 1
             return 0
+
+        # DIAGNOSTIC, merge branch only, do not port to the driver PR.
+        # The BMS reports its own uptime in every status frame and we have
+        # always discarded it. Both packs drop their BLE link in the same
+        # second, and the evidence for that being a link fault rather than a
+        # BMS restart is that the disconnect reason is a supervision timeout
+        # and both resume advertising about a second later. A restarting BMS
+        # would look exactly the same. This counter going backwards is what
+        # tells the two apart, and nothing else we read can.
+        uptime_minutes = int.from_bytes(data[0:2], "little") * 1440 + data[2] * 60 + data[3]
+        if self._bms_uptime_minutes is not None and uptime_minutes < self._bms_uptime_minutes:
+            logger.warning(f"HumsiENK: BMS uptime went backwards, {self._bms_uptime_minutes} -> {uptime_minutes} minutes: the BMS restarted")
+        elif self._bms_uptime_minutes is None:
+            logger.info(f"HumsiENK: BMS uptime at first status frame: {uptime_minutes} minutes")
+        self._bms_uptime_minutes = uptime_minutes
 
         self.charge_fet = bool(status & (1 << 7))
         self.discharge_fet = bool(status & (1 << 23))

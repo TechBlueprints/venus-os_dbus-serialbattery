@@ -12,6 +12,7 @@ imported. The stub is removed again afterwards so no other test module
 inherits it.
 """
 
+import logging
 import os
 import sys
 import time
@@ -112,10 +113,10 @@ def cell_payload(millivolts):
     return bytes(payload)
 
 
-def status_payload(status_bits=0, balancing=0, disconnected=0):
+def status_payload(status_bits=0, balancing=0, disconnected=0, days=3, hours=4, minutes=5):
     payload = bytearray()
-    payload += (3).to_bytes(2, "little")  # runtime days
-    payload += bytes([4, 5])  # runtime hours, minutes
+    payload += days.to_bytes(2, "little")  # runtime days
+    payload += bytes([hours, minutes])  # runtime hours, minutes
     payload += status_bits.to_bytes(4, "little")
     payload += balancing.to_bytes(3, "little")
     payload += disconnected.to_bytes(3, "little")
@@ -588,3 +589,30 @@ def test_the_driver_carries_no_fallback_machinery():
     import inspect
 
     assert "fallback" not in inspect.getsource(humsienk_ble).lower()
+
+
+def test_bms_uptime_going_backwards_is_reported_as_a_restart(caplog):
+    # The BMS reports its uptime in every status frame. Both packs drop their
+    # BLE link in the same second, and a restarting BMS is indistinguishable
+    # from a link fault by the disconnect reason alone, so a counter that goes
+    # backwards is the only evidence that separates them.
+    bms = make_bms()
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(days=3, hours=4, minutes=5)))
+    assert bms._bms_uptime_minutes == 3 * 1440 + 4 * 60 + 5
+
+    with caplog.at_level(logging.WARNING):
+        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(days=0, hours=0, minutes=1)))
+
+    assert bms._bms_uptime_minutes == 1
+    assert "the BMS restarted" in caplog.text
+
+
+def test_bms_uptime_moving_forward_is_not_reported(caplog):
+    bms = make_bms()
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(days=3, hours=4, minutes=5)))
+
+    with caplog.at_level(logging.WARNING):
+        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(days=3, hours=4, minutes=6)))
+
+    assert bms._bms_uptime_minutes == 3 * 1440 + 4 * 60 + 6
+    assert "restarted" not in caplog.text
