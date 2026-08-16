@@ -19,10 +19,16 @@ def parse_adapter_entries(entries):
     """
     Split BLUETOOTH_ADAPTERS into pinned devices and the shared pool.
 
-    Entries of the form MAC@hciX pin that device to exactly that adapter: no
-    rotation and no fallback to any other adapter. Plain hciX entries form the
-    pool used by every device that is not pinned. Returns (pins, pool), with
-    pins keyed by upper case MAC address.
+    Entries of the form MAC@hciX pin that device to that adapter, with no
+    fallback to the shared pool. Repeating a MAC pins it to several adapters
+    in order: the first is used for every connection attempt, the rest are
+    tried only when it cannot be resolved there. That keeps a battery on a
+    known good radio while leaving it somewhere to go if that radio fails,
+    without returning it to a pool shared with other devices.
+
+    Plain hciX entries form the pool used by every device that is not pinned.
+    Returns (pins, pool), with pins keyed by upper case MAC address and each
+    value a list of adapters in priority order.
     """
     pins = {}
     pool = []
@@ -35,7 +41,9 @@ def parse_adapter_entries(entries):
             mac = mac.strip().upper()
             adapter = adapter.strip()
             if mac and adapter:
-                pins[mac] = adapter
+                adapters = pins.setdefault(mac, [])
+                if adapter not in adapters:
+                    adapters.append(adapter)
             else:
                 logger.warning(f"Ignoring malformed BLUETOOTH_ADAPTERS entry '{entry}'")
         else:
@@ -47,9 +55,9 @@ BLUETOOTH_ADAPTER_PINS, BLUETOOTH_ADAPTER_POOL = parse_adapter_entries(BLUETOOTH
 
 
 def adapters_for(address):
-    """Pinned adapter (as a single-element list) for this device, or None."""
-    pin = BLUETOOTH_ADAPTER_PINS.get(str(address).strip().upper())
-    return [pin] if pin else None
+    """Adapters pinned to this device in priority order, or None if unpinned."""
+    pins = BLUETOOTH_ADAPTER_PINS.get(str(address).strip().upper())
+    return list(pins) if pins else None
 
 
 # Hold flag: while the flag file for a device exists, the reconnect loop makes
