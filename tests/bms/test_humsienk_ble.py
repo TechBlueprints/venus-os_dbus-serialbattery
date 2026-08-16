@@ -776,3 +776,29 @@ def test_condition_bits_are_reported_but_switch_states_are_not(caplog):
         bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=switches | (1 << 12))))
     assert "condition bits changed" in caplog.text
     assert "0x00001000" in caplog.text and "[12]" in caplog.text
+
+
+def test_a_condition_bit_change_carries_the_cell_voltages(caplog):
+    # DIAGNOSTIC. A bit's meaning cannot be established from the bit alone.
+    # Bit 11 tracks the top of charge on real packs, which is consistent with
+    # a cell overvoltage warning and with other readings; the cells at the
+    # setting edge are what separate them.
+    bms = make_bms()
+    bms._parse_and_update(frame(HumsiENK_Ble.CMD_CELL_VOLTAGES, cell_payload([3300, 3595, 3301, 3302])))
+
+    with caplog.at_level(logging.WARNING):
+        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 7) | (1 << 11) | (1 << 23))))
+
+    assert "highest cell 3.595 V" in caplog.text
+    assert "3.300" in caplog.text and "3.302" in caplog.text
+
+
+def test_a_condition_bit_change_before_any_cell_frame_says_so(caplog):
+    # Status can arrive before the first 0x22, and an empty list would read as
+    # "all cells at zero" rather than "not yet known".
+    bms = make_bms()
+
+    with caplog.at_level(logging.WARNING):
+        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 11))))
+
+    assert "highest cell unread V" in caplog.text

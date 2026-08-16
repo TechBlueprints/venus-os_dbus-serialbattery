@@ -505,9 +505,24 @@ class HumsiENK_Ble(Battery):
         # 12 set or proves the alarm comes from somewhere else.
         conditions = status & ~self.SWITCH_STATUS_BITS & 0xFFFFFFFF
         if conditions != self._status_conditions:
+            # The cell voltages come with the change, because a bit's meaning
+            # cannot be established from the bit alone. Bit 11 is the case in
+            # point: it was set through the top of charge and released 90
+            # minutes later, which is consistent with a cell overvoltage
+            # warning and equally consistent with several other readings.
+            # Catching the setting edge with the cells attached is what
+            # separates them.
+            #
+            # These cells are up to one poll interval older than the status
+            # word, because 0x22 and 0x20 are separate frames. At the edge of
+            # a threshold that matters, so the reading is a bound rather than
+            # an exact value.
+            cells = [cell.voltage for cell in self.cells if cell.voltage is not None]
+            highest = f"{max(cells):.3f}" if cells else "unread"
             logger.warning(
                 f"HumsiENK: condition bits changed 0x{self._status_conditions or 0:08X} -> 0x{conditions:08X}, "
-                f"set {[bit for bit in range(32) if conditions & (1 << bit)]}, full word 0x{status:08X}"
+                f"set {[bit for bit in range(32) if conditions & (1 << bit)]}, full word 0x{status:08X}, "
+                f"highest cell {highest} V, cells {[f'{v:.3f}' for v in cells]}"
             )
         self._status_conditions = conditions
 
