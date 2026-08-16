@@ -439,6 +439,9 @@ class BCMBackend(BleConnectionBackend):
         self._handoff_fails = 0
         # Timestamps of recent breaker engagements, see _engage_breaker()
         self._breaker_times = []
+        # Addresses whose ConnectDevice fast path has proven unusable, see
+        # _resolve_device(). Per address, and cleared on a real connection.
+        self._connect_device_unusable = set()
 
     def _breaker_tripped(self):
         """
@@ -579,13 +582,23 @@ class BCMBackend(BleConnectionBackend):
           2. Cache-first find across the allowed adapters.
           3. ConnectDevice on the remaining allowed adapters.
 
-        Returns (device, connect_adapters); device is None if unresolvable.
+        Step 1 is skipped for an address whose ConnectDevice path has already
+        produced a device that could not then be connected. On some stacks
+        ConnectDevice reports success while the object it creates is gone by
+        the time bleak looks at it, so every attempt costs a connect timeout
+        and re-occupies the peripheral, and only scan-based resolution ever
+        works. Learning that per address after the first failure keeps the
+        fast path for systems where it does work, instead of paying for it on
+        every reconnect for the life of the process.
+
+        Returns (device, connect_adapters, via_connect_device); device is None
+        if unresolvable.
         """
-        if adapters and prefer_connect_device:
+        if adapters and prefer_connect_device and address not in self._connect_device_unusable:
             path = await self._connect_device_no_scan(address, adapters[0])
             if path:
                 logger.info(f"BLE [{address}] connected on preferred adapter {adapters[0]} via ConnectDevice")
-                return _ble_device(address, path), [adapters[0]]
+                return _ble_device(address, path), [adapters[0]], True
 
         device = None
         try:
@@ -600,19 +613,20 @@ class BCMBackend(BleConnectionBackend):
             # so evict it and fall through to ConnectDevice instead.
             found_adapter = _adapter_of(device)
             if found_adapter is None:
-                return device, adapters
+                return device, adapters, False
             if not adapters or found_adapter in adapters:
-                return device, [found_adapter]
+                return device, [found_adapter], False
             logger.info(f"BLE [{address}] cached on disallowed {found_adapter}, removing and using ConnectDevice on allowed adapters")
             await self._remove_cached_device(address, found_adapter)
 
-        for adapter in adapters or ["hci0"]:
-            path = await self._connect_device_no_scan(address, adapter)
-            if path:
-                logger.info(f"BLE [{address}] created device on {adapter} via ConnectDevice (no scan)")
-                return _ble_device(address, path), [adapter]
+        if address not in self._connect_device_unusable:
+            for adapter in adapters or ["hci0"]:
+                path = await self._connect_device_no_scan(address, adapter)
+                if path:
+                    logger.info(f"BLE [{address}] created device on {adapter} via ConnectDevice (no scan)")
+                    return _ble_device(address, path), [adapter], True
 
-        return None, adapters
+        return None, adapters, False
 
     async def establish(self, client, address, notify_char, notify_callback):
         adapters = self._adapters(address)
@@ -629,7 +643,7 @@ class BCMBackend(BleConnectionBackend):
 
         # while the breaker is tripped, skip the ConnectDevice-first path: it
         # is exactly what keeps re-occupying the peripheral
-        device, connect_adapters = await self._resolve_device(address, adapters, prefer_connect_device=not tripped)
+        device, connect_adapters, via_connect_device = await self._resolve_device(address, adapters, prefer_connect_device=not tripped)
         if device is None:
             self._handoff_fails += 1
             raise Exception(f"device not resolvable on allowed adapters {adapters} (scan and ConnectDevice both failed)")
@@ -649,6 +663,16 @@ class BCMBackend(BleConnectionBackend):
             )
         except Exception:
             self._handoff_fails += 1
+            if via_connect_device:
+                # ConnectDevice reported success and the device it produced
+                # could not be connected. That path is unusable on this stack,
+                # so stop taking it for this address: every further attempt
+                # costs a connect timeout and re-occupies the peripheral,
+                # while scan resolution is what actually works here.
+                self._connect_device_unusable.add(address)
+                logger.warning(f"BLE [{address}] ConnectDevice produced an unusable device, resolving by scan from now on")
+                for adapter in adapters or ["hci0"]:
+                    await self._remove_cached_device(address, adapter)
             raise
         logger.info(f"BLE [{address}] connected via BCM")
 
@@ -671,6 +695,10 @@ class BCMBackend(BleConnectionBackend):
             self._handoff_fails += 1
             raise
         self._handoff_fails = 0
+        # A real connection means the fast path is worth trying again: the
+        # earlier failure may have been a stale cache entry rather than a
+        # stack that cannot do this at all.
+        self._connect_device_unusable.discard(address)
         return client
 
     async def release(self, client):
