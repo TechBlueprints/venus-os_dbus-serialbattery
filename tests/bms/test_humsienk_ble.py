@@ -750,3 +750,29 @@ def test_a_dump_is_not_repeated_by_the_second_trigger(caplog):
         bms.refresh_data()
 
     assert "link lost" not in caplog.text
+
+
+def test_condition_bits_are_reported_but_switch_states_are_not(caplog):
+    # DIAGNOSTIC. The switch bits move constantly in normal operation, so
+    # logging those would bury the thing being hunted: a condition bit such as
+    # bit 12 that /Alarms/HighVoltage claims is set while every captured word
+    # says otherwise.
+    bms = make_bms()
+    switches = (1 << 7) | (1 << 23)
+
+    with caplog.at_level(logging.WARNING):
+        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=switches)))
+    assert "condition bits changed" in caplog.text  # first word establishes the baseline
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        # heater comes on, discharge FET opens: switches only, still no condition
+        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 7) | (1 << 15))))
+    assert "condition bits changed" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        # pack overvoltage warning, the bit actually being hunted
+        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=switches | (1 << 12))))
+    assert "condition bits changed" in caplog.text
+    assert "0x00001000" in caplog.text and "[12]" in caplog.text

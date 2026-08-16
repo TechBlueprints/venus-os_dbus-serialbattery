@@ -190,6 +190,7 @@ class HumsiENK_Ble(Battery):
         self._unsolicited_seen = {}  # DIAGNOSTIC, see _log_unsolicited
         self._status_history = deque(maxlen=20)  # DIAGNOSTIC, see _record_status
         self._status_unbound = None
+        self._status_conditions = None  # DIAGNOSTIC, see _record_status
         self._link_was_fresh = False
 
         logger.info("Init of HumsiENK_Ble at " + address)
@@ -462,6 +463,10 @@ class HumsiENK_Ble(Battery):
     # evidence. Nothing reads these; they are only reported when they move.
     UNBOUND_STATUS_BITS = (3, 5, 6, 11, 13, 14, 19, 27, 31)
 
+    # Charge FET, heater and discharge FET. Everything else in the status
+    # word is a condition rather than a switch position.
+    SWITCH_STATUS_BITS = (1 << 7) | (1 << 15) | (1 << 23)
+
     def _record_status(self, status: int) -> None:
         """
         DIAGNOSTIC, merge branch only, do not port to the driver PR.
@@ -488,6 +493,23 @@ class HumsiENK_Ble(Battery):
             now_set = [bit for bit in moved if unbound & (1 << bit)]
             logger.warning(f"HumsiENK: unmapped status bits moved {moved}, now set {now_set}, full word 0x{status:08X}")
         self._status_unbound = unbound
+
+        # Every condition bit, meaning everything except the three switch
+        # states. /Alarms/HighVoltage read 1 for about three hours today, which
+        # can only come from bit 12, yet every status word we have captured is
+        # 0x00800080 with bits 8 to 15 clear, and the high-voltage alarm
+        # counter never incremented. Two observations that should agree do not,
+        # and the recorder above cannot settle it because it samples only when
+        # the link drops. This logs the word itself the moment any condition
+        # bit changes, so the next absorption either produces a word with bit
+        # 12 set or proves the alarm comes from somewhere else.
+        conditions = status & ~self.SWITCH_STATUS_BITS & 0xFFFFFFFF
+        if conditions != self._status_conditions:
+            logger.warning(
+                f"HumsiENK: condition bits changed 0x{self._status_conditions or 0:08X} -> 0x{conditions:08X}, "
+                f"set {[bit for bit in range(32) if conditions & (1 << bit)]}, full word 0x{status:08X}"
+            )
+        self._status_conditions = conditions
 
     def _dump_status_history(self, stale_seconds: float) -> None:
         """
