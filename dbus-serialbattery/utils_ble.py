@@ -1,10 +1,187 @@
 import threading
 import asyncio
+import os
 import subprocess
 import sys
+import time
 from bleak import BleakClient
+from bleak.exc import BleakCharacteristicNotFoundError
 from time import sleep
-from utils import logger, BLUETOOTH_FORCE_RESET_BLE_STACK, capture_raw_data
+from utils import (
+    logger,
+    BLUETOOTH_ADAPTERS,
+    BLUETOOTH_CONNECTION_BACKEND,
+    BLUETOOTH_FORCE_RESET_BLE_STACK,
+    capture_raw_data,
+)
+
+
+def parse_adapter_entries(entries):
+    """
+    Split BLUETOOTH_ADAPTERS into pinned devices and the shared pool.
+
+    Entries of the form MAC@hciX pin that device to exactly that adapter: no
+    rotation and no fallback to any other adapter. Plain hciX entries form the
+    pool used by every device that is not pinned. Returns (pins, pool), with
+    pins keyed by upper case MAC address.
+    """
+    pins = {}
+    pool = []
+    for entry in entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "@" in entry:
+            mac, _, adapter = entry.rpartition("@")
+            mac = mac.strip().upper()
+            adapter = adapter.strip()
+            if mac and adapter:
+                pins[mac] = adapter
+            else:
+                logger.warning(f"Ignoring malformed BLUETOOTH_ADAPTERS entry '{entry}'")
+        else:
+            pool.append(entry)
+    return pins, pool
+
+
+BLUETOOTH_ADAPTER_PINS, BLUETOOTH_ADAPTER_POOL = parse_adapter_entries(BLUETOOTH_ADAPTERS)
+
+
+def adapters_for(address):
+    """Pinned adapter (as a single-element list) for this device, or None."""
+    pin = BLUETOOTH_ADAPTER_PINS.get(str(address).strip().upper())
+    return [pin] if pin else None
+
+
+# Hold flag: while the flag file for a device exists, the reconnect loop makes
+# no connection attempts for that device at all, giving a degraded BMS radio
+# extended quiet. The driver, its dbus service and its published data stay up,
+# which is the whole point - killing the driver process instead makes DVCC see
+# the service disappear and raises alarms across the bank.
+# A flag whose content is "auto" was written by an automatic recovery path and
+# expires by itself; any other content is an operator hold and persists until
+# the file is removed.
+BLE_HOLD_FLAG_DIR = "/data/tmp"
+BLE_HOLD_FLAG_PREFIX = "ble-hold-"
+BLE_HOLD_AUTO_EXPIRY = 1200.0
+BLE_HOLD_POLL_INTERVAL = 5
+
+
+def ble_hold_flag_path(address):
+    """Path of the hold flag file for the given device address."""
+    return os.path.join(BLE_HOLD_FLAG_DIR, BLE_HOLD_FLAG_PREFIX + str(address).replace(":", "").lower())
+
+
+# Outer deadlines for the connection backend. Generous on purpose: they are a
+# last resort against a permanently parked await, not a connection timeout.
+BLE_ESTABLISH_TIMEOUT = 300.0
+BLE_RELEASE_TIMEOUT = 30.0
+
+
+class BleConnectionBackend:
+    """
+    Interface for establishing and releasing BLE connections.
+
+    Separates how a connection is established and torn down (the backend) from
+    how Syncron_Ble supervises it and exchanges data with the BMS drivers, so
+    alternative connection strategies can be plugged in without touching the
+    drivers.
+    """
+
+    def create_client(self, address, disconnected_callback):
+        """
+        Create the BleakClient for the given address, or None if the backend
+        creates its own client during establish().
+        """
+        raise NotImplementedError
+
+    async def establish(self, client, address, notify_char, notify_callback):
+        """
+        Connect and start notifications. Returns the connected client
+        (may differ from the one passed in). Raises on failure.
+        """
+        raise NotImplementedError
+
+    async def release(self, client):
+        """Disconnect the client."""
+        raise NotImplementedError
+
+
+class BleakBackend(BleConnectionBackend):
+    """
+    Default backend: connects directly with bleak, matching the historical
+    behavior of this driver.
+
+    If BLUETOOTH_ADAPTERS is set, connections are made only via the listed
+    adapters: a device pinned with MAC@hciX always uses that adapter, every
+    other device takes the next entry of the shared pool after a failed
+    attempt. An empty list uses the system default adapter.
+    """
+
+    def __init__(self):
+        self.adapter_index = 0
+        self.current_adapter = None
+
+    def create_client(self, address, disconnected_callback):
+        kwargs = {}
+        pinned = adapters_for(address)
+        if pinned:
+            self.current_adapter = pinned[0]
+        elif BLUETOOTH_ADAPTER_POOL:
+            self.current_adapter = BLUETOOTH_ADAPTER_POOL[self.adapter_index % len(BLUETOOTH_ADAPTER_POOL)]
+        if self.current_adapter:
+            kwargs["adapter"] = self.current_adapter
+        return BleakClient(address, disconnected_callback=disconnected_callback, **kwargs)
+
+    async def establish(self, client, address, notify_char, notify_callback):
+        try:
+            return await self._establish(client, address, notify_char, notify_callback)
+        except Exception:
+            # rotate to the next pool adapter for the next attempt; pinned
+            # devices never rotate, and an all-pinned config has an empty pool
+            if BLUETOOTH_ADAPTER_POOL:
+                self.adapter_index += 1
+            raise
+
+    async def _establish(self, client, address, notify_char, notify_callback):
+        logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
+        await client.connect()
+        logger.info("connected to bluetooh device" + address)
+        # On some devices GATT characteristics become available only after connect()
+        # has already returned, so the first start_notify() can raise
+        # BleakCharacteristicNotFoundError for a characteristic that does exist.
+        # Re-run service discovery and retry before giving up.
+        for attempt in range(3):
+            try:
+                await client.start_notify(notify_char, notify_callback)
+                break
+            except BleakCharacteristicNotFoundError:
+                if attempt == 2:
+                    raise
+                logger.warning(f"characteristic {notify_char} not found yet, re-running service discovery")
+                # bleak has no public API to re-run service discovery on a connected
+                # client; clear the cached services so _get_services() fetches again
+                client._backend.services = None
+                await client._backend._get_services()
+                await asyncio.sleep(0.5)
+        return client
+
+    async def release(self, client):
+        await client.disconnect()
+
+
+# Available connection backends, selected by class name via BLUETOOTH_CONNECTION_BACKEND
+supported_ble_backends = [BleakBackend]
+
+
+def get_ble_backend(name=None):
+    """Return the connection backend selected by BLUETOOTH_CONNECTION_BACKEND."""
+    name = BLUETOOTH_CONNECTION_BACKEND if name is None else name
+    for backend in supported_ble_backends:
+        if backend.__name__ == name:
+            return backend()
+    logger.warning(f"Unknown BLUETOOTH_CONNECTION_BACKEND '{name}', using 'BleakBackend'")
+    return BleakBackend()
 
 
 # Class that enables synchronous writing and reading to a bluetooh device
@@ -34,6 +211,10 @@ class Syncron_Ble:
         self.write_characteristic = write_characteristic
         self.read_characteristic = read_characteristic
         self.address = address
+        self.backend = get_ble_backend()
+        # Only the BLE thread of the current generation keeps running; see
+        # rebuild_ble_thread()
+        self._ble_thread_generation = 0
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
@@ -49,37 +230,112 @@ class Syncron_Ble:
         else:
             self.connected = True
 
-    def initiate_ble_thread_main(self):
-        asyncio.run(self.async_main(self.address))
+    def initiate_ble_thread_main(self, generation=0):
+        asyncio.run(self.async_main(self.address, generation))
 
-    async def async_main(self, address):
+    def rebuild_ble_thread(self):
+        """Abandon a wedged BLE thread and start a fresh one in-process.
+
+        The remedy for a deadlocked reconnect loop used to be exiting the
+        whole process, which takes the dbus service and the in-RAM state
+        down with it and makes the inverter raise 'BMS connection lost'.
+        Rebuilding just the BLE thread keeps everything the rest of the
+        system depends on alive. The old thread, if merely slow rather than
+        hung, exits at its next loop iteration via the generation check; a
+        truly hung one is abandoned (it is a daemon thread).
+        """
+        try:
+            self._ble_thread_generation += 1
+            generation = self._ble_thread_generation
+            self.ble_async_thread_ready = threading.Event()
+            self.ble_connection_ready = threading.Event()
+            self.ble_async_thread_event_loop = False
+            self.connected = False
+            self.backend = get_ble_backend()  # fresh backend state
+            ble_async_thread = threading.Thread(
+                name=f"BMS_bluetooth_async_thread_gen{generation}",
+                target=self.initiate_ble_thread_main,
+                args=(generation,),
+                daemon=True,
+            )
+            ble_async_thread.start()
+            started = self.ble_async_thread_ready.wait(5)
+            logger.error(f"BLE thread rebuild for {self.address}: generation {generation} {'started' if started else 'FAILED TO START'}")
+            return started
+        except Exception as e:
+            logger.error(f"BLE thread rebuild for {self.address} failed: {repr(e)}")
+            return False
+
+    async def async_main(self, address, generation=0):
         self.ble_async_thread_event_loop = asyncio.get_event_loop()
         self.ble_async_thread_ready.set()
 
-        # try to connect over and over if the connection fails
-        while self.main_thread.is_alive():
+        # Space out connection attempts: 1s, 3s, then steady 6s. The first
+        # retry stays instant-ish for ordinary blips; the 6s cruise stops
+        # the continuous hammering that produced 220-attempt recovery
+        # storms and wedged adapter discovery state. A session that held
+        # for over a minute resets the ramp.
+        backoff = [1, 3, 6]
+        failures = 0
+        hold_flag = ble_hold_flag_path(self.address)
+        holding = False
+        while self.main_thread.is_alive() and generation == self._ble_thread_generation:
+            if os.path.exists(hold_flag):
+                try:
+                    with open(hold_flag) as f:
+                        automatic = f.read().strip() == "auto"
+                    if automatic and time.time() - os.path.getmtime(hold_flag) > BLE_HOLD_AUTO_EXPIRY:
+                        os.remove(hold_flag)
+                        logger.info(f"BLE hold for {self.address} auto-expired, resuming connection attempts")
+                        continue
+                except Exception as e:
+                    if not holding:
+                        logger.warning(f"BLE hold flag {hold_flag} could not be read: {repr(e)}")
+                if not holding:
+                    holding = True
+                    logger.warning(f"BLE hold flag {hold_flag} present, pausing connection attempts for {self.address}")
+                await asyncio.sleep(BLE_HOLD_POLL_INTERVAL)
+                continue
+            if holding:
+                holding = False
+                logger.info(f"BLE hold for {self.address} released, resuming connection attempts")
+            attempt_started = time.time()
             await self.connect_to_bms(self.address)
-            await asyncio.sleep(1)  # sleep one second before trying to reconnecting
+            if time.time() - attempt_started > 60.0:
+                failures = 0
+            else:
+                failures = min(failures + 1, len(backoff) - 1)
+            await asyncio.sleep(backoff[failures])
 
     def client_disconnected(self, client):
         logger.error(f"bluetooh device with address: {self.address} disconnected")
 
     async def connect_to_bms(self, address):
-        self.client = BleakClient(address, disconnected_callback=self.client_disconnected)
+        self.client = self.backend.create_client(address, self.client_disconnected)
         try:
-            logger.info("initiating BLE connection to: " + address)
-            await self.client.connect()
-            logger.info("connected to bluetooh device" + address)
-            await self.client.start_notify(self.read_characteristic, self.notify_read_callback)
+            # Belt-and-braces deadline: a backend's own timeouts should always
+            # fire first, but no single stalled await may park the reconnect
+            # loop permanently. One unguarded D-Bus await once silenced
+            # reconnection for four hours without a single log line.
+            self.client = await asyncio.wait_for(
+                self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback),
+                timeout=BLE_ESTABLISH_TIMEOUT,
+            )
 
         except Exception as e:
             logger.error("Failed when trying to connect", e)
             return False
         finally:
             self.ble_connection_ready.set()
-            while self.client.is_connected and self.main_thread.is_alive():
-                await asyncio.sleep(0.1)
-            await self.client.disconnect()
+            if self.client:
+                while self.client.is_connected and self.main_thread.is_alive():
+                    await asyncio.sleep(0.1)
+                try:
+                    await asyncio.wait_for(self.backend.release(self.client), timeout=BLE_RELEASE_TIMEOUT)
+                except Exception as e:
+                    # a disconnect that never completes must not prevent the
+                    # next connection attempt
+                    logger.warning(f"BLE [{address}] disconnect did not complete: {repr(e)}")
 
     # saves response and tells the command sender that the response has arived
     def notify_read_callback(self, sender, data: bytearray):
@@ -96,14 +352,18 @@ class Syncron_Ble:
         self.response_event = False
         return self.response_data
 
-    async def send_coroutine_to_ble_thread_and_wait_for_result(self, coroutine):
-        bt_task = asyncio.run_coroutine_threadsafe(coroutine, self.ble_async_thread_event_loop)
-        result = await asyncio.wait_for(asyncio.wrap_future(bt_task), timeout=1.5)
-        return result
-
     def send_data(self, data):
-        data = asyncio.run(self.send_coroutine_to_ble_thread_and_wait_for_result(self.ble_thread_send_com(data)))
-        return data
+        # Schedule the write on the BLE thread's existing event loop and wait
+        # for the result directly. The previous implementation wrapped this in
+        # asyncio.run(), constructing and tearing down a whole event loop for
+        # every command sent — measurable CPU overhead on GX hardware for
+        # drivers that poll several commands every few seconds.
+        future = asyncio.run_coroutine_threadsafe(self.ble_thread_send_com(data), self.ble_async_thread_event_loop)
+        try:
+            return future.result(timeout=1.5)
+        except Exception:
+            future.cancel()
+            raise
 
 
 def restart_ble_hardware_and_bluez_driver():
