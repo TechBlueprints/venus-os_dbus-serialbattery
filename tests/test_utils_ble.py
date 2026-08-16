@@ -16,9 +16,21 @@ import types
 DRIVER_DIR = os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery")
 CONFIG_DEFAULT = os.path.join(DRIVER_DIR, "config.default.ini")
 sys.path.insert(0, DRIVER_DIR)
+# The driver puts ext on sys.path before it imports utils_ble, which is what
+# makes the vendored habluetooth discoverable there. Do the same here, so the
+# backend registry under test is the one the driver builds. Only find_spec()
+# runs against it; habluetooth itself is never imported by this suite.
+sys.path.insert(1, os.path.join(DRIVER_DIR, "ext"))
 
 if "bleak" not in sys.modules:
-    sys.modules["bleak"] = types.SimpleNamespace(BleakClient=object)
+    # HaBluetoothBackend raises BleakError, so bleak.exc needs stubbing too
+    _bleak_exc = types.ModuleType("bleak.exc")
+    _bleak_exc.BleakError = type("BleakError", (Exception,), {})
+    _bleak = types.ModuleType("bleak")
+    _bleak.BleakClient = object
+    _bleak.exc = _bleak_exc
+    sys.modules["bleak"] = _bleak
+    sys.modules["bleak.exc"] = _bleak_exc
 
 
 def _load_utils_ble():
@@ -162,3 +174,65 @@ def test_a_repeated_pin_to_the_same_adapter_is_not_duplicated():
     pins, _ = utils_ble.parse_adapter_entries(["AA:BB@hci4", "AA:BB@hci4"])
 
     assert pins == {"AA:BB": ["hci4"]}
+
+
+def test_habluetooth_backend_is_available_from_the_vendored_copy():
+    """ext/habluetooth is what makes the backend selectable at all."""
+    assert utils_ble.HAS_HABLUETOOTH
+    assert utils_ble.HaBluetoothBackend in utils_ble.supported_ble_backends
+
+
+def test_habluetooth_backend_defers_client_creation_to_establish():
+    backend = utils_ble.get_ble_backend("HaBluetoothBackend")
+    sentinel = object()
+    assert backend.create_client("C8:47:8C:00:00:00", sentinel) is None
+    assert backend.disconnected_callback is sentinel
+
+
+def test_habluetooth_backend_scans_only_the_pinned_adapter():
+    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
+    # build the pins the way the driver does, so this test keeps testing the
+    # backend rather than a hand-written guess at how a pin is stored
+    utils_ble.BLUETOOTH_ADAPTER_PINS, _ = utils_ble.parse_adapter_entries(["C8:47:8C:00:00:00@hci1"])
+    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci2"]
+    try:
+        backend = utils_ble.get_ble_backend("HaBluetoothBackend")
+        available = {"hci0": {}, "hci1": {}, "hci2": {}}
+        # a pinned battery never scans on anything but its own adapter
+        assert backend._adapters_to_scan("c8:47:8c:00:00:00", available) == ["hci1"]
+        # an unpinned one uses the pool, not every adapter present
+        assert backend._adapters_to_scan("C8:47:8C:00:00:11", available) == ["hci2"]
+    finally:
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+
+
+def test_habluetooth_backend_scans_every_adapter_a_battery_is_pinned_to():
+    """A battery pinned to several adapters gets a scanner on each of them."""
+    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
+    utils_ble.BLUETOOTH_ADAPTER_PINS, _ = utils_ble.parse_adapter_entries(["C8:47:8C:00:00:00@hci4", "C8:47:8C:00:00:00@hci2"])
+    utils_ble.BLUETOOTH_ADAPTER_POOL = []
+    try:
+        backend = utils_ble.get_ble_backend("HaBluetoothBackend")
+        available = {"hci2": {}, "hci4": {}}
+        # the manager arbitrates between them per advertisement, so both are
+        # scanned rather than only the first
+        assert backend._adapters_to_scan("C8:47:8C:00:00:00", available) == ["hci4", "hci2"]
+    finally:
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+
+
+def test_habluetooth_backend_scans_every_adapter_when_unconfigured():
+    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {}
+    utils_ble.BLUETOOTH_ADAPTER_POOL = []
+    try:
+        backend = utils_ble.get_ble_backend("HaBluetoothBackend")
+        assert backend._adapters_to_scan("C8:47:8C:00:00:11", {"hci0": {}, "hci1": {}}) == ["hci0", "hci1"]
+    finally:
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
