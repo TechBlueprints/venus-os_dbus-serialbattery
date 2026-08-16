@@ -405,7 +405,9 @@ class TestServedValues:
         _serve(wrapper)
         assert wrapper.get_voltage() == 25.5
         assert wrapper.get_current() == -12.0
-        assert wrapper.get_soc() == 61.0
+        # SoC is anchored on the BMS reading and moved by the shunt's travel,
+        # so at engagement it equals the BMS value rather than the shunt's
+        assert wrapper.get_soc() == 55.0
         assert wrapper.get_temperature() == 21.0
 
     def test_bms_values_while_fresh(self, monkeypatch):
@@ -433,7 +435,7 @@ class TestServedValues:
         wrapper.set_calculated_data()
         assert wrapper.get_voltage() == 25.5
         assert wrapper.battery.current_calc == -12.0
-        assert wrapper.battery.soc_calc == 61.0
+        assert wrapper.battery.soc_calc == 55.0
         assert wrapper.battery.power_calc == pytest.approx(25.5 * -12.0)
 
     def test_capacity_remain_derives_from_the_served_soc(self, monkeypatch):
@@ -441,8 +443,8 @@ class TestServedValues:
         wrapper.battery.capacity_remain = 111.0
         _serve(wrapper)
         wrapper.set_calculated_data()
-        assert wrapper.get_capacity_remain() == pytest.approx(280.0 * 61.0 / 100)
-        assert wrapper.get_capacity_consumed() == pytest.approx(-(280.0 - 280.0 * 61.0 / 100))
+        assert wrapper.get_capacity_remain() == pytest.approx(280.0 * 55.0 / 100)
+        assert wrapper.get_capacity_consumed() == pytest.approx(-(280.0 - 280.0 * 55.0 / 100))
 
     def test_capacity_remain_uses_the_bms_value_while_fresh(self, monkeypatch):
         wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=True)
@@ -455,6 +457,83 @@ class TestServedValues:
         wrapper.battery.discharge_fet = False
         _serve(wrapper)
         assert wrapper.get_current() == 0.0
+
+
+class TestSocAnchoring:
+    """The served SoC is the BMS reading moved by the shunt's travel, not the
+    shunt's own absolute estimate. Two instruments disagree on absolute SoC by
+    a point or two, and publishing that difference at every engagement and
+    again at every recovery is a sawtooth on a system that loses its BMS link
+    a few times an hour."""
+
+    def test_no_step_at_engagement(self, monkeypatch):
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.soc = 55.0
+        before = wrapper.get_soc()
+
+        _serve(wrapper)
+
+        assert wrapper._serving is True
+        assert wrapper.get_soc() == before, "SoC must be continuous across the switch to the shunt"
+
+    def test_shunt_travel_moves_the_served_soc(self, monkeypatch):
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.soc = 55.0
+        _serve(wrapper)
+
+        # the pack discharges 3 points while the BMS is away
+        wrapper.dbus_fallback_objects["Soc"].value = _LIVE_SHUNT["Soc"] - 3.0
+        _serve(wrapper)
+
+        assert wrapper.get_soc() == pytest.approx(52.0)
+
+    def test_no_step_at_recovery(self, monkeypatch):
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.soc = 55.0
+        _serve(wrapper)
+        wrapper.dbus_fallback_objects["Soc"].value = _LIVE_SHUNT["Soc"] - 3.0
+        _serve(wrapper)
+        served = wrapper.get_soc()
+
+        # BMS returns having counted the same discharge
+        wrapper.battery.soc = 52.0
+        wrapper.battery.ble_handle.connected = True
+        wrapper.refresh_data()
+
+        assert wrapper._serving is False
+        assert wrapper.get_soc() == pytest.approx(served)
+
+    def test_without_a_bms_reading_the_shunt_value_is_served(self, monkeypatch):
+        # a process that registered from the stash has never seen a BMS SoC,
+        # so there is nothing to anchor on and the sensor's own value is all
+        # there is
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.soc = None
+        _serve(wrapper)
+
+        assert wrapper._soc_anchor is None
+        assert wrapper.get_soc() == _LIVE_SHUNT["Soc"]
+
+    def test_the_served_soc_stays_in_range(self, monkeypatch):
+        # two readings that are each in range can sum out of it
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.soc = 99.0
+        _serve(wrapper)
+        wrapper.dbus_fallback_objects["Soc"].value = _LIVE_SHUNT["Soc"] + 20.0
+        _serve(wrapper)
+
+        assert wrapper.get_soc() == 100.0
+
+    def test_the_anchor_is_dropped_on_recovery(self, monkeypatch):
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.soc = 55.0
+        _serve(wrapper)
+        assert wrapper._soc_anchor == 55.0
+
+        wrapper.battery.ble_handle.connected = True
+        wrapper.refresh_data()
+
+        assert wrapper._soc_anchor is None, "a stale anchor would corrupt the next outage"
 
 
 class TestOnlineAndConnectionStrings:
@@ -1217,8 +1296,15 @@ class TestPublishCycleThroughDbusHelper:
         helper.battery._last_fresh_time = _now() - 100
         helper.publish_battery(_FakeLoop())
         assert service["/SocBms"] == round(helper.battery.battery.soc, 2)
-        assert service["/SocBms"] != service["/Soc"]
         assert service["/CapacityBms"] == 170.0
+
+        # The served SoC is anchored on the BMS reading, so the two agree at
+        # engagement and only separate as the shunt travels. Move the shunt
+        # and they must diverge by exactly that travel, which is the whole
+        # point of keeping the comparison path.
+        helper.battery.dbus_fallback_objects["Soc"].value = _LIVE_SHUNT["Soc"] - 4.0
+        helper.publish_battery(_FakeLoop())
+        assert service["/Soc"] == pytest.approx(service["/SocBms"] - 4.0)
 
     def test_a_cell_blind_battery_never_publishes_an_invalid_charge_limit(self, monkeypatch):
         # velib maps a None publish to *invalid* rather than refusing it, and
@@ -1247,8 +1333,8 @@ class TestPublishCycleThroughDbusHelper:
         assert service["/Dc/0/Voltage"] == 25.5
         assert service["/Dc/0/Current"] == -12.0
         assert service["/Dc/0/Temperature"] == 21.0
-        assert service["/Soc"] == 61.0
-        assert service["/Capacity"] == pytest.approx(280.0 * 61.0 / 100)
+        assert service["/Soc"] == 55.0
+        assert service["/Capacity"] == pytest.approx(280.0 * 55.0 / 100)
         assert service["/System/NrOfModulesOnline"] == 0
         assert service["/System/NrOfModulesOffline"] == 1
         assert service["/Mgmt/Connection"] == "BLE AA:BB - FALLBACK: on shunt"
