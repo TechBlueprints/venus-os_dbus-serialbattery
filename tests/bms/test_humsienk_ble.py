@@ -644,3 +644,34 @@ def test_bms_uptime_moving_forward_is_not_reported(caplog):
 
     assert bms._bms_uptime_minutes == 3 * 1440 + 4 * 60 + 6
     assert "restarted" not in caplog.text
+
+
+def test_frames_the_driver_never_requested_are_reported(caplog):
+    # The vendor app has handlers for 0x12, 0x23, 0x55, 0x56 and 0xF3 and sends
+    # none of them, so if they arrive they arrive unprompted. They were being
+    # discarded at debug level, which is invisible at the configured log level.
+    bms = make_bms()
+
+    with caplog.at_level(logging.INFO):
+        bms._parse_and_update(frame(0x55, bytes.fromhex("deadbeef")))
+
+    assert "unsolicited 0x55" in caplog.text
+    assert "deadbeef" in caplog.text
+
+
+def test_an_unsolicited_frame_is_rate_limited_per_command(caplog):
+    # A BMS pushing one of these continuously must not flood the log, and the
+    # count has to keep rising so the rate is still visible.
+    bms = make_bms()
+    for _ in range(3):
+        bms._parse_and_update(frame(0x55, b"\x01"))
+
+    caplog.clear()  # the first three are expected to report; only what follows matters
+    with caplog.at_level(logging.INFO):
+        for _ in range(20):
+            bms._parse_and_update(frame(0x55, b"\x01"))
+        bms._parse_and_update(frame(0x56, b"\x02"))
+
+    assert "unsolicited 0x55" not in caplog.text  # already reported 3 times
+    assert "unsolicited 0x56 frame #1" in caplog.text  # a different code still reports
+    assert bms._unsolicited_seen[0x55][0] == 23

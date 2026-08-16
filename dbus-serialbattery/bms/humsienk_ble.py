@@ -175,6 +175,7 @@ class HumsiENK_Ble(Battery):
         self._deadline = None  # caps a run of requests, see _request()
         self._bms_uptime_minutes = None  # DIAGNOSTIC, see _parse_status
         self._bms_uptime_logged = None
+        self._unsolicited_seen = {}  # DIAGNOSTIC, see _log_unsolicited
 
         logger.info("Init of HumsiENK_Ble at " + address)
 
@@ -421,7 +422,35 @@ class HumsiENK_Ble(Battery):
         elif command == self.CMD_VERSION:
             self._parse_version(data)
         else:
-            logger.debug(f"HumsiENK: ignoring response to unknown command 0x{command:02X}")
+            self._log_unsolicited(command, data)
+
+    def _log_unsolicited(self, command: int, data: bytes) -> None:
+        """
+        DIAGNOSTIC, merge branch only, do not port to the driver PR.
+
+        Report frames the driver never asked for. The vendor app carries
+        handlers for 0x12, 0x23, 0x55, 0x56 and 0xF3 and issues none of them,
+        so either the BMS pushes them unprompted or they are dead code. Two
+        would be worth having: 0x56 reads as a fault count, and 0x55 begins
+        with a date and time, which would say whether the packs share a clock.
+
+        Nothing is sent to find out. This only surfaces what already arrives,
+        which the driver has been discarding at debug level.
+
+        Rate limited per command code so a chatty BMS cannot flood the log.
+
+        :param command: the unrecognised command code
+        :param data: the frame payload
+        :return: None
+        """
+        seen = self._unsolicited_seen.get(command)
+        count = (seen[0] if seen else 0) + 1
+        last = seen[1] if seen else 0.0
+        now = time.time()
+        if count <= 3 or (now - last) >= 900:
+            logger.info(f"HumsiENK: unsolicited 0x{command:02X} frame #{count}, {len(data)} bytes: {data.hex()}")
+            last = now
+        self._unsolicited_seen[command] = (count, last)
 
     def _parse_battery_info(self, data: bytes) -> None:
         """
