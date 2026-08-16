@@ -110,8 +110,12 @@ class FallbackBattery:
     # ── recovery ladder ──────────────────────────────────────────────────
     #: How long the wrapper may serve the shunt with zero fresh BMS data
     #: before it assumes the driver's reconnect machinery is wedged rather
-    #: than the BMS being away, and acts.
-    STALL_MINUTES = 10.0
+    #: than the BMS being away, and acts. Long on purpose: a BMS can be
+    #: legitimately unreachable for a while (a radio that needs quiet, a
+    #: pack woken by a charger), and acting on a healthy outage costs more
+    #: than waiting through one, since the fallback sensor is measuring
+    #: throughout.
+    STALL_MINUTES = 30.0
     #: In-process BLE thread rebuilds tried before giving up and asking
     #: for a driver restart.
     STALL_MAX_REBUILDS = 2
