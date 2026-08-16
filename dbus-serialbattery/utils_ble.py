@@ -600,24 +600,31 @@ class BCMBackend(BleConnectionBackend):
                 logger.info(f"BLE [{address}] connected on preferred adapter {adapters[0]} via ConnectDevice")
                 return _ble_device(address, path), [adapters[0]], True
 
+        # Cache-first resolution can hand back an object cached on a NON-allowed
+        # adapter: with several batteries in range of several radios, each
+        # driver's scans cache every device they see, including the ones pinned
+        # elsewhere. Connecting through it would silently break the allow-list,
+        # so the entry is evicted - and then the scan is worth repeating,
+        # because the eviction is exactly what lets a fresh one resolve the
+        # device where it belongs. Two attempts at most, so a cache another
+        # process is actively refilling cannot spin here.
         device = None
-        try:
-            device = await bcm_find_device(address, timeout=15.0, max_attempts=2, adapters=adapters)
-        except Exception as e:
-            logger.warning(f"BLE [{address}] managed scan failed: {repr(e)}")
-
-        if device is not None:
-            # Cache-first resolution can hand back an object cached on a
-            # NON-allowed adapter, left over from an earlier connection
-            # there. Connecting through it silently breaks the allow-list,
-            # so evict it and fall through to ConnectDevice instead.
+        for attempt in range(2):
+            try:
+                device = await bcm_find_device(address, timeout=15.0, max_attempts=2 if attempt == 0 else 1, adapters=adapters)
+            except Exception as e:
+                logger.warning(f"BLE [{address}] managed scan failed: {repr(e)}")
+                device = None
+            if device is None:
+                break
             found_adapter = _adapter_of(device)
             if found_adapter is None:
                 return device, adapters, False
             if not adapters or found_adapter in adapters:
                 return device, [found_adapter], False
-            logger.info(f"BLE [{address}] cached on disallowed {found_adapter}, removing and using ConnectDevice on allowed adapters")
+            logger.info(f"BLE [{address}] cached on disallowed {found_adapter}, removing and re-resolving")
             await self._remove_cached_device(address, found_adapter)
+            device = None
 
         if address not in self._connect_device_unusable:
             for adapter in adapters or ["hci0"]:
