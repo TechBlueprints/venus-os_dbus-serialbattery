@@ -1,0 +1,1287 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from asyncio import timeout as asyncio_timeout
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from functools import lru_cache
+from struct import Struct
+from struct import error as struct_error
+from typing import TYPE_CHECKING, Any, cast
+
+from bluetooth_data_tools import monotonic_time_coarse
+from btsocket import btmgmt_socket
+from btsocket.btmgmt_socket import BluetoothSocketError
+
+from ..const import (
+    FAST_CONN_LATENCY,
+    FAST_CONN_TIMEOUT,
+    FAST_MAX_CONN_INTERVAL,
+    FAST_MIN_CONN_INTERVAL,
+    MEDIUM_CONN_LATENCY,
+    MEDIUM_CONN_TIMEOUT,
+    MEDIUM_MAX_CONN_INTERVAL,
+    MEDIUM_MIN_CONN_INTERVAL,
+    ConnectParams,
+)
+
+if TYPE_CHECKING:
+    import socket
+    from collections.abc import AsyncIterator, Callable
+
+    from ..base_scanner import BaseHaScanner
+
+_LOGGER = logging.getLogger(__name__)
+_int = int
+_bytes = bytes
+# Everything is little endian
+
+HEADER_SIZE = 6
+# Header is event_code (2 bytes), controller_idx (2 bytes), param_len (2 bytes)
+DEVICE_FOUND = 0x0012
+ADV_MONITOR_DEVICE_FOUND = 0x002F
+
+# Management commands
+MGMT_OP_LOAD_LONG_TERM_KEYS = 0x0013
+MGMT_OP_DISCONNECT = 0x0014
+MGMT_OP_GET_CONNECTIONS = 0x0015
+MGMT_OP_PAIR_DEVICE = 0x0019
+MGMT_OP_UNPAIR_DEVICE = 0x001B
+MGMT_OP_START_DISCOVERY = 0x0023
+MGMT_OP_STOP_DISCOVERY = 0x0024
+MGMT_OP_LOAD_CONN_PARAM = 0x0035
+MGMT_OP_ADD_ADV_PATTERNS_MONITOR = 0x0052
+MGMT_OP_REMOVE_ADV_MONITOR = 0x0053
+
+# IO capability for pairing; NoInputNoOutput selects "Just Works" (no PIN or
+# passkey prompt), which is what a headless host can satisfy.
+IO_CAPABILITY_NO_INPUT_NO_OUTPUT = 0x03
+
+# Management events
+MGMT_EV_CMD_COMPLETE = 0x0001
+MGMT_EV_CMD_STATUS = 0x0002
+MGMT_EV_NEW_LONG_TERM_KEY = 0x000A
+MGMT_EV_USER_CONFIRM_REQUEST = 0x000F
+MGMT_EV_USER_PASSKEY_REQUEST = 0x0010
+MGMT_EV_AUTH_FAILED = 0x0011
+MGMT_OP_USER_CONFIRM_REPLY = 0x001C
+MGMT_OP_USER_CONFIRM_NEG_REPLY = 0x001D
+MGMT_OP_USER_PASSKEY_REPLY = 0x001E
+MGMT_OP_USER_PASSKEY_NEG_REPLY = 0x001F
+
+# Discovery address-type bitmask: BR/EDR (0x01) | LE Public (0x02) | LE Random (0x04).
+# We only scan for LE devices, so we combine the two LE bits.
+SCAN_TYPE_LE = 0x06
+
+# Management command status codes
+MGMT_STATUS_SUCCESS = 0x00
+# Busy means another mgmt client (e.g. bluetoothd) already started discovery;
+# device-found events are still delivered to every open socket, so we treat it
+# as success for our purposes.
+MGMT_STATUS_BUSY = 0x0A
+
+# Pre-compiled struct formats for performance
+COMMAND_HEADER = Struct("<HHH")
+COMMAND_HEADER_PACK = COMMAND_HEADER.pack
+CONN_PARAM_STRUCT = Struct("<H6sBHHHH")
+CONN_PARAM_PACK = CONN_PARAM_STRUCT.pack
+# START/STOP_DISCOVERY carry a single address-type bitmask byte.
+DISCOVERY_STRUCT = Struct("<B")
+DISCOVERY_PACK = DISCOVERY_STRUCT.pack
+# REMOVE_ADV_MONITOR carries a uint16 monitor handle.
+MONITOR_HANDLE_STRUCT = Struct("<H")
+MONITOR_HANDLE_PACK = MONITOR_HANDLE_STRUCT.pack
+MONITOR_HANDLE_UNPACK = MONITOR_HANDLE_STRUCT.unpack
+# DISCONNECT carries bdaddr (6) + address type (1).
+DISCONNECT_STRUCT = Struct("<6sB")
+DISCONNECT_PACK = DISCONNECT_STRUCT.pack
+# PAIR_DEVICE carries bdaddr (6) + address type (1) + IO capability (1).
+PAIR_DEVICE_STRUCT = Struct("<6sBB")
+PAIR_DEVICE_PACK = PAIR_DEVICE_STRUCT.pack
+# UNPAIR_DEVICE carries bdaddr (6) + address type (1) + disconnect flag (1).
+UNPAIR_DEVICE_STRUCT = Struct("<6sBB")
+UNPAIR_DEVICE_PACK = UNPAIR_DEVICE_STRUCT.pack
+# USER_*_REPLY (confirm + passkey-negative) carry bdaddr (6) + address type (1).
+USER_REPLY_STRUCT = Struct("<6sB")
+USER_REPLY_PACK = USER_REPLY_STRUCT.pack
+# USER_PASSKEY_REPLY adds a uint32 passkey.
+USER_PASSKEY_REPLY_STRUCT = Struct("<6sBI")
+USER_PASSKEY_REPLY_PACK = USER_PASSKEY_REPLY_STRUCT.pack
+# USER_CONFIRMATION_REQUEST event = bdaddr (6) + type (1) + confirm_hint (1) +
+# value (4); USER_PASSKEY_REQUEST event = bdaddr (6) + type (1).
+_USER_CONFIRM_REQ_EV_SIZE = 12
+_USER_PASSKEY_REQ_EV_SIZE = 7
+# LOAD_LONG_TERM_KEYS carries a uint16 key count followed by mgmt_ltk_info
+# records: bdaddr (6) + address type (1) + key type (1) + central flag (1) +
+# encryption size (1) + ediv (2) + rand (8) + value (16) = 36 bytes each.
+LTK_COUNT_STRUCT = Struct("<H")
+LTK_COUNT_PACK = LTK_COUNT_STRUCT.pack
+LTK_INFO_STRUCT = Struct("<6sBBBBH8s16s")
+LTK_INFO_PACK = LTK_INFO_STRUCT.pack
+LTK_INFO_UNPACK = LTK_INFO_STRUCT.unpack
+LTK_INFO_SIZE = LTK_INFO_STRUCT.size  # 36
+_LTK_RAND_LEN = 8
+_LTK_VALUE_LEN = 16
+# NEW_LONG_TERM_KEY event = store_hint (1) + an mgmt_ltk_info record.
+_NEW_LTK_EV_SIZE = 1 + LTK_INFO_SIZE
+# AUTH_FAILED event = bdaddr (6) + address type (1) + status (1).
+_AUTH_FAILED_EV_SIZE = 8
+
+CONNECTION_ERRORS = (
+    BluetoothSocketError,
+    OSError,
+    asyncio.TimeoutError,
+    PermissionError,
+)
+
+
+def _set_future_if_not_done(future: asyncio.Future[None] | None) -> None:
+    """Set the future result if not done."""
+    if future is not None and not future.done():
+        future.set_result(None)
+
+
+def _command_succeeded(result: tuple[int, bytes] | None) -> bool:
+    """Whether a mgmt command returned the SUCCESS status."""
+    return result is not None and result[0] == MGMT_STATUS_SUCCESS
+
+
+def _result_status_text(result: tuple[int, bytes] | None) -> str:
+    """Describe a mgmt command result for logging: no response, or its status."""
+    return "no response" if result is None else f"status={result[0]:#x}"
+
+
+@dataclass(slots=True, frozen=True)
+class LongTermKey:
+    """
+    A bonded LE long-term key (the mgmt ``mgmt_ltk_info`` record).
+
+    These are captured from NEW_LONG_TERM_KEY events when pairing completes and
+    fed back via :meth:`MGMTBluetoothCtl.load_long_term_keys` on reconnect so the
+    kernel re-encrypts the link without re-pairing. ``rand`` is 8 bytes and
+    ``value`` is 16 bytes.
+    """
+
+    address: str
+    address_type: int
+    key_type: int
+    central: bool  # the mgmt API calls this "master"
+    encryption_size: int
+    ediv: int
+    rand: bytes
+    value: bytes
+
+
+@dataclass(slots=True, frozen=True)
+class NewLongTermKey:
+    """A NEW_LONG_TERM_KEY event: a freshly bonded key to persist."""
+
+    store_hint: int  # non-zero means the kernel suggests persisting the key
+    key: LongTermKey
+
+
+@dataclass(slots=True, frozen=True)
+class AuthenticationFailed:
+    """An AUTHENTICATION_FAILED event: pairing did not complete."""
+
+    address: str
+    address_type: int
+    status: int
+
+
+@dataclass(slots=True, frozen=True)
+class UserConfirmationRequest:
+    """A USER_CONFIRMATION_REQUEST event: confirm a numeric comparison value."""
+
+    address: str
+    address_type: int
+    # Per the mgmt API: when set, the value is not relevant and the user should
+    # just confirm the pairing (yes/no, no number to show); when 0, ``value``
+    # holds the number to display for comparison.
+    confirm_hint: int
+    value: int  # the 6-digit numeric comparison value (when confirm_hint is 0)
+
+
+@dataclass(slots=True, frozen=True)
+class UserPasskeyRequest:
+    """A USER_PASSKEY_REQUEST event: the peer wants a passkey entered."""
+
+    address: str
+    address_type: int
+
+
+if TYPE_CHECKING:
+    PairingEvent = (
+        NewLongTermKey
+        | AuthenticationFailed
+        | UserConfirmationRequest
+        | UserPasskeyRequest
+    )
+    PairingHandler = Callable[[PairingEvent], None]
+
+
+def _mgmt_address_bytes(address: str) -> bytes | None:
+    """
+    Pack ``AA:BB:CC:DD:EE:FF`` into the 6 little-endian bytes mgmt expects.
+
+    Returns ``None`` for a malformed address (the caller treats that as a soft
+    failure rather than raising into the mgmt command path).
+    """
+    try:
+        addr_bytes = bytes.fromhex(address.replace(":", ""))
+    except ValueError:
+        return None
+    if len(addr_bytes) != 6:
+        return None
+    return addr_bytes[::-1]
+
+
+@lru_cache(maxsize=512)
+def bytes_mac_to_str(mac: bytes) -> str:
+    """Convert a MAC address in bytes to a string in big-endian (MSB-first) order."""
+    return ":".join(f"{b:02X}" for b in reversed(mac))
+
+
+@lru_cache(maxsize=512)
+def make_bluez_details(address: str, adapter: str) -> dict[str, Any]:
+    """Make the BlueZ details dict for a raw advertisement."""
+    base_path = f"/org/bluez/{adapter}"
+    return {
+        "path": f"{base_path}/dev_{address.replace(':', '_')}",
+        "props": {
+            "Adapter": base_path,
+        },
+    }
+
+
+class BluetoothMGMTProtocol:
+    """Bluetooth MGMT protocol."""
+
+    def __init__(
+        self,
+        connection_made_future: asyncio.Future[None],
+        scanners: dict[int, BaseHaScanner],
+        on_connection_lost: Callable[[], None],
+        is_shutting_down: Callable[[], bool],
+        sock: socket.socket,
+        pairing_handlers: dict[tuple[int, str], PairingHandler],
+    ) -> None:
+        """Initialize the protocol."""
+        self.transport: asyncio.Transport | None = None
+        self.connection_made_future = connection_made_future
+        self._buffer: bytes | None = None
+        self._buffer_len = 0
+        self._pos = 0
+        self._scanners = scanners
+        # Shared by reference with MGMTBluetoothCtl; keyed by
+        # (controller_idx, peer address) so pairing events route to the client
+        # that registered for them.
+        self._pairing_handlers = pairing_handlers
+        self._on_connection_lost = on_connection_lost
+        self._is_shutting_down = is_shutting_down
+        # Keyed by (opcode, controller_idx) so the same command can be in flight
+        # on more than one adapter at once without the responses colliding.
+        self._pending_commands: dict[
+            tuple[int, int], asyncio.Future[tuple[int, bytes]]
+        ] = {}
+        self._sock = sock
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        """Handle connection made."""
+        _set_future_if_not_done(self.connection_made_future)
+        self.transport = cast("asyncio.Transport", transport)
+
+    def _write_to_socket(self, data: bytes) -> None:
+        """
+        Write data directly to the socket, bypassing asyncio transport.
+
+        This works around a kernel bug where sendto() on Bluetooth management
+        sockets returns 0 instead of the number of bytes sent on some platforms
+        (e.g., Odroid M1 with kernel 6.12.43). When asyncio sees 0, it thinks
+        the send failed and retries forever.
+
+        Since mgmt sockets are SOCK_RAW, sends are atomic - either the entire
+        packet is sent or nothing is sent.
+        """
+        try:
+            n = self._sock.send(data)
+            # On buggy kernels, n might be 0 even though the data was sent
+            # We treat 0 as success for mgmt sockets
+            if n == 0 and len(data) > 0:
+                # Kernel bug: returned 0 but data was actually sent
+                _LOGGER.debug(
+                    "Bluetooth mgmt socket returned 0 for %d bytes (kernel bug fix)",
+                    len(data),
+                )
+        except Exception:
+            _LOGGER.exception("Failed to write to mgmt socket")
+            raise
+
+    @asynccontextmanager
+    async def command_response(
+        self, opcode: int, controller_idx: int
+    ) -> AsyncIterator[asyncio.Future[tuple[int, bytes]]]:
+        """
+        Context manager for handling command responses.
+
+        Only one command per (opcode, controller_idx) may be in flight at a
+        time: a second concurrent call with the same key overwrites the first
+        waiter, which would then never resolve. The mgmt command wrappers never
+        double-issue the same command on one adapter, so this is sufficient.
+
+        Usage:
+            async with protocol.command_response(opcode, controller_idx) as future:
+                transport.write(command)
+                status, data = await future
+        """
+        future: asyncio.Future[tuple[int, bytes]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        key = (opcode, controller_idx)
+        self._pending_commands[key] = future
+        try:
+            yield future
+        finally:
+            # Clean up if the future wasn't resolved
+            self._pending_commands.pop(key, None)
+
+    def _add_to_buffer(self, data: bytes | bytearray | memoryview) -> None:
+        """Add data to the buffer."""
+        # Protractor sends a bytearray, so we need to convert it to bytes
+        # https://github.com/esphome/issues/issues/5117
+        # type(data) should not be isinstance(data, bytes) because we want to
+        # to explicitly check for bytes and not for subclasses of bytes
+        bytes_data = bytes(data) if type(data) is not bytes else data
+        if self._buffer_len == 0:
+            # This is the best case scenario, we don't have to copy the data
+            # and can just use the buffer directly. This is the most common
+            # case as well.
+            self._buffer = bytes_data
+        else:
+            if TYPE_CHECKING:
+                assert self._buffer is not None, "Buffer should be set"
+            # This is the worst case scenario, we have to copy the bytes_data
+            # and can't just use the buffer directly. This is also very
+            # uncommon since we usually read the entire frame at once.
+            self._buffer += bytes_data
+        self._buffer_len += len(bytes_data)
+
+    def _remove_from_buffer(self) -> None:
+        """Remove data from the buffer."""
+        end_of_frame_pos = self._pos
+        self._buffer_len -= end_of_frame_pos
+        if self._buffer_len == 0:
+            # This is the best case scenario, we can just set the buffer to None
+            # and don't have to copy the data. This is the most common case as well.
+            self._buffer = None
+            return
+        if TYPE_CHECKING:
+            assert self._buffer is not None, "Buffer should be set"
+        # This is the worst case scenario, we have to copy the data
+        # and can't just use the buffer directly. This should only happen
+        # when we read multiple frames at once because the event loop
+        # is blocked and we cannot pull the data out of the buffer fast enough.
+        cstr = self._buffer
+        # Important: we must use the explicit length for the slice
+        # since Cython will stop at any '\0' character if we don't
+        self._buffer = cstr[end_of_frame_pos : self._buffer_len + end_of_frame_pos]
+
+    def data_received(self, data: _bytes) -> None:  # noqa: C901
+        """Handle data received."""
+        self._add_to_buffer(data)
+        while self._buffer_len >= 6:
+            if TYPE_CHECKING:
+                assert self._buffer is not None, "Buffer should be set"
+            self._pos = 6
+            header = self._buffer
+            event_code = header[0] | (header[1] << 8)
+            controller_idx = header[2] | (header[3] << 8)
+            param_len = header[4] | (header[5] << 8)
+            if self._buffer_len < self._pos + param_len:
+                # We don't have the entire frame yet, so we need to wait
+                # for more data to arrive.
+                return
+            self._pos += param_len
+            if event_code == DEVICE_FOUND:
+                parse_offset = 6
+            elif event_code == ADV_MONITOR_DEVICE_FOUND:
+                parse_offset = 8
+            elif event_code in {MGMT_EV_CMD_COMPLETE, MGMT_EV_CMD_STATUS}:
+                # Handle management command responses
+                if param_len >= 3:
+                    opcode = header[6] | (header[7] << 8)
+                    status = header[8]
+                    if opcode == MGMT_OP_LOAD_CONN_PARAM:
+                        # Fire-and-forget command, no waiter to resolve.
+                        self._handle_load_conn_param_response(status, controller_idx)
+                    elif (
+                        future := self._pending_commands.get((opcode, controller_idx))
+                    ) is not None:
+                        # Resolve whatever awaited this (opcode, controller_idx):
+                        # capability check, discovery, advertisement monitor, etc.
+                        del self._pending_commands[(opcode, controller_idx)]
+                        if not future.done():
+                            response_data = (
+                                header[9 : self._pos] if param_len > 3 else b""
+                            )
+                            future.set_result((status, response_data))
+                self._remove_from_buffer()
+                continue
+            elif event_code == MGMT_EV_NEW_LONG_TERM_KEY:
+                self._handle_new_long_term_key(controller_idx, header[6 : self._pos])
+                self._remove_from_buffer()
+                continue
+            elif event_code == MGMT_EV_AUTH_FAILED:
+                self._handle_auth_failed(controller_idx, header[6 : self._pos])
+                self._remove_from_buffer()
+                continue
+            elif event_code == MGMT_EV_USER_CONFIRM_REQUEST:
+                self._handle_user_confirm_request(controller_idx, header[6 : self._pos])
+                self._remove_from_buffer()
+                continue
+            elif event_code == MGMT_EV_USER_PASSKEY_REQUEST:
+                self._handle_user_passkey_request(controller_idx, header[6 : self._pos])
+                self._remove_from_buffer()
+                continue
+            else:
+                self._remove_from_buffer()
+                continue
+            address = header[parse_offset : parse_offset + 6]
+            rssi = header[parse_offset + 7]
+            if rssi > 128:
+                rssi -= 256
+
+            # Skip address_type (+6), flags (+8..+11) and AD_Data_Length
+            # (+12..+13); the advertising data payload starts at +14.
+            data = header[parse_offset + 14 : self._pos]
+            self._remove_from_buffer()
+
+            if (scanner := self._scanners.get(controller_idx)) is not None:
+                # Adapt the raw BlueZ advertisement onto the generic ingestion
+                # path. The BlueZ-specific bits (MAC byte order, object path)
+                # live here in the channel rather than on the scanner classes,
+                # which only expose the platform-agnostic _async_on_raw_advertisement.
+                address_str = bytes_mac_to_str(address)
+                scanner._async_on_raw_advertisement(
+                    address_str,
+                    rssi,
+                    data,
+                    make_bluez_details(address_str, scanner.adapter),
+                    monotonic_time_coarse(),
+                )
+
+    def _handle_new_long_term_key(self, controller_idx: _int, param: _bytes) -> None:
+        """Decode a NEW_LONG_TERM_KEY event and route it to its handler."""
+        if len(param) < _NEW_LTK_EV_SIZE:
+            _LOGGER.debug("hci%u: truncated NEW_LONG_TERM_KEY event", controller_idx)
+            return
+        store_hint = param[0]
+        addr, addr_type, key_type, central, enc_size, ediv, rand, value = (
+            LTK_INFO_UNPACK(param[1 : 1 + LTK_INFO_SIZE])
+        )
+        address = bytes_mac_to_str(addr)
+        if (handler := self._pairing_handlers.get((controller_idx, address))) is None:
+            return
+        self._dispatch_pairing_event(
+            handler,
+            NewLongTermKey(
+                store_hint,
+                LongTermKey(
+                    address,
+                    addr_type,
+                    key_type,
+                    bool(central),
+                    enc_size,
+                    ediv,
+                    rand,
+                    value,
+                ),
+            ),
+        )
+
+    def _handle_auth_failed(self, controller_idx: _int, param: _bytes) -> None:
+        """Decode an AUTHENTICATION_FAILED event and route it to its handler."""
+        if len(param) < _AUTH_FAILED_EV_SIZE:
+            _LOGGER.debug("hci%u: truncated AUTH_FAILED event", controller_idx)
+            return
+        address = bytes_mac_to_str(param[0:6])
+        if (handler := self._pairing_handlers.get((controller_idx, address))) is None:
+            return
+        self._dispatch_pairing_event(
+            handler, AuthenticationFailed(address, param[6], param[7])
+        )
+
+    def _handle_user_confirm_request(self, controller_idx: _int, param: _bytes) -> None:
+        """Decode a USER_CONFIRMATION_REQUEST event and route it to its handler."""
+        if len(param) < _USER_CONFIRM_REQ_EV_SIZE:
+            _LOGGER.debug("hci%u: truncated USER_CONFIRM_REQUEST event", controller_idx)
+            return
+        address = bytes_mac_to_str(param[0:6])
+        if (handler := self._pairing_handlers.get((controller_idx, address))) is None:
+            return
+        value = int.from_bytes(param[8:12], "little")
+        self._dispatch_pairing_event(
+            handler, UserConfirmationRequest(address, param[6], param[7], value)
+        )
+
+    def _handle_user_passkey_request(self, controller_idx: _int, param: _bytes) -> None:
+        """Decode a USER_PASSKEY_REQUEST event and route it to its handler."""
+        if len(param) < _USER_PASSKEY_REQ_EV_SIZE:
+            _LOGGER.debug("hci%u: truncated USER_PASSKEY_REQUEST event", controller_idx)
+            return
+        address = bytes_mac_to_str(param[0:6])
+        if (handler := self._pairing_handlers.get((controller_idx, address))) is None:
+            return
+        self._dispatch_pairing_event(handler, UserPasskeyRequest(address, param[6]))
+
+    def _dispatch_pairing_event(
+        self, handler: PairingHandler, event: PairingEvent
+    ) -> None:
+        """Call a pairing handler, isolating it from the socket read loop."""
+        # data_received runs in the read loop, so a raising handler must not tear
+        # down event demux for the whole mgmt connection.
+        try:
+            handler(event)
+        except Exception:
+            _LOGGER.exception("Error in %s handler", type(event).__name__)
+
+    def _handle_load_conn_param_response(
+        self, status: _int, controller_idx: _int
+    ) -> None:
+        """Handle MGMT_OP_LOAD_CONN_PARAM response."""
+        if status != 0:
+            _LOGGER.warning(
+                "hci%u: Failed to load conn params: status=%d",
+                controller_idx,
+                status,
+            )
+        else:
+            _LOGGER.debug(
+                "hci%u: Connection parameters loaded successfully",
+                controller_idx,
+            )
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        """Handle connection lost."""
+        # Only suppress warnings during shutdown, not info messages
+        if exc:
+            if not self._is_shutting_down():
+                _LOGGER.warning("Bluetooth management socket connection lost: %s", exc)
+        else:
+            _LOGGER.info("Bluetooth management socket connection closed")
+        self.transport = None
+        self._on_connection_lost()
+
+
+class MGMTBluetoothCtl:
+    """Class to control interfaces using the BlueZ management API."""
+
+    def __init__(self, timeout: float, scanners: dict[int, BaseHaScanner]) -> None:
+        """Initialize the control class."""
+        # Internal state
+        self.timeout = timeout
+        self.protocol: BluetoothMGMTProtocol | None = None
+        self.sock: socket.socket | None = None
+        self.scanners = scanners
+        # Pairing-event handlers keyed by (controller_idx, peer address); shared
+        # by reference with each protocol instance so registrations survive a
+        # socket reconnect.
+        self._pairing_handlers: dict[tuple[int, str], PairingHandler] = {}
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._on_connection_lost_future: asyncio.Future[None] | None = None
+        self._shutting_down = False
+        # Set once setup() confirms NET_ADMIN/NET_RAW; the same privileges that
+        # allow the capability probe allow driving discovery over the socket.
+        self.can_discover = False
+
+    def close(self) -> None:
+        """Close the management interface."""
+        self._shutting_down = True
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+        if self.protocol and self.protocol.transport:
+            self.protocol.transport.close()
+            self.protocol = None
+        btmgmt_socket.close(self.sock)
+
+    def _on_connection_lost(self) -> None:
+        """Handle connection lost."""
+        if self._shutting_down:
+            _LOGGER.debug("Bluetooth management socket connection lost during shutdown")
+        else:
+            _LOGGER.debug("Bluetooth management socket connection lost, reconnecting")
+        _set_future_if_not_done(self._on_connection_lost_future)
+        self._on_connection_lost_future = None
+
+    async def reconnect_task(self) -> None:
+        """Monitor the connection and reconnect if needed."""
+        while not self._shutting_down:
+            if self._on_connection_lost_future:
+                await self._on_connection_lost_future
+            if self._shutting_down:
+                break  # type: ignore[unreachable]
+            _LOGGER.debug("Reconnecting to Bluetooth management socket")
+            try:
+                await self._establish_connection()
+            except CONNECTION_ERRORS:
+                _LOGGER.debug("Bluetooth management socket connection timed out")
+                # If we get a timeout, we should try to reconnect
+                # after a short delay
+                await asyncio.sleep(1)
+
+    async def _establish_connection(self) -> None:
+        """Establish a connection to the Bluetooth management socket."""
+        _LOGGER.debug("Establishing Bluetooth management socket connection")
+        self.sock = btmgmt_socket.open()
+        loop = asyncio.get_running_loop()
+        connection_made_future: asyncio.Future[None] = loop.create_future()
+        try:
+            async with asyncio_timeout(self.timeout):
+                # _create_connection_transport accessed
+                # directly to avoid SOCK_STREAM check
+                # see https://bugs.python.org/issue38285
+                _, protocol = await loop._create_connection_transport(  # type: ignore[attr-defined]
+                    self.sock,
+                    lambda: BluetoothMGMTProtocol(
+                        connection_made_future,
+                        self.scanners,
+                        self._on_connection_lost,
+                        lambda: self._shutting_down,
+                        self.sock,
+                        self._pairing_handlers,
+                    ),
+                    None,
+                    None,
+                )
+                await connection_made_future
+        except TimeoutError:
+            btmgmt_socket.close(self.sock)
+            raise
+        _LOGGER.debug("Bluetooth management socket connection established")
+        self.protocol = cast("BluetoothMGMTProtocol", protocol)
+        self._on_connection_lost_future = loop.create_future()
+
+    def _has_mgmt_capabilities_from_status(self, status: int) -> bool:
+        """
+        Check if a MGMT command status indicates we have capabilities.
+
+        Returns True if we have capabilities, False otherwise.
+
+        Status codes:
+        - 0x00 = Success (we have permissions)
+        - 0x01 = Unknown Command (might happen if kernel is too old)
+        - 0x0D = Invalid Parameters
+        - 0x10 = Not Powered (for some operations)
+        - 0x11 = Invalid Index (adapter doesn't exist but we have permissions)
+        - 0x14 = Permission Denied (missing NET_ADMIN/NET_RAW)
+        """
+        if status == 0x14:  # Permission denied
+            _LOGGER.debug(
+                "MGMT capability check failed with permission denied - "
+                "missing NET_ADMIN/NET_RAW"
+            )
+            return False
+        if status in (0x00, 0x11):  # Success or Invalid Index
+            _LOGGER.debug("MGMT capability check passed (status: %#x)", status)
+            return True
+        # Unknown status - log it and assume no permissions to be safe
+        _LOGGER.debug(
+            "MGMT capability check returned unexpected status %#x - "
+            "assuming missing permissions",
+            status,
+        )
+        return False
+
+    async def _check_capabilities(self) -> bool:
+        """
+        Check if we have the necessary capabilities to use MGMT.
+
+        Returns True if we have capabilities, False otherwise.
+        """
+        if not self.protocol or not self.protocol.transport:
+            return False
+
+        # Try GET_CONNECTIONS for adapter 0 - this is a read-only command
+        # that requires NET_ADMIN privileges but doesn't change any state
+        header = COMMAND_HEADER_PACK(
+            MGMT_OP_GET_CONNECTIONS,  # opcode
+            0,  # controller index 0 (hci0)
+            0,  # no parameters
+        )
+
+        try:
+            return await self._do_mgmt_op_get_connections(header)
+        except (TimeoutError, OSError) as ex:
+            _LOGGER.debug(
+                "MGMT capability check failed: %s - likely missing NET_ADMIN/NET_RAW",
+                ex,
+            )
+            return False
+
+    async def _do_mgmt_op_get_connections(self, header: bytes) -> bool:
+        """Send a MGMT_OP_GET_CONNECTIONS command and check capabilities."""
+        if TYPE_CHECKING:
+            assert self.protocol is not None
+            assert self.protocol.transport is not None
+
+        async with self.protocol.command_response(
+            MGMT_OP_GET_CONNECTIONS, 0
+        ) as response_future:
+            self.protocol._write_to_socket(header)
+            # Wait for response with timeout
+            async with asyncio_timeout(5.0):
+                status, _ = await response_future
+            return self._has_mgmt_capabilities_from_status(status)
+
+    async def setup(self) -> None:
+        """Set up management interface."""
+        await self._establish_connection()
+
+        # Check if we actually have the capabilities to use MGMT
+        if not await self._check_capabilities():
+            # Mark as shutting down to prevent reconnection attempts
+            self._shutting_down = True
+            # Close the connection and raise an error to trigger fallback
+            if self.protocol and self.protocol.transport:
+                self.protocol.transport.close()
+            btmgmt_socket.close(self.sock)
+            msg = "Missing NET_ADMIN/NET_RAW capabilities for Bluetooth management"
+            raise PermissionError(msg)
+
+        self.can_discover = True
+        self._reconnect_task = asyncio.create_task(self.reconnect_task())
+
+    async def _send_command_await(
+        self, opcode: int, adapter_idx: int, cmd_data: bytes
+    ) -> tuple[int, bytes] | None:
+        """
+        Send a mgmt command and await its command-complete/status response.
+
+        Returns ``(status, response_params)``, or ``None`` if the socket is
+        down, the write fails, or no response arrives within the timeout.
+        """
+        if not self.protocol or not self.protocol.transport:
+            _LOGGER.error("Cannot send mgmt command %#x: no connection", opcode)
+            return None
+        header = COMMAND_HEADER_PACK(opcode, adapter_idx, len(cmd_data))
+        try:
+            async with self.protocol.command_response(opcode, adapter_idx) as future:
+                # _write_to_socket can raise OSError or BluetoothSocketError when
+                # the socket has gone away; treat any of these as a soft failure.
+                self.protocol._write_to_socket(header + cmd_data)
+                async with asyncio_timeout(self.timeout):
+                    return await future
+        except (TimeoutError, OSError, BluetoothSocketError) as ex:
+            _LOGGER.debug("hci%u: mgmt command %#x failed: %s", adapter_idx, opcode, ex)
+            return None
+
+    async def start_discovery(self, adapter_idx: int) -> bool:
+        """
+        Start LE discovery on an adapter over the management socket.
+
+        Returns True if discovery is running, including the case where another
+        mgmt client (e.g. bluetoothd) already started it (BUSY); device-found
+        events are delivered to every open socket regardless of who started
+        discovery. A failure here means the adapter produces no advertisements,
+        so it is logged at warning level.
+        """
+        result = await self._send_command_await(
+            MGMT_OP_START_DISCOVERY, adapter_idx, DISCOVERY_PACK(SCAN_TYPE_LE)
+        )
+        if result is not None and result[0] in (
+            MGMT_STATUS_SUCCESS,
+            MGMT_STATUS_BUSY,
+        ):
+            return True
+        _LOGGER.warning(
+            "hci%u: failed to start discovery: %s",
+            adapter_idx,
+            _result_status_text(result),
+        )
+        return False
+
+    async def stop_discovery(self, adapter_idx: int) -> bool:
+        """
+        Stop LE discovery on an adapter over the management socket.
+
+        Only MGMT_STATUS_SUCCESS means discovery actually stopped. Unlike start,
+        a BUSY status here means the kernel did NOT stop discovery (e.g. another
+        mgmt client is still discovering), so it is not treated as success.
+        """
+        result = await self._send_command_await(
+            MGMT_OP_STOP_DISCOVERY, adapter_idx, DISCOVERY_PACK(SCAN_TYPE_LE)
+        )
+        if _command_succeeded(result):
+            return True
+        # Best-effort cleanup on a shared socket, so this stays at debug, but
+        # log the no-response case too for parity with the other wrappers.
+        _LOGGER.debug(
+            "hci%u: stop discovery did not stop: %s",
+            adapter_idx,
+            _result_status_text(result),
+        )
+        return False
+
+    async def add_adv_pattern_monitor(self, adapter_idx: int) -> int | None:
+        """
+        Register a match-all advertisement monitor for passive scanning.
+
+        A pattern_count of 0 tells the controller to report every
+        advertisement via ADV_MONITOR_DEVICE_FOUND. Returns the assigned
+        monitor handle (for later removal), or None on failure.
+        """
+        result = await self._send_command_await(
+            MGMT_OP_ADD_ADV_PATTERNS_MONITOR, adapter_idx, b"\x00"
+        )
+        if result is None:
+            return None
+        status, data = result
+        if status == MGMT_STATUS_SUCCESS:
+            if len(data) >= 2:
+                return MONITOR_HANDLE_UNPACK(data[:2])[0]
+            # Success without the 2-byte handle: the monitor may be registered
+            # in the controller but we cannot track it for later removal.
+            _LOGGER.warning(
+                "hci%u: add advertisement monitor succeeded without a handle",
+                adapter_idx,
+            )
+            return None
+        _LOGGER.warning(
+            "hci%u: failed to add advertisement monitor: status=%#x",
+            adapter_idx,
+            status,
+        )
+        return None
+
+    async def remove_adv_monitor(self, adapter_idx: int, handle: int) -> bool:
+        """Remove a previously registered advertisement monitor by handle."""
+        result = await self._send_command_await(
+            MGMT_OP_REMOVE_ADV_MONITOR, adapter_idx, MONITOR_HANDLE_PACK(handle)
+        )
+        if _command_succeeded(result):
+            return True
+        # A failed removal leaves the monitor registered controller-side, so
+        # surface it at warning level to make a leaked handle diagnosable.
+        _LOGGER.warning(
+            "hci%u: failed to remove advertisement monitor %u: %s",
+            adapter_idx,
+            handle,
+            _result_status_text(result),
+        )
+        return False
+
+    async def pair_device(
+        self,
+        adapter_idx: int,
+        address: str,
+        address_type: int,
+        io_capability: int = IO_CAPABILITY_NO_INPUT_NO_OUTPUT,
+    ) -> bool:
+        """
+        Pair (bond) with a device over the management socket.
+
+        ``io_capability`` defaults to NoInputNoOutput, which drives "Just Works"
+        pairing; the kernel performs SMP and stores the keys. Returns True when
+        the controller reports the pairing completed.
+        """
+        addr = _mgmt_address_bytes(address)
+        if addr is None:
+            _LOGGER.error("hci%u: invalid address to pair: %s", adapter_idx, address)
+            return False
+        result = await self._send_command_await(
+            MGMT_OP_PAIR_DEVICE,
+            adapter_idx,
+            PAIR_DEVICE_PACK(addr, address_type, io_capability),
+        )
+        if _command_succeeded(result):
+            return True
+        _LOGGER.warning(
+            "hci%u: failed to pair with %s: %s",
+            adapter_idx,
+            address,
+            _result_status_text(result),
+        )
+        return False
+
+    async def unpair_device(
+        self,
+        adapter_idx: int,
+        address: str,
+        address_type: int,
+        *,
+        disconnect: bool = True,
+    ) -> bool:
+        """Remove the bond for a device (and disconnect it by default)."""
+        addr = _mgmt_address_bytes(address)
+        if addr is None:
+            _LOGGER.error("hci%u: invalid address to unpair: %s", adapter_idx, address)
+            return False
+        result = await self._send_command_await(
+            MGMT_OP_UNPAIR_DEVICE,
+            adapter_idx,
+            UNPAIR_DEVICE_PACK(addr, address_type, 1 if disconnect else 0),
+        )
+        if _command_succeeded(result):
+            return True
+        _LOGGER.warning(
+            "hci%u: failed to unpair %s: %s",
+            adapter_idx,
+            address,
+            _result_status_text(result),
+        )
+        return False
+
+    async def disconnect_device(
+        self, adapter_idx: int, address: str, address_type: int
+    ) -> bool:
+        """Force-disconnect a device at the controller over the mgmt socket."""
+        addr = _mgmt_address_bytes(address)
+        if addr is None:
+            _LOGGER.error(
+                "hci%u: invalid address to disconnect: %s", adapter_idx, address
+            )
+            return False
+        result = await self._send_command_await(
+            MGMT_OP_DISCONNECT, adapter_idx, DISCONNECT_PACK(addr, address_type)
+        )
+        if _command_succeeded(result):
+            return True
+        _LOGGER.warning(
+            "hci%u: failed to disconnect %s: %s",
+            adapter_idx,
+            address,
+            _result_status_text(result),
+        )
+        return False
+
+    async def user_confirmation_reply(
+        self, adapter_idx: int, address: str, address_type: int, *, accept: bool = True
+    ) -> bool:
+        """Answer a USER_CONFIRMATION_REQUEST (numeric comparison) for a peer."""
+        opcode = (
+            MGMT_OP_USER_CONFIRM_REPLY if accept else MGMT_OP_USER_CONFIRM_NEG_REPLY
+        )
+        return await self._user_reply(
+            opcode, adapter_idx, address, USER_REPLY_PACK, (address_type,)
+        )
+
+    async def user_passkey_reply(
+        self, adapter_idx: int, address: str, address_type: int, passkey: int
+    ) -> bool:
+        """Answer a USER_PASSKEY_REQUEST with the entered passkey for a peer."""
+        return await self._user_reply(
+            MGMT_OP_USER_PASSKEY_REPLY,
+            adapter_idx,
+            address,
+            USER_PASSKEY_REPLY_PACK,
+            (address_type, passkey),
+        )
+
+    async def user_passkey_negative_reply(
+        self, adapter_idx: int, address: str, address_type: int
+    ) -> bool:
+        """Reject a USER_PASSKEY_REQUEST for a peer."""
+        return await self._user_reply(
+            MGMT_OP_USER_PASSKEY_NEG_REPLY,
+            adapter_idx,
+            address,
+            USER_REPLY_PACK,
+            (address_type,),
+        )
+
+    async def _user_reply(
+        self,
+        opcode: int,
+        adapter_idx: int,
+        address: str,
+        pack: Callable[..., bytes],
+        extra: tuple[int, ...],
+    ) -> bool:
+        """Send a USER_*_REPLY command for a peer and report success."""
+        addr = _mgmt_address_bytes(address)
+        if addr is None:
+            _LOGGER.error("hci%u: invalid address for reply: %s", adapter_idx, address)
+            return False
+        try:
+            # An out-of-range address_type or passkey raises struct.error; keep
+            # that a soft failure rather than letting it escape the command path.
+            payload = pack(addr, *extra)
+        except struct_error:
+            _LOGGER.exception(
+                "hci%u: invalid pairing reply parameters for %s", adapter_idx, address
+            )
+            return False
+        result = await self._send_command_await(opcode, adapter_idx, payload)
+        if _command_succeeded(result):
+            return True
+        _LOGGER.warning(
+            "hci%u: pairing reply %#x for %s failed: %s",
+            adapter_idx,
+            opcode,
+            address,
+            _result_status_text(result),
+        )
+        return False
+
+    async def load_long_term_keys(
+        self, adapter_idx: int, keys: list[LongTermKey]
+    ) -> bool:
+        """
+        Restore bonded long-term keys for an adapter.
+
+        Replaces the controller's LTK list (an empty list clears it) so the
+        kernel can re-encrypt links to already-bonded peers without re-pairing.
+
+        The mgmt API has no add-one primitive, so this writes the controller's
+        whole list. That list belongs to the controller and its kernel, not to
+        this process or container, so it is shared with every other mgmt client
+        on the same kernel: if host bluetoothd is still managing this controller,
+        loading our keys clears the bonds it loaded, and there is no way to import
+        those back (DBus never exposes key material, and bluetoothd's on-disk
+        store is not reachable from another container). The mgmt connect path
+        therefore requires a controller bluetoothd is not managing; see the Home
+        Assistant integration guide on per-adapter controller ownership.
+        """
+        records: list[bytes] = []
+        for key in keys:
+            addr = _mgmt_address_bytes(key.address)
+            if addr is None:
+                _LOGGER.error(
+                    "hci%u: invalid address in long-term key: %s",
+                    adapter_idx,
+                    key.address,
+                )
+                return False
+            if len(key.rand) != _LTK_RAND_LEN or len(key.value) != _LTK_VALUE_LEN:
+                _LOGGER.error(
+                    "hci%u: malformed long-term key for %s", adapter_idx, key.address
+                )
+                return False
+            try:
+                # Out-of-range integer fields (e.g. a corrupt key_type) raise
+                # struct.error; keep that a soft failure rather than letting it
+                # escape the command path.
+                record = LTK_INFO_PACK(
+                    addr,
+                    key.address_type,
+                    key.key_type,
+                    1 if key.central else 0,
+                    key.encryption_size,
+                    key.ediv,
+                    key.rand,
+                    key.value,
+                )
+            except struct_error:
+                _LOGGER.exception(
+                    "hci%u: out-of-range field in long-term key for %s",
+                    adapter_idx,
+                    key.address,
+                )
+                return False
+            records.append(record)
+        cmd_data = LTK_COUNT_PACK(len(keys)) + b"".join(records)
+        result = await self._send_command_await(
+            MGMT_OP_LOAD_LONG_TERM_KEYS, adapter_idx, cmd_data
+        )
+        if _command_succeeded(result):
+            return True
+        _LOGGER.warning(
+            "hci%u: failed to load %d long-term key(s): %s",
+            adapter_idx,
+            len(keys),
+            _result_status_text(result),
+        )
+        return False
+
+    def register_pairing_handler(
+        self, adapter_idx: int, address: str, handler: PairingHandler
+    ) -> Callable[[], None]:
+        """
+        Route NEW_LONG_TERM_KEY / AUTHENTICATION_FAILED events for a peer.
+
+        ``handler`` is called with a :class:`NewLongTermKey` or
+        :class:`AuthenticationFailed` for events on ``adapter_idx`` from
+        ``address``. Returns a callback that unregisters it.
+
+        ``address`` must be the canonical colon-separated form
+        (``AA:BB:CC:DD:EE:FF``); it is upper-cased to match the address the
+        event decoder produces, but any other shape (e.g. no colons) will simply
+        never match and the handler will not fire.
+
+        Registration is last-wins: a second call for the same
+        ``(adapter_idx, address)`` replaces the previous handler, and that
+        previous registration's unregister callback becomes a no-op. Handlers do
+        not stack.
+        """
+        key = (adapter_idx, address.upper())
+        self._pairing_handlers[key] = handler
+
+        def _unregister() -> None:
+            if self._pairing_handlers.get(key) is handler:
+                del self._pairing_handlers[key]
+
+        return _unregister
+
+    def load_conn_params(
+        self,
+        adapter_idx: int,
+        address: str,
+        address_type: int,
+        params: ConnectParams,
+    ) -> bool:
+        """
+        Load connection parameters for a specific device.
+
+        Args:
+            adapter_idx: Adapter index (e.g., 0 for hci0)
+            address: Device MAC address (e.g., "AA:BB:CC:DD:EE:FF")
+            address_type: BDADDR_LE_PUBLIC (1) or BDADDR_LE_RANDOM (2)
+            params: Connection parameters to load (ConnectParams.FAST or
+              ConnectParams.MEDIUM)
+
+        Returns:
+            True if command was sent successfully
+
+        """
+        if not self.protocol or not self.protocol.transport:
+            _LOGGER.error("Cannot load conn params: no connection")
+            return False
+
+        # Parse MAC address
+        addr_bytes = bytes.fromhex(address.replace(":", ""))
+        if len(addr_bytes) != 6:
+            _LOGGER.error("Invalid MAC address: %s", address)
+            return False
+
+        # Build command structure (C definitions from BlueZ mgmt-api.txt):
+        # struct mgmt_cp_load_conn_param {
+        #     uint16_t param_count;
+        #     struct mgmt_conn_param params[0];
+        # };
+        # struct mgmt_conn_param {
+        #     struct mgmt_addr_info addr;
+        #     uint16_t min_interval;
+        #     uint16_t max_interval;
+        #     uint16_t latency;
+        #     uint16_t timeout;
+        # };
+        # struct mgmt_addr_info {
+        #     bdaddr_t bdaddr;
+        #     uint8_t type;
+        # };
+
+        # Get the appropriate connection parameters based on the enum
+        if params is ConnectParams.FAST:
+            min_interval = FAST_MIN_CONN_INTERVAL
+            max_interval = FAST_MAX_CONN_INTERVAL
+            latency = FAST_CONN_LATENCY
+            timeout = FAST_CONN_TIMEOUT
+        else:  # params is ConnectParams.MEDIUM:
+            min_interval = MEDIUM_MIN_CONN_INTERVAL
+            max_interval = MEDIUM_MAX_CONN_INTERVAL
+            latency = MEDIUM_CONN_LATENCY
+            timeout = MEDIUM_CONN_TIMEOUT
+
+        # Pack the command
+        cmd_data = CONN_PARAM_PACK(
+            1,  # param_count = 1
+            addr_bytes[::-1],  # bdaddr (reversed for little endian)
+            address_type,  # address type
+            min_interval,  # min_interval
+            max_interval,  # max_interval
+            latency,  # latency
+            timeout,  # timeout
+        )
+
+        # Send the command
+        try:
+            header = COMMAND_HEADER_PACK(
+                MGMT_OP_LOAD_CONN_PARAM,  # opcode
+                adapter_idx,  # controller index
+                len(cmd_data),  # parameter length
+            )
+            self.protocol._write_to_socket(header + cmd_data)
+            _LOGGER.debug(
+                "Loaded conn params for %s: interval=%d-%d, latency=%d, timeout=%d",
+                address,
+                min_interval,
+                max_interval,
+                latency,
+                timeout,
+            )
+        except Exception:
+            _LOGGER.exception("Failed to load conn params")
+            return False
+        else:
+            return True
+
+    def load_conn_params_explicit(
+        self,
+        adapter_idx: int,
+        address: str,
+        address_type: int,
+        min_interval: int,
+        max_interval: int,
+        latency: int,
+        timeout: int,
+    ) -> bool:
+        """
+        Load explicit connection parameters for a specific device.
+
+        Args:
+            adapter_idx: Adapter index (e.g., 0 for hci0)
+            address: Device MAC address (e.g., "AA:BB:CC:DD:EE:FF")
+            address_type: BDADDR_LE_PUBLIC (1) or BDADDR_LE_RANDOM (2)
+            min_interval: Minimum connection interval (units of 1.25ms)
+            max_interval: Maximum connection interval (units of 1.25ms)
+            latency: Connection latency (number of events)
+            timeout: Supervision timeout (units of 10ms)
+
+        Returns:
+            True if command was sent successfully
+
+        """
+        if not self.protocol or not self.protocol.transport:
+            _LOGGER.error("Cannot load conn params: no connection")
+            return False
+
+        # Parse MAC address
+        addr_bytes = bytes.fromhex(address.replace(":", ""))
+        if len(addr_bytes) != 6:
+            _LOGGER.error("Invalid MAC address: %s", address)
+            return False
+
+        # Pack the command
+        cmd_data = CONN_PARAM_PACK(
+            1,  # param_count = 1
+            addr_bytes[::-1],  # bdaddr (reversed for little endian)
+            address_type,  # address type
+            min_interval,
+            max_interval,
+            latency,
+            timeout,
+        )
+
+        # Send the command
+        try:
+            header = COMMAND_HEADER_PACK(
+                MGMT_OP_LOAD_CONN_PARAM,  # opcode
+                adapter_idx,  # controller index
+                len(cmd_data),  # parameter length
+            )
+            self.protocol._write_to_socket(header + cmd_data)
+            _LOGGER.debug(
+                "Loaded explicit conn params for %s:"
+                " interval=%d-%d, latency=%d, timeout=%d",
+                address,
+                min_interval,
+                max_interval,
+                latency,
+                timeout,
+            )
+        except Exception:
+            _LOGGER.exception("Failed to load conn params")
+            return False
+        else:
+            return True

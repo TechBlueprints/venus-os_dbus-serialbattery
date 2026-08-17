@@ -1,10 +1,12 @@
 import threading
 import asyncio
+import importlib.util
 import os
 import subprocess
 import sys
 import time
 from bleak import BleakClient
+from bleak.exc import BleakError
 from time import sleep
 from utils import (
     logger,
@@ -581,8 +583,170 @@ class BCMBackend(BleConnectionBackend):
         await client.disconnect()
 
 
+# habluetooth and its dependencies are vendored under ext/ and are large. Only
+# locate the package here: the import itself happens when the backend is first
+# used, so a driver on the default backend does not pay for parsing a stack it
+# never touches.
+HAS_HABLUETOOTH = importlib.util.find_spec("habluetooth") is not None
+
+
+def bluetooth_manager_class():
+    """
+    habluetooth's BluetoothManager, subclassed to keep it quiet.
+
+    The manager warns at startup when a subclass does not override
+    _discover_service_info, since it expects to hand new devices to something
+    that dispatches them. This driver looks up its one battery in the manager's
+    own advertisement history instead, so the hook stays empty on purpose.
+    """
+    from habluetooth import BluetoothManager
+
+    class SerialbatteryBluetoothManager(BluetoothManager):
+        def _discover_service_info(self, service_info):
+            """Discovery events are not dispatched anywhere."""
+
+    return SerialbatteryBluetoothManager
+
+
+class HaBluetoothBackend(BleConnectionBackend):
+    """
+    Backend based on habluetooth, the Bluetooth stack Home Assistant uses.
+
+    A scanner runs on every adapter this device may use and a manager collects
+    the advertisements from all of them. Connections then go out through the
+    adapter that currently hears the battery best, and connection slots are
+    accounted per adapter instead of being discovered by failing. The device is
+    resolved from tracked advertisements rather than by scanning per attempt,
+    which is what sets this apart from the other backends.
+
+    BLUETOOTH_ADAPTERS selects the adapters: a device pinned with MAC@hciX gets
+    a scanner on that adapter alone, otherwise the pool entries are used, and an
+    empty option scans every adapter present. Nothing rotates after a failure as
+    in the other backends, because the manager re-picks per advertisement.
+
+    Each BMS driver runs in its own process and therefore starts its own
+    scanners; pinning every battery to its own adapter keeps them out of each
+    other's way.
+    """
+
+    # How long an attempt waits for an advertisement before giving up. The
+    # reconnect loop's own pacing decides when the next attempt happens.
+    DISCOVERY_TIMEOUT = 30.0
+    DISCOVERY_POLL_INTERVAL = 0.25
+
+    def __init__(self):
+        self.disconnected_callback = None
+        self.current_adapter = None
+        self._manager = None
+        self._scanners = []
+        self._loop = None
+
+    def create_client(self, address, disconnected_callback):
+        # establish() builds habluetooth's own client wrapper, once the manager
+        # has resolved the device from an advertisement
+        self.disconnected_callback = disconnected_callback
+        pinned = adapters_for(address)
+        self.current_adapter = pinned[0] if pinned else None
+        return None
+
+    async def establish(self, client, address, notify_char, notify_callback):
+        from bleak_retry_connector import establish_connection
+        from habluetooth.wrappers import HaBleakClientWrapper
+
+        await self._ensure_manager(address)
+        logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
+        device = await self._wait_for_advertisement(address)
+        client = await establish_connection(HaBleakClientWrapper, device, address, disconnected_callback=self.disconnected_callback)
+        logger.info("connected to bluetooth device " + address)
+        await client.start_notify(notify_char, notify_callback)
+        return client
+
+    async def release(self, client):
+        # the manager and its scanners stay up on purpose: the advertisement
+        # history they hold is what lets the next connect skip discovery
+        await client.disconnect()
+
+    def _adapters_to_scan(self, address, available):
+        """Adapters to run a scanner on: the pin, else the pool, else all of them."""
+        pinned = adapters_for(address)
+        if pinned:
+            return pinned
+        if BLUETOOTH_ADAPTER_POOL:
+            return list(BLUETOOTH_ADAPTER_POOL)
+        return list(available)
+
+    async def _ensure_manager(self, address):
+        """Set up the manager and its scanners once per event loop."""
+        loop = asyncio.get_running_loop()
+        if self._manager is not None and self._loop is loop:
+            return
+        if self._manager is not None:
+            # rebuild_ble_thread() runs the reconnect loop on a new thread with
+            # a new event loop, and the previous manager and scanners belong to
+            # a loop that no longer runs, so they are dropped and rebuilt here
+            logger.warning(f"BLE [{address}] event loop changed, rebuilding the habluetooth manager")
+            self._manager = None
+            self._scanners = []
+
+        from bluetooth_adapters import ADAPTER_CONNECTION_SLOTS, DEFAULT_ADDRESS, DEFAULT_CONNECTION_SLOTS, get_adapters
+        from habluetooth import BluetoothScanningMode, HaScanner, set_manager
+
+        adapters = get_adapters()
+        await adapters.refresh()
+        available = adapters.adapters
+        manager = bluetooth_manager_class()(adapters)
+        # the client wrapper reaches the manager through habluetooth's global
+        set_manager(manager)
+        await manager.async_setup()
+
+        scanners = []
+        for adapter in self._adapters_to_scan(address, available):
+            details = available.get(adapter)
+            if details is None:
+                logger.warning(f"BLE adapter {adapter} is not present, not scanning on it")
+                continue
+            scanner = HaScanner(BluetoothScanningMode.ACTIVE, adapter, details.get("address") or DEFAULT_ADDRESS)
+            scanner.async_setup()
+            try:
+                await scanner.async_start()
+            except Exception as e:
+                # An adapter the kernel lists but BlueZ does not expose, such as
+                # a built-in radio that never came up, must not keep the working
+                # adapters from being used.
+                logger.warning(f"BLE adapter {adapter} could not start scanning: {repr(e)}")
+                continue
+            manager.async_register_scanner(scanner, connection_slots=details.get(ADAPTER_CONNECTION_SLOTS) or DEFAULT_CONNECTION_SLOTS)
+            scanners.append(scanner)
+            logger.info(f"BLE [{address}] scanning on adapter {adapter}")
+
+        if not scanners:
+            manager.async_stop()
+            raise BleakError(f"no usable bluetooth adapter to reach {address}")
+
+        self._manager = manager
+        self._scanners = scanners
+        self._loop = loop
+
+    async def _wait_for_advertisement(self, address):
+        """BLEDevice for the address once a scanner has heard it advertise."""
+        deadline = time.monotonic() + self.DISCOVERY_TIMEOUT
+        waited = False
+        while True:
+            device = self._manager.async_ble_device_from_address(address, True)
+            if device is not None:
+                return device
+            if time.monotonic() >= deadline:
+                raise BleakError(f"no advertisement from {address} within {self.DISCOVERY_TIMEOUT:.0f}s")
+            if not waited:
+                waited = True
+                logger.info(f"BLE [{address}] waiting for an advertisement")
+            await asyncio.sleep(self.DISCOVERY_POLL_INTERVAL)
+
+
 # Available connection backends, selected by class name via BLUETOOTH_CONNECTION_BACKEND
 supported_ble_backends = [BleakBackend, BCMBackend]
+if HAS_HABLUETOOTH:
+    supported_ble_backends.append(HaBluetoothBackend)
 
 
 def get_ble_backend(name=None):
