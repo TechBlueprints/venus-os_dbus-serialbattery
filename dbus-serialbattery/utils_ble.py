@@ -19,47 +19,55 @@ from utils import (
 
 def parse_adapter_entries(entries):
     """
-    Split BLUETOOTH_ADAPTERS into pinned devices and the shared pool.
+    Split BLUETOOTH_ADAPTERS into per-battery adapters and the shared pool.
 
-    Entries of the form MAC@hciX pin that device to that adapter, with no
-    fallback to the shared pool. Repeating a MAC pins it to several adapters
-    in order: the first is used for every connection attempt, the rest are
-    tried only when it cannot be resolved there. That keeps a battery on a
-    known good radio while leaving it somewhere to go if that radio fails,
-    without returning it to a pool shared with other devices.
+    An entry of MAC@hciX gives that battery its own adapter; repeating the MAC
+    gives it several, in preference order. A battery with entries of its own
+    uses only those and never the shared pool, which is the point of naming
+    them. Plain hciX entries form the pool, used by every battery that has no
+    entry of its own.
 
-    Plain hciX entries form the pool used by every device that is not pinned.
-    Returns (pins, pool), with pins keyed by upper case MAC address and each
-    value a list of adapters in priority order.
+    Returns (devices, pool), devices keyed by upper case MAC with a list of
+    adapters in preference order.
     """
-    pins = {}
+    devices = {}
     pool = []
     for entry in entries:
         entry = entry.strip()
         if not entry:
             continue
-        if "@" in entry:
-            mac, _, adapter = entry.rpartition("@")
-            mac = mac.strip().upper()
-            adapter = adapter.strip()
-            if mac and adapter:
-                adapters = pins.setdefault(mac, [])
-                if adapter not in adapters:
-                    adapters.append(adapter)
-            else:
-                logger.warning(f"Ignoring malformed BLUETOOTH_ADAPTERS entry '{entry}'")
-        else:
+        if "@" not in entry:
             pool.append(entry)
-    return pins, pool
+            continue
+        mac, _, adapter = entry.rpartition("@")
+        mac = mac.strip().upper()
+        adapter = adapter.strip()
+        if not mac or not adapter:
+            logger.warning(f"Ignoring malformed BLUETOOTH_ADAPTERS entry '{entry}'")
+            continue
+        adapters = devices.setdefault(mac, [])
+        if adapter not in adapters:
+            adapters.append(adapter)
+    return devices, pool
 
 
-BLUETOOTH_ADAPTER_PINS, BLUETOOTH_ADAPTER_POOL = parse_adapter_entries(BLUETOOTH_ADAPTERS)
+BLUETOOTH_DEVICE_ADAPTERS, BLUETOOTH_ADAPTER_POOL = parse_adapter_entries(BLUETOOTH_ADAPTERS)
 
 
 def adapters_for(address):
-    """Adapters pinned to this device in priority order, or None if unpinned."""
-    pins = BLUETOOTH_ADAPTER_PINS.get(str(address).strip().upper())
-    return list(pins) if pins else None
+    """Adapters configured for this battery in preference order, or None."""
+    adapters = BLUETOOTH_DEVICE_ADAPTERS.get(str(address).strip().upper())
+    return list(adapters) if adapters else None
+
+
+def adapters_in_attempt_order(address):
+    """
+    Adapters this battery may use, most preferred first.
+
+    Its own adapters if it has any, otherwise the shared pool. The caller walks
+    the list by index, so both are rotated the same way.
+    """
+    return adapters_for(address) or list(BLUETOOTH_ADAPTER_POOL)
 
 
 def notify_characteristic_present(client, notify_char):
@@ -209,22 +217,35 @@ class BleakBackend(BleConnectionBackend):
     behavior of this driver.
 
     If BLUETOOTH_ADAPTERS is set, connections are made only via the listed
-    adapters: a device pinned with MAC@hciX always uses that adapter, every
-    other device takes the next entry of the shared pool after a failed
-    attempt. An empty list uses the system default adapter.
+    adapters. A device pinned with MAC@hciX uses its pinned adapters and never
+    the shared pool; an unpinned one uses the pool. Either list is walked in
+    order, moving on only after a failed attempt, so a dropped link reconnects
+    on the adapter it was using. An empty list uses the system default adapter.
     """
 
     def __init__(self):
         self.adapter_index = 0
         self.current_adapter = None
 
+    def _select_adapter(self, address):
+        """
+        Adapter for the next attempt, or None when nothing is configured.
+
+        The index only advances when an attempt fails, so a dropped link
+        reconnects on the adapter it was already using and only a failed connect
+        moves on to the next one. It is never reset on success: once a battery
+        is talking over an adapter there is no reason to go back and re-probe a
+        preferred one that may be gone, and the modulo brings the list round to
+        it again if this one later fails.
+        """
+        adapters = adapters_in_attempt_order(address)
+        if not adapters:
+            return None
+        return adapters[self.adapter_index % len(adapters)]
+
     def create_client(self, address, disconnected_callback):
         kwargs = {}
-        pinned = adapters_for(address)
-        if pinned:
-            self.current_adapter = pinned[0]
-        elif BLUETOOTH_ADAPTER_POOL:
-            self.current_adapter = BLUETOOTH_ADAPTER_POOL[self.adapter_index % len(BLUETOOTH_ADAPTER_POOL)]
+        self.current_adapter = self._select_adapter(address)
         if self.current_adapter:
             kwargs["adapter"] = self.current_adapter
         return BleakClient(address, disconnected_callback=disconnected_callback, **kwargs)
@@ -233,10 +254,8 @@ class BleakBackend(BleConnectionBackend):
         try:
             return await self._establish(client, address, notify_char, notify_callback)
         except Exception:
-            # rotate to the next pool adapter for the next attempt; pinned
-            # devices never rotate, and an all-pinned config has an empty pool
-            if BLUETOOTH_ADAPTER_POOL:
-                self.adapter_index += 1
+            # a failed attempt, so the next one goes out on the next adapter
+            self.adapter_index += 1
             raise
 
     async def _establish(self, client, address, notify_char, notify_callback):
@@ -767,9 +786,9 @@ class BleakRetryBackend(BleConnectionBackend):
     backoff and cleans up stale BlueZ state, which helps on systems where plain
     connects are unstable.
 
-    BLUETOOTH_ADAPTERS is honored the same way as in BleakBackend: a device
-    pinned with MAC@hciX is resolved and connected only via that adapter, every
-    other device takes the next entry of the shared pool after a failed
+    BLUETOOTH_ADAPTERS is honored the same way as in BleakBackend: a pinned
+    device is resolved and connected only via its pinned adapters, an unpinned
+    one via the shared pool, and either list moves on only after a failed
     attempt. An empty list uses the system default adapter.
     """
 
@@ -777,24 +796,34 @@ class BleakRetryBackend(BleConnectionBackend):
         self.adapter_index = 0
         self.current_adapter = None
 
+    def _select_adapter(self, address):
+        """
+        Adapter for the next attempt, or None when nothing is configured.
+
+        The index only advances when an attempt fails, so a dropped link
+        reconnects on the adapter it was already using and only a failed connect
+        moves on to the next one. It is never reset on success: once a battery
+        is talking over an adapter there is no reason to go back and re-probe a
+        preferred one that may be gone, and the modulo brings the list round to
+        it again if this one later fails.
+        """
+        adapters = adapters_in_attempt_order(address)
+        if not adapters:
+            return None
+        return adapters[self.adapter_index % len(adapters)]
+
     def create_client(self, address, disconnected_callback):
         # establish_connection() creates the client itself
         self.disconnected_callback = disconnected_callback
-        pinned = adapters_for(address)
-        if pinned:
-            self.current_adapter = pinned[0]
-        elif BLUETOOTH_ADAPTER_POOL:
-            self.current_adapter = BLUETOOTH_ADAPTER_POOL[self.adapter_index % len(BLUETOOTH_ADAPTER_POOL)]
+        self.current_adapter = self._select_adapter(address)
         return None
 
     async def establish(self, client, address, notify_char, notify_callback):
         try:
             return await self._establish(client, address, notify_char, notify_callback)
         except Exception:
-            # rotate to the next pool adapter for the next attempt; pinned
-            # devices never rotate, and an all-pinned config has an empty pool
-            if BLUETOOTH_ADAPTER_POOL:
-                self.adapter_index += 1
+            # a failed attempt, so the next one goes out on the next adapter
+            self.adapter_index += 1
             raise
 
     async def _establish(self, client, address, notify_char, notify_callback):

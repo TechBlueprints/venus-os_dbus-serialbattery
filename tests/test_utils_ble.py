@@ -31,7 +31,7 @@ if "bleak" not in sys.modules:
     _bleak_exc.BleakCharacteristicNotFoundError = type("BleakCharacteristicNotFoundError", (Exception,), {})
     _bleak_exc.BleakError = type("BleakError", (Exception,), {})
     _bleak = types.ModuleType("bleak")
-    _bleak.BleakClient = object
+    _bleak.BleakClient = type("BleakClient", (), {"__init__": lambda self, *a, **kw: None})
     _bleak.BleakScanner = object
     _bleak.exc = _bleak_exc
     sys.modules["bleak"] = _bleak
@@ -153,14 +153,14 @@ def test_pool_order_is_preserved():
     assert pool == ["hci2", "hci0", "hci1"]
 
 
-def test_mac_at_adapter_entries_pin_and_stay_out_of_the_pool():
+def test_mac_at_adapter_entries_stay_out_of_the_default_pool():
     pins, pool = utils_ble.parse_adapter_entries(["C8:47:8C:00:00:00@hci1", "C8:47:8C:00:00:11@hci2"])
     assert pins == {"C8:47:8C:00:00:00": ["hci1"], "C8:47:8C:00:00:11": ["hci2"]}
     # a pinned MAC is not an adapter name and must never be handed to bleak
     assert pool == []
 
 
-def test_pins_and_pool_can_be_mixed():
+def test_per_battery_adapters_and_the_pool_can_be_mixed():
     pins, pool = utils_ble.parse_adapter_entries(["hci0", "C8:47:8C:00:00:00@hci1"])
     assert pins == {"C8:47:8C:00:00:00": ["hci1"]}
     assert pool == ["hci0"]
@@ -191,15 +191,15 @@ def test_config_default_adapters_is_empty_so_the_default_adapter_is_used():
 
 
 def test_adapters_for_matches_a_pinned_device_regardless_of_case():
-    original = utils_ble.BLUETOOTH_ADAPTER_PINS
-    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": ["hci1"]}
+    original = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
+    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1"]}
     try:
         assert utils_ble.adapters_for("c8:47:8c:00:00:00") == ["hci1"]
         assert utils_ble.adapters_for("C8:47:8C:00:00:00") == ["hci1"]
         # an unpinned device falls through to the shared pool
         assert utils_ble.adapters_for("C8:47:8C:00:00:11") is None
     finally:
-        utils_ble.BLUETOOTH_ADAPTER_PINS = original
+        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original
 
 
 def test_hold_flag_path_normalizes_the_mac_address():
@@ -225,23 +225,23 @@ def _bcm():
 
 
 def test_bcm_adapter_selection_honors_a_pin_and_ignores_the_pool():
-    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
     original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": ["hci1"]}
+    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1"]}
     utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci0", "hci2"]
     try:
         # a pinned battery may use exactly one adapter, never the pool
         assert _bcm()._adapters("C8:47:8C:00:00:00") == ["hci1"]
     finally:
-        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
         utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
 
 
 def test_bcm_adapter_selection_spreads_unpinned_devices_across_the_pool():
     """Preference order is rotated per device, but stays a permutation of the pool."""
-    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
     original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_ADAPTER_PINS = {}
+    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {}
     utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci0", "hci1", "hci2"]
     try:
         backend = _bcm()
@@ -254,7 +254,7 @@ def test_bcm_adapter_selection_spreads_unpinned_devices_across_the_pool():
         # and it is stable: the same address always yields the same order
         assert backend._adapters("C8:47:8C:00:00:00") == orders["C8:47:8C:00:00:00"]
     finally:
-        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
         utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
 
 
@@ -397,7 +397,7 @@ def test_backends_implement_the_connection_interface():
             assert getattr(cls, method) is not getattr(utils_ble.BleConnectionBackend, method)
 
 
-def test_a_mac_repeated_pins_several_adapters_in_priority_order():
+def test_a_mac_repeated_gives_a_battery_several_adapters_in_order():
     # first entry is the primary, the rest are only tried if it cannot resolve
     pins, pool = utils_ble.parse_adapter_entries(["AA:BB@hci4", "CC:DD@hci5", "AA:BB@hci2"])
 
@@ -405,7 +405,7 @@ def test_a_mac_repeated_pins_several_adapters_in_priority_order():
     assert pool == []
 
 
-def test_a_repeated_pin_to_the_same_adapter_is_not_duplicated():
+def test_a_repeated_adapter_for_one_battery_is_not_duplicated():
     pins, _ = utils_ble.parse_adapter_entries(["AA:BB@hci4", "AA:BB@hci4"])
 
     assert pins == {"AA:BB": ["hci4"]}
@@ -474,10 +474,10 @@ def test_habluetooth_backend_defers_client_creation_to_establish():
     assert backend.disconnected_callback is sentinel
 
 
-def test_habluetooth_backend_scans_only_the_pinned_adapter():
-    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+def test_habluetooth_backend_scans_only_the_batterys_own_adapters():
+    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
     original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": ["hci1", "hci3"]}
+    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1", "hci3"]}
     utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci2"]
     try:
         backend = utils_ble.get_ble_backend("HaBluetoothBackend")
@@ -487,20 +487,20 @@ def test_habluetooth_backend_scans_only_the_pinned_adapter():
         # an unpinned one uses the pool, not every adapter present
         assert backend._adapters_to_scan("C8:47:8C:00:00:11", available) == ["hci2"]
     finally:
-        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
         utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
 
 
 def test_habluetooth_backend_scans_every_adapter_when_unconfigured():
-    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
     original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_ADAPTER_PINS = {}
+    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {}
     utils_ble.BLUETOOTH_ADAPTER_POOL = []
     try:
         backend = utils_ble.get_ble_backend("HaBluetoothBackend")
         assert backend._adapters_to_scan("C8:47:8C:00:00:11", {"hci0": {}, "hci1": {}}) == ["hci0", "hci1"]
     finally:
-        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
         utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
 
 
@@ -511,10 +511,10 @@ def test_bleak_retry_backend_defers_client_creation_to_establish():
     assert backend.disconnected_callback is sentinel
 
 
-def test_bleak_retry_backend_selects_the_pinned_adapter():
-    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+def test_bleak_retry_backend_selects_the_batterys_first_adapter():
+    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
     original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": ["hci1", "hci4"]}
+    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1", "hci4"]}
     utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci2", "hci3"]
     try:
         backend = utils_ble.get_ble_backend("BleakRetryBackend")
@@ -526,14 +526,14 @@ def test_bleak_retry_backend_selects_the_pinned_adapter():
         backend.create_client("C8:47:8C:00:00:11", None)
         assert backend.current_adapter == "hci2"
     finally:
-        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
         utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
 
 
 def test_bleak_retry_backend_rotates_the_pool_after_a_failed_attempt():
-    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
     original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_ADAPTER_PINS = {}
+    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {}
     utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci2", "hci3"]
     try:
         backend = utils_ble.get_ble_backend("BleakRetryBackend")
@@ -546,7 +546,7 @@ def test_bleak_retry_backend_rotates_the_pool_after_a_failed_attempt():
         backend.create_client("C8:47:8C:00:00:11", None)
         assert backend.current_adapter == "hci3"
     finally:
-        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
         utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
 
 
@@ -559,3 +559,80 @@ def test_the_retry_connector_establish_is_not_shadowed_by_the_managers():
     here would catch because none of them reach the connect path.
     """
     assert utils_ble.retry_establish_connection is sys.modules["bleak_retry_connector"].establish_connection
+
+
+def _configure(devices, pool):
+    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = devices
+    utils_ble.BLUETOOTH_ADAPTER_POOL = pool
+
+
+@pytest.mark.parametrize("backend_name", ["BleakBackend", "BleakRetryBackend"])
+def test_a_battery_advances_to_its_next_adapter_after_a_failed_attempt(backend_name):
+    """
+    The reason multi-pin exists: the preferred radio can vanish (USB renumbering
+    after a reset), and the battery has to reach its second pin or the driver
+    blocks charging for a bank that is perfectly healthy.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_DEVICE_ADAPTERS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+    try:
+        backend = utils_ble.get_ble_backend(backend_name)
+        assert backend._select_adapter("C8:47:8C:00:00:00") == "hci5"
+        backend.adapter_index += 1
+        assert backend._select_adapter("C8:47:8C:00:00:00") == "hci6"
+        # and round again, so a pin that comes back is reachable
+        backend.adapter_index += 1
+        assert backend._select_adapter("C8:47:8C:00:00:00") == "hci5"
+    finally:
+        _configure(original_pins, original_pool)
+
+
+@pytest.mark.parametrize("backend_name", ["BleakBackend", "BleakRetryBackend"])
+def test_a_failed_connect_is_what_advances_the_adapter(backend_name):
+    original_pins, original_pool = utils_ble.BLUETOOTH_DEVICE_ADAPTERS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+    try:
+        backend = utils_ble.get_ble_backend(backend_name)
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci5"
+        # the stubs raise, which is a failed attempt
+        with pytest.raises(Exception):
+            asyncio.run(backend.establish(None, "C8:47:8C:00:00:00", "char", None))
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci6"
+    finally:
+        _configure(original_pins, original_pool)
+
+
+@pytest.mark.parametrize("backend_name", ["BleakBackend", "BleakRetryBackend"])
+def test_a_dropped_link_reconnects_on_the_same_adapter(backend_name):
+    """
+    A disconnect is not a failed attempt. The reconnect loop calls create_client
+    again without establish() having raised, and that must not move the battery
+    off a radio that is working - only a failed connect does.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_DEVICE_ADAPTERS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+    try:
+        backend = utils_ble.get_ble_backend(backend_name)
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci5"
+        for _ in range(5):
+            backend.create_client("C8:47:8C:00:00:00", None)
+            assert backend.current_adapter == "hci5"
+    finally:
+        _configure(original_pins, original_pool)
+
+
+@pytest.mark.parametrize("backend_name", ["BleakBackend", "BleakRetryBackend"])
+def test_a_battery_with_its_own_adapters_never_uses_the_default_pool(backend_name):
+    original_pins, original_pool = utils_ble.BLUETOOTH_DEVICE_ADAPTERS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5"]}, ["hci0", "hci1"])
+    try:
+        backend = utils_ble.get_ble_backend(backend_name)
+        # exhausting the single pin wraps back onto itself, never onto the pool
+        for i in range(4):
+            backend.adapter_index = i
+            assert backend._select_adapter("C8:47:8C:00:00:00") == "hci5"
+    finally:
+        _configure(original_pins, original_pool)
