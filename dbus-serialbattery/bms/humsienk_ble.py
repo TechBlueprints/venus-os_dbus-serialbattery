@@ -62,11 +62,6 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
         self._notification_queue = deque(maxlen=256)
         self._notification_signal = threading.Condition()
         self._watchdog_last_fed = time.time()
-        # DIAGNOSTIC: called once when an established link is lost. The
-        # layer above stops calling the driver's refresh_data() the moment
-        # this class reports the link down, so the driver has no way to
-        # notice a drop on its own.
-        self.on_link_lost = kwargs.pop("on_link_lost", None)
         super().__init__(*args, **kwargs)
 
     def feed_watchdog(self) -> None:
@@ -115,16 +110,7 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
                             break
                         await asyncio.sleep(0.1)
             finally:
-                was_connected = self.connected
                 self.connected = False
-                # DIAGNOSTIC: only for a link that was actually up, so a
-                # failed connection attempt does not look like a drop. Guarded
-                # because nothing diagnostic may break reconnection.
-                if was_connected and self.on_link_lost is not None:
-                    try:
-                        self.on_link_lost()
-                    except Exception as e:
-                        logger.debug(f"HumsiENK: on_link_lost raised: {repr(e)}")
                 if self.client:
                     try:
                         await asyncio.wait_for(self.backend.release(self.client), timeout=BLE_RELEASE_TIMEOUT)
@@ -187,11 +173,6 @@ class HumsiENK_Ble(Battery):
         self._last_poll_time = 0.0
         self._last_handshake_time = 0.0
         self._deadline = None  # caps a run of requests, see _request()
-        self._unsolicited_seen = {}  # DIAGNOSTIC, see _log_unsolicited
-        self._status_history = deque(maxlen=20)  # DIAGNOSTIC, see _record_status
-        self._status_unbound = None
-        self._status_conditions = None  # DIAGNOSTIC, see _record_status
-        self._link_was_fresh = False
 
         logger.info("Init of HumsiENK_Ble at " + address)
 
@@ -212,12 +193,7 @@ class HumsiENK_Ble(Battery):
         """
         result = False
         try:
-            self.ble_handle = HumsiENK_Syncron_Ble(
-                self.address,
-                read_characteristic=self.BLE_RX_UUID,
-                write_characteristic=self.BLE_TX_UUID,
-                on_link_lost=self._on_link_lost,  # DIAGNOSTIC
-            )
+            self.ble_handle = HumsiENK_Syncron_Ble(self.address, read_characteristic=self.BLE_RX_UUID, write_characteristic=self.BLE_TX_UUID)
 
             if not self.ble_handle.connected:
                 logger.error("HumsiENK_Ble: could not connect to " + self.address)
@@ -302,14 +278,7 @@ class HumsiENK_Ble(Battery):
 
         # Report only what the radio delivered: values are published as current
         # or not at all, never republished as if they were fresh.
-        stale_seconds = time.time() - self._last_frame_time
-        fresh = stale_seconds <= self.DATA_FRESHNESS_SECONDS
-        # DIAGNOSTIC: dump the link's last moments on the edge into staleness,
-        # once per outage rather than on every cycle while it stays down.
-        if self._link_was_fresh and not fresh:
-            self._dump_status_history(stale_seconds)
-        self._link_was_fresh = fresh
-        return fresh
+        return (time.time() - self._last_frame_time) <= self.DATA_FRESHNESS_SECONDS
 
     def _build_command(self, command: int, data: list = None) -> bytes:
         """
@@ -449,154 +418,8 @@ class HumsiENK_Ble(Battery):
             self._parse_config(data)
         elif command == self.CMD_VERSION:
             self._parse_version(data)
-        elif command == self.CMD_HANDSHAKE:
-            # The BMS acknowledges the handshake with an empty frame. Nothing
-            # to parse, but it is solicited, so it is not a discovery.
-            logger.debug("HumsiENK: handshake acknowledged")
         else:
-            self._log_unsolicited(command, data)
-
-    # DIAGNOSTIC. Status bits the vendor app never displays and we never map.
-    # The charge and discharge halves are near mirrors, which suggests 13/14
-    # are the charge-side MOSFET temperature pair and that 3/19 and 11/27 are
-    # protection-and-warning pairs, but that is inference from layout, not
-    # evidence. Nothing reads these; they are only reported when they move.
-    # Bits not published: charging and discharging stopped and the pre-discharge
-    # FET are states rather than faults, and the overvoltage and lower imbalance
-    # warnings assert during normal in-spec charging (see _parse_status). Their
-    # movement is still reported, so a change in behaviour does not go unseen.
-    UNBOUND_STATUS_BITS = (6, 11, 12, 22, 31)
-
-    # Charge FET, heater and discharge FET. Everything else in the status
-    # word is a condition rather than a switch position.
-    SWITCH_STATUS_BITS = (1 << 7) | (1 << 15) | (1 << 23)
-
-    def _record_status(self, status: int) -> None:
-        """
-        DIAGNOSTIC, merge branch only, do not port to the driver PR.
-
-        Keep the recent status words so the link's last moments can be dumped
-        when it drops, and report any movement in the bits nothing reads.
-
-        Both packs lose their link several times an hour and about a fifth of
-        those drops land on both within the same second. Every explanation so
-        far rests on what the link did, because the disconnect reason is a
-        supervision timeout and the BMS says nothing. What we have never been
-        able to see is whether the BMS itself signalled anything in the
-        seconds beforehand. If a bit moves before a drop the cause is inside
-        the pack; if the word is unchanged to the last frame, it is not.
-
-        :param status: the 32 bit operation status word
-        :return: None
-        """
-        self._status_history.append((time.time(), status))
-
-        unbound = sum(1 << bit for bit in self.UNBOUND_STATUS_BITS if status & (1 << bit))
-        if self._status_unbound is not None and unbound != self._status_unbound:
-            moved = [bit for bit in self.UNBOUND_STATUS_BITS if (unbound ^ self._status_unbound) & (1 << bit)]
-            now_set = [bit for bit in moved if unbound & (1 << bit)]
-            logger.warning(f"HumsiENK: unmapped status bits moved {moved}, now set {now_set}, full word 0x{status:08X}")
-        self._status_unbound = unbound
-
-        # Every condition bit, meaning everything except the three switch
-        # states. /Alarms/HighVoltage read 1 for about three hours today, which
-        # can only come from bit 12, yet every status word we have captured is
-        # 0x00800080 with bits 8 to 15 clear, and the high-voltage alarm
-        # counter never incremented. Two observations that should agree do not,
-        # and the recorder above cannot settle it because it samples only when
-        # the link drops. This logs the word itself the moment any condition
-        # bit changes, so the next absorption either produces a word with bit
-        # 12 set or proves the alarm comes from somewhere else.
-        conditions = status & ~self.SWITCH_STATUS_BITS & 0xFFFFFFFF
-        if conditions != self._status_conditions:
-            # The cell voltages come with the change, because a bit's meaning
-            # cannot be established from the bit alone. Bit 11 is the case in
-            # point: it was set through the top of charge and released 90
-            # minutes later, which is consistent with a cell overvoltage
-            # warning and equally consistent with several other readings.
-            # Catching the setting edge with the cells attached is what
-            # separates them.
-            #
-            # These cells are up to one poll interval older than the status
-            # word, because 0x22 and 0x20 are separate frames. At the edge of
-            # a threshold that matters, so the reading is a bound rather than
-            # an exact value.
-            cells = [cell.voltage for cell in self.cells if cell.voltage is not None]
-            highest = f"{max(cells):.3f}" if cells else "unread"
-            logger.warning(
-                f"HumsiENK: condition bits changed 0x{self._status_conditions or 0:08X} -> 0x{conditions:08X}, "
-                f"set {[bit for bit in range(32) if conditions & (1 << bit)]}, full word 0x{status:08X}, "
-                f"highest cell {highest} V, cells {[f'{v:.3f}' for v in cells]}"
-            )
-        self._status_conditions = conditions
-
-    def _dump_status_history(self, stale_seconds: float) -> None:
-        """
-        DIAGNOSTIC, merge branch only, do not port to the driver PR.
-
-        Print the recorded status words when the link goes stale, newest last,
-        with runs of an identical word collapsed. A trace that ends in a single
-        long run means the BMS was still reporting the same thing right up to
-        the moment it went quiet.
-
-        :param stale_seconds: how long the data has been stale
-        :return: None
-        """
-        if not self._status_history:
-            return
-        last = self._status_history[-1][0]
-        runs = []
-        for stamp, status in self._status_history:
-            if runs and runs[-1][0] == status:
-                runs[-1][2] += 1
-            else:
-                runs.append([status, stamp, 1])
-        trace = " -> ".join(f"0x{status:08X}@-{last - stamp:.0f}s" + (f" x{count}" if count > 1 else "") for status, stamp, count in runs)
-        logger.warning(f"HumsiENK: link lost, {stale_seconds:.0f} s since the last frame, last {len(self._status_history)} status words: {trace}")
-        # Consumed, so whichever trigger arrives second finds nothing to say.
-        self._status_history.clear()
-
-    def _on_link_lost(self) -> None:
-        """
-        DIAGNOSTIC, merge branch only, do not port to the driver PR.
-
-        Dump the trace when the BLE layer reports an established link gone.
-        This is the trigger that actually fires on a real drop: the layer
-        above stops calling refresh_data() as soon as the handle reports the
-        link down, which on a link BlueZ notices quickly happens before the
-        data is stale enough for the driver to spot it.
-
-        :return: None
-        """
-        self._dump_status_history(time.time() - self._last_frame_time)
-
-    def _log_unsolicited(self, command: int, data: bytes) -> None:
-        """
-        DIAGNOSTIC, merge branch only, do not port to the driver PR.
-
-        Report frames the driver never asked for. The vendor app carries
-        handlers for 0x12, 0x23, 0x55, 0x56 and 0xF3 and issues none of them,
-        so either the BMS pushes them unprompted or they are dead code. Two
-        would be worth having: 0x56 reads as a fault count, and 0x55 begins
-        with a date and time, which would say whether the packs share a clock.
-
-        Nothing is sent to find out. This only surfaces what already arrives,
-        which the driver has been discarding at debug level.
-
-        Rate limited per command code so a chatty BMS cannot flood the log.
-
-        :param command: the unrecognised command code
-        :param data: the frame payload
-        :return: None
-        """
-        seen = self._unsolicited_seen.get(command)
-        count = (seen[0] if seen else 0) + 1
-        last = seen[1] if seen else 0.0
-        now = time.time()
-        if count <= 3 or (now - last) >= 900:
-            logger.info(f"HumsiENK: unsolicited 0x{command:02X} frame #{count}, {len(data)} bytes: {data.hex()}")
-            last = now
-        self._unsolicited_seen[command] = (count, last)
+            logger.debug(f"HumsiENK: ignoring response to unknown command 0x{command:02X}")
 
     def _parse_battery_info(self, data: bytes) -> None:
         """
@@ -750,8 +573,6 @@ class HumsiENK_Ble(Battery):
                 return 1
             return 0
 
-        self._record_status(status)
-
         self.charge_fet = bool(status & (1 << 7))
         self.discharge_fet = bool(status & (1 << 23))
         # The three switch bits are a set: the vendor app labels them charging
@@ -828,38 +649,6 @@ class HumsiENK_Ble(Battery):
             return
 
         values = [int.from_bytes(data[i : i + 2], "little") for i in range(0, 44, 2)]
-
-        # DIAGNOSTIC, merge branch only, do not port to the driver PR.
-        # Chasing a pack overvoltage warning (status bit 12) that appears near
-        # 14.2 V on a 4S pack whose cell OVP is 3.65 V. Nothing in the fields
-        # we read can produce that, so dump every field with the vendor app's
-        # own names to find what does. Remove once the threshold is known.
-        _CONFIG_FIELD_NAMES = (
-            "battery_count",
-            "battery_capacity_0.01Ah",
-            "overvoltage_protection_mV",
-            "overvoltage_recovery_mV",
-            "overvoltage_delay_units_unknown",
-            "undervoltage_protection_mV",
-            "undervoltage_recovery_mV",
-            "undervoltage_delay_units_unknown",
-            "charge_ocp_0.1A",
-            "charge_ocp_delay_units_unknown",
-            "discharge_ocp1_0.1A",
-            "discharge_ocp1_delay_units_unknown",
-            "discharge_ocp2_0.1A",
-            "discharge_ocp2_delay_units_unknown",
-            "charge_high_temp_protection",
-            "charge_high_temp_recovery",
-            "charge_low_temp_protection",
-            "charge_low_temp_recovery",
-            "discharge_high_temp_protection",
-            "discharge_high_temp_recovery",
-            "discharge_low_temp_protection",
-            "discharge_low_temp_recovery",
-        )
-        logger.info("HumsiENK: config frame raw: " + " ".join(f"[{index}]{name}={value}" for index, (name, value) in enumerate(zip(_CONFIG_FIELD_NAMES, values))))
-
         cell_count = values[0]
         capacity = values[1] / 100
         cell_max_voltage = values[2] / 1000

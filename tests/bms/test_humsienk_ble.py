@@ -12,7 +12,6 @@ imported. The stub is removed again afterwards so no other test module
 inherits it.
 """
 
-import logging
 import os
 import sys
 import time
@@ -113,10 +112,10 @@ def cell_payload(millivolts):
     return bytes(payload)
 
 
-def status_payload(status_bits=0, balancing=0, disconnected=0, days=3, hours=4, minutes=5):
+def status_payload(status_bits=0, balancing=0, disconnected=0):
     payload = bytearray()
-    payload += days.to_bytes(2, "little")  # runtime days
-    payload += bytes([hours, minutes])  # runtime hours, minutes
+    payload += (3).to_bytes(2, "little")  # runtime days
+    payload += bytes([4, 5])  # runtime hours, minutes
     payload += status_bits.to_bytes(4, "little")
     payload += balancing.to_bytes(3, "little")
     payload += disconnected.to_bytes(3, "little")
@@ -671,189 +670,3 @@ def test_the_driver_carries_no_fallback_machinery():
     import inspect
 
     assert "fallback" not in inspect.getsource(humsienk_ble).lower()
-
-
-def test_frames_the_driver_never_requested_are_reported(caplog):
-    # The vendor app has handlers for 0x12, 0x23, 0x55, 0x56 and 0xF3 and sends
-    # none of them, so if they arrive they arrive unprompted. They were being
-    # discarded at debug level, which is invisible at the configured log level.
-    bms = make_bms()
-
-    with caplog.at_level(logging.INFO):
-        bms._parse_and_update(frame(0x55, bytes.fromhex("deadbeef")))
-
-    assert "unsolicited 0x55" in caplog.text
-    assert "deadbeef" in caplog.text
-
-
-def test_an_unsolicited_frame_is_rate_limited_per_command(caplog):
-    # A BMS pushing one of these continuously must not flood the log, and the
-    # count has to keep rising so the rate is still visible.
-    bms = make_bms()
-    for _ in range(3):
-        bms._parse_and_update(frame(0x55, b"\x01"))
-
-    caplog.clear()  # the first three are expected to report; only what follows matters
-    with caplog.at_level(logging.INFO):
-        for _ in range(20):
-            bms._parse_and_update(frame(0x55, b"\x01"))
-        bms._parse_and_update(frame(0x56, b"\x02"))
-
-    assert "unsolicited 0x55" not in caplog.text  # already reported 3 times
-    assert "unsolicited 0x56 frame #1" in caplog.text  # a different code still reports
-    assert bms._unsolicited_seen[0x55][0] == 23
-
-
-def test_the_handshake_acknowledgement_is_not_treated_as_a_discovery(caplog):
-    # The BMS answers the handshake with an empty 0x00 frame. It is solicited,
-    # so reporting it as unprompted would be wrong and would repeat forever.
-    bms = make_bms()
-
-    with caplog.at_level(logging.INFO):
-        bms._parse_and_update(frame(HumsiENK_Ble.CMD_HANDSHAKE, b""))
-
-    assert "unsolicited" not in caplog.text
-    assert HumsiENK_Ble.CMD_HANDSHAKE not in bms._unsolicited_seen
-
-
-def test_movement_in_the_unmapped_status_bits_is_reported(caplog):
-    # What is left unmapped is charging stopped, discharging stopped and the
-    # pre-discharge FET: documented states with no D-Bus path. The only way
-    # anything is ever learned about them is by noticing them move.
-    bms = make_bms()
-    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 7))))
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 7) | (1 << 6))))
-
-    assert "unmapped status bits moved [6]" in caplog.text
-    assert "now set [6]" in caplog.text
-
-
-def test_movement_in_mapped_bits_is_not_reported_as_unmapped(caplog):
-    # Bit 4 is pack overvoltage and is already published as an alarm; it must
-    # not also be announced as an unexplained bit.
-    bms = make_bms()
-    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=0)))
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 4))))
-
-    assert "unmapped status bits" not in caplog.text
-
-
-def test_the_last_status_words_are_dumped_when_the_link_goes_stale(caplog):
-    bms = make_bms()
-    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=0x00000080)))
-    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=0x00000080)))
-    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=0x00008080)))
-    bms.ble_handle.connected = False
-    bms._last_frame_time = time.time()          # fresh, so the next cycle is the edge
-    assert bms.refresh_data() is True
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        bms._last_frame_time = time.time() - 60  # link has gone quiet
-        assert bms.refresh_data() is False
-
-    assert "link lost, 60 s since the last frame" in caplog.text
-    assert "0x00000080" in caplog.text and "x2" in caplog.text, "identical words must collapse into a run"
-    assert "0x00008080" in caplog.text
-
-
-def test_the_stale_dump_happens_once_per_outage(caplog):
-    bms = make_bms()
-    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload()))
-    bms._last_frame_time = time.time()
-    bms.refresh_data()
-    bms._last_frame_time = time.time() - 60
-    bms.refresh_data()
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        for _ in range(5):
-            bms.refresh_data()
-
-    assert "link lost" not in caplog.text, "the dump must fire once, not every cycle while down"
-
-
-def test_the_ble_layer_reports_a_lost_link_to_the_driver():
-    # The fallback wrapper stops calling refresh_data() as soon as the handle
-    # reports the link down, so the driver cannot see a drop by itself. The
-    # BLE layer has to tell it, or the trace is never dumped on a real outage.
-    bms = make_bms()
-    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=0x00808080)))
-    assert len(bms._status_history) == 1
-
-    bms._on_link_lost()
-
-    assert not bms._status_history, "the trace is consumed, so a second trigger stays quiet"
-
-
-def test_a_dump_is_not_repeated_by_the_second_trigger(caplog):
-    bms = make_bms()
-    bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload()))
-    bms._on_link_lost()
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        bms._on_link_lost()
-        bms._last_frame_time = time.time() - 60
-        bms._link_was_fresh = True
-        bms.refresh_data()
-
-    assert "link lost" not in caplog.text
-
-
-def test_condition_bits_are_reported_but_switch_states_are_not(caplog):
-    # DIAGNOSTIC. The switch bits move constantly in normal operation, so
-    # logging those would bury the thing being hunted: a condition bit such as
-    # bit 12 that /Alarms/HighVoltage claims is set while every captured word
-    # says otherwise.
-    bms = make_bms()
-    switches = (1 << 7) | (1 << 23)
-
-    with caplog.at_level(logging.WARNING):
-        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=switches)))
-    assert "condition bits changed" in caplog.text  # first word establishes the baseline
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        # heater comes on, discharge FET opens: switches only, still no condition
-        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 7) | (1 << 15))))
-    assert "condition bits changed" not in caplog.text
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        # pack overvoltage warning, the bit actually being hunted
-        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=switches | (1 << 12))))
-    assert "condition bits changed" in caplog.text
-    assert "0x00001000" in caplog.text and "[12]" in caplog.text
-
-
-def test_a_condition_bit_change_carries_the_cell_voltages(caplog):
-    # DIAGNOSTIC. A bit's meaning cannot be established from the bit alone.
-    # Bit 11 tracks the top of charge on real packs, which is consistent with
-    # a cell overvoltage warning and with other readings; the cells at the
-    # setting edge are what separate them.
-    bms = make_bms()
-    bms._parse_and_update(frame(HumsiENK_Ble.CMD_CELL_VOLTAGES, cell_payload([3300, 3595, 3301, 3302])))
-
-    with caplog.at_level(logging.WARNING):
-        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 7) | (1 << 11) | (1 << 23))))
-
-    assert "highest cell 3.595 V" in caplog.text
-    assert "3.300" in caplog.text and "3.302" in caplog.text
-
-
-def test_a_condition_bit_change_before_any_cell_frame_says_so(caplog):
-    # Status can arrive before the first 0x22, and an empty list would read as
-    # "all cells at zero" rather than "not yet known".
-    bms = make_bms()
-
-    with caplog.at_level(logging.WARNING):
-        bms._parse_and_update(frame(HumsiENK_Ble.CMD_STATUS, status_payload(status_bits=(1 << 11))))
-
-    assert "highest cell unread V" in caplog.text
