@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import time
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 from time import sleep
 from utils import (
@@ -155,6 +155,23 @@ BLE_AUTO_HOLD_WINDOW = 300.0
 # last resort against a permanently parked await, not a connection timeout.
 BLE_ESTABLISH_TIMEOUT = 300.0
 BLE_RELEASE_TIMEOUT = 30.0
+
+
+# bleak-retry-connector lives in the ext folder, which dbus-serialbattery.py adds
+# to sys.path. Guard the import so utils_ble can be imported without it.
+# bleak_connection_manager exports an establish_connection of its own and is
+# imported further down, so this one is aliased rather than shadowed.
+try:
+    from bleak_retry_connector import (
+        close_stale_connections,
+        establish_connection as retry_establish_connection,
+        get_device,
+        get_device_by_adapter,
+    )
+
+    HAS_BLEAK_RETRY_CONNECTOR = True
+except ImportError:
+    HAS_BLEAK_RETRY_CONNECTOR = False
 
 
 class BleConnectionBackend:
@@ -743,10 +760,82 @@ class HaBluetoothBackend(BleConnectionBackend):
             await asyncio.sleep(self.DISCOVERY_POLL_INTERVAL)
 
 
+class BleakRetryBackend(BleConnectionBackend):
+    """
+    Backend based on bleak-retry-connector, which is vendored in the ext folder
+    and also used by the aiobmsble drivers. establish_connection() retries with
+    backoff and cleans up stale BlueZ state, which helps on systems where plain
+    connects are unstable.
+
+    BLUETOOTH_ADAPTERS is honored the same way as in BleakBackend: a device
+    pinned with MAC@hciX is resolved and connected only via that adapter, every
+    other device takes the next entry of the shared pool after a failed
+    attempt. An empty list uses the system default adapter.
+    """
+
+    def __init__(self):
+        self.adapter_index = 0
+        self.current_adapter = None
+
+    def create_client(self, address, disconnected_callback):
+        # establish_connection() creates the client itself
+        self.disconnected_callback = disconnected_callback
+        pinned = adapters_for(address)
+        if pinned:
+            self.current_adapter = pinned[0]
+        elif BLUETOOTH_ADAPTER_POOL:
+            self.current_adapter = BLUETOOTH_ADAPTER_POOL[self.adapter_index % len(BLUETOOTH_ADAPTER_POOL)]
+        return None
+
+    async def establish(self, client, address, notify_char, notify_callback):
+        try:
+            return await self._establish(client, address, notify_char, notify_callback)
+        except Exception:
+            # rotate to the next pool adapter for the next attempt; pinned
+            # devices never rotate, and an all-pinned config has an empty pool
+            if BLUETOOTH_ADAPTER_POOL:
+                self.adapter_index += 1
+            raise
+
+    async def _establish(self, client, address, notify_char, notify_callback):
+        logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
+        device = await self._resolve_device(address)
+        if device is None:
+            raise BleakError(f"bluetooth device {address} not found" + (f" on adapter {self.current_adapter}" if self.current_adapter else ""))
+        await close_stale_connections(device)
+        kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
+        client = await retry_establish_connection(BleakClient, device, address, disconnected_callback=self.disconnected_callback, **kwargs)
+        logger.info("connected to bluetooth device " + address)
+        await client.start_notify(notify_char, notify_callback)
+        return client
+
+    async def _resolve_device(self, address):
+        """BLEDevice for the address from the BlueZ cache, scanning as fallback.
+
+        With an adapter selected, both the cache lookup and the scan are bound
+        to that adapter, so a pinned device can never resolve to a path on
+        another adapter.
+        """
+        if self.current_adapter:
+            device = await get_device_by_adapter(address, self.current_adapter)
+        else:
+            device = await get_device(address)
+        if device is None:
+            logger.info(f"bluetooth device {address} not in BlueZ cache, scanning")
+            kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
+            device = await BleakScanner.find_device_by_address(address, timeout=10.0, **kwargs)
+        return device
+
+    async def release(self, client):
+        await client.disconnect()
+
+
 # Available connection backends, selected by class name via BLUETOOTH_CONNECTION_BACKEND
 supported_ble_backends = [BleakBackend, BCMBackend]
 if HAS_HABLUETOOTH:
     supported_ble_backends.append(HaBluetoothBackend)
+if HAS_BLEAK_RETRY_CONNECTOR:
+    supported_ble_backends.append(BleakRetryBackend)
 
 
 def get_ble_backend(name=None):

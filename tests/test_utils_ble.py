@@ -7,12 +7,15 @@ registered before the import so the non-BLE logic can be exercised for real.
 Everything that actually talks to a radio is left untested here.
 """
 
+import asyncio
 import configparser
 import importlib.util
 import os
 import sys
 import time
 import types
+
+import pytest
 
 DRIVER_DIR = os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery")
 CONFIG_DEFAULT = os.path.join(DRIVER_DIR, "config.default.ini")
@@ -29,9 +32,25 @@ if "bleak" not in sys.modules:
     _bleak_exc.BleakError = type("BleakError", (Exception,), {})
     _bleak = types.ModuleType("bleak")
     _bleak.BleakClient = object
+    _bleak.BleakScanner = object
     _bleak.exc = _bleak_exc
     sys.modules["bleak"] = _bleak
     sys.modules["bleak.exc"] = _bleak_exc
+
+
+if "bleak_retry_connector" not in sys.modules:
+    # utils_ble only needs these four names; stubbing the module keeps
+    # BleakRetryBackend in supported_ble_backends so the generic backend
+    # tests below cover it as well.
+    async def _not_under_test(*args, **kwargs):
+        raise NotImplementedError
+
+    _brc = types.ModuleType("bleak_retry_connector")
+    _brc.close_stale_connections = _not_under_test
+    _brc.establish_connection = _not_under_test
+    _brc.get_device = _not_under_test
+    _brc.get_device_by_adapter = _not_under_test
+    sys.modules["bleak_retry_connector"] = _brc
 
 
 def _load_utils_ble():
@@ -483,3 +502,60 @@ def test_habluetooth_backend_scans_every_adapter_when_unconfigured():
     finally:
         utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
         utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+
+
+def test_bleak_retry_backend_defers_client_creation_to_establish():
+    backend = utils_ble.get_ble_backend("BleakRetryBackend")
+    sentinel = object()
+    assert backend.create_client("C8:47:8C:00:00:00", sentinel) is None
+    assert backend.disconnected_callback is sentinel
+
+
+def test_bleak_retry_backend_selects_the_pinned_adapter():
+    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": ["hci1", "hci4"]}
+    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci2", "hci3"]
+    try:
+        backend = utils_ble.get_ble_backend("BleakRetryBackend")
+        backend.create_client("c8:47:8c:00:00:00", None)
+        # the first pin is the one connections go out on
+        assert backend.current_adapter == "hci1"
+
+        backend = utils_ble.get_ble_backend("BleakRetryBackend")
+        backend.create_client("C8:47:8C:00:00:11", None)
+        assert backend.current_adapter == "hci2"
+    finally:
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+
+
+def test_bleak_retry_backend_rotates_the_pool_after_a_failed_attempt():
+    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {}
+    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci2", "hci3"]
+    try:
+        backend = utils_ble.get_ble_backend("BleakRetryBackend")
+        backend.create_client("C8:47:8C:00:00:11", None)
+        assert backend.current_adapter == "hci2"
+        # the stubbed bleak_retry_connector raises NotImplementedError, which
+        # counts as a failed attempt and must advance the pool index
+        with pytest.raises(NotImplementedError):
+            asyncio.run(backend.establish(None, "C8:47:8C:00:00:11", "char", None))
+        backend.create_client("C8:47:8C:00:00:11", None)
+        assert backend.current_adapter == "hci3"
+    finally:
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+
+
+def test_the_retry_connector_establish_is_not_shadowed_by_the_managers():
+    """
+    bleak_connection_manager and habluetooth both bring an establish_connection
+    of their own, and bleak_connection_manager's is imported later in the module
+    than the retry connector's. An unaliased import would leave BleakRetryBackend
+    silently calling BCM's function with the wrong signature, which no other test
+    here would catch because none of them reach the connect path.
+    """
+    assert utils_ble.retry_establish_connection is sys.modules["bleak_retry_connector"].establish_connection
