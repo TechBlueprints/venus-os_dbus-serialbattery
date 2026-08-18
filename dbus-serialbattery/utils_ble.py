@@ -11,6 +11,7 @@ from time import sleep
 from utils import (
     logger,
     BLUETOOTH_ADAPTERS,
+    BLUETOOTH_ADAPTER_SLOTS,
     BLUETOOTH_CONNECTION_BACKEND,
     BLUETOOTH_FORCE_RESET_BLE_STACK,
     capture_raw_data,
@@ -52,6 +53,18 @@ def parse_adapter_entries(entries):
 
 
 BLUETOOTH_DEVICE_ADAPTERS, BLUETOOTH_ADAPTER_POOL = parse_adapter_entries(BLUETOOTH_ADAPTERS)
+
+
+# Cross-process adapter slots (see adapter_slots.py): claimed with a kernel
+# flock before connecting and held for the life of the connection, so choosing
+# an adapter and claiming it are one atomic act shared with the host's other
+# BLE services. None when BLUETOOTH_ADAPTER_SLOTS is 0.
+if BLUETOOTH_ADAPTER_SLOTS > 0:
+    from adapter_slots import AdapterSlotManager
+
+    adapter_slot_manager = AdapterSlotManager(max_slots=BLUETOOTH_ADAPTER_SLOTS)
+else:
+    adapter_slot_manager = None
 
 
 def adapters_for(address):
@@ -795,6 +808,12 @@ class BleakRetryBackend(BleConnectionBackend):
     def __init__(self):
         self.adapter_index = 0
         self.current_adapter = None
+        self._slot = None
+
+    def _release_slot(self):
+        if self._slot is not None:
+            self._slot.release()
+            self._slot = None
 
     def _select_adapter(self, address):
         """
@@ -806,11 +825,30 @@ class BleakRetryBackend(BleConnectionBackend):
         is talking over an adapter there is no reason to go back and re-probe a
         preferred one that may be gone, and the modulo brings the list round to
         it again if this one later fails.
+
+        With adapter slots enabled, choosing and claiming are one atomic act:
+        the list is walked from the rotation point and the first adapter with a
+        free slot is both selected and claimed, so two processes choosing at
+        the same moment cannot land on the same slot. A slot already held from
+        the previous attempt keeps the battery on that adapter, which is what
+        makes a dropped link reconnect where it was; the failure path releases
+        it before rotating. If every adapter is fully occupied, the preferred
+        one is used unlocked: coordination is an optimization, not a gate.
         """
         adapters = adapters_in_attempt_order(address)
         if not adapters:
             return None
-        return adapters[self.adapter_index % len(adapters)]
+        if adapter_slot_manager is None:
+            return adapters[self.adapter_index % len(adapters)]
+        if self._slot is not None:
+            return self._slot.adapter
+        start = self.adapter_index % len(adapters)
+        adapter, slot = adapter_slot_manager.acquire_first(adapters[start:] + adapters[:start])
+        if slot is not None:
+            self._slot = slot
+            return adapter
+        logger.info(f"BLE [{address}] all adapter slots held, connecting unlocked on {adapters[start]}")
+        return adapters[start]
 
     def create_client(self, address, disconnected_callback):
         # establish_connection() creates the client itself
@@ -822,7 +860,9 @@ class BleakRetryBackend(BleConnectionBackend):
         try:
             return await self._establish(client, address, notify_char, notify_callback)
         except Exception:
-            # a failed attempt, so the next one goes out on the next adapter
+            # a failed attempt, so the next one goes out on the next adapter,
+            # and the slot is given up so the walk can claim a different one
+            self._release_slot()
             self.adapter_index += 1
             raise
 
@@ -856,6 +896,8 @@ class BleakRetryBackend(BleConnectionBackend):
         return device
 
     async def release(self, client):
+        # the connection is over, so its claim on the adapter is too
+        self._release_slot()
         await client.disconnect()
 
 
