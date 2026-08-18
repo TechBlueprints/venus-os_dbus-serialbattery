@@ -1269,8 +1269,22 @@ class DbusHelper:
                     )
 
                     # Exit if recovery time exceeded and
-                    # if BLOCK_ON_DISCONNECT is enabled or cell voltages are unsafe
-                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good):
+                    # if BLOCK_ON_DISCONNECT is enabled or cell voltages are unsafe.
+                    # A guarding fallback vetoes the cell-voltage fast path, and only
+                    # that: the fast exit reasons "running blind near the limits, so
+                    # restart hard and early", and a fallback serving live in-band
+                    # data means the premise is false. Everything that fires on a
+                    # true fact - the flapping warning above, the 30 min ladder, the
+                    # exit's own cable alarm - stays exactly as stock, because an
+                    # alarm with a valid reason must fire even while the system is
+                    # safe. BLOCK_ON_DISCONNECT is an explicit operator choice and
+                    # is never vetoed. Batteries without the fallback feature do not
+                    # have the attribute and keep stock behavior.
+                    fallback_guarding = getattr(self.battery, "fallback_guarding", None)
+                    fallback_guarding = bool(fallback_guarding()) if callable(fallback_guarding) else False
+                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (
+                        utils.BLOCK_ON_DISCONNECT or (not self.cell_voltages_good and not fallback_guarding)
+                    ):
                         recovery_failed = True
                     # Exit if extended recovery time exceeded
                     # This is only possible if cell voltages are good and BLOCK_ON_DISCONNECT is disabled else it would have exited earlier

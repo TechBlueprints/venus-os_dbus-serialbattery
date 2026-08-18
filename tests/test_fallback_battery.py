@@ -1646,3 +1646,49 @@ class TestUtilsImportTimeConfig:
         errors = self._import_utils_with_config(tmp_path, "[DEFAULT]\n")
         assert not any("FALLBACK_STOP_MINUTES" in error for error in errors)
         assert not hasattr(utils, "FALLBACK_STOP_MINUTES")
+
+
+class TestFallbackGuarding:
+    """
+    fallback_guarding() is what lets DbusHelper skip its blind-operation fast
+    exit and cable alarms: it must be True exactly when the fallback is
+    healthy enough to vouch for the system, and collapse to False the moment
+    any leg of that health stops holding.
+    """
+
+    def _guarding_wrapper(self, monkeypatch):
+        wrapper = _make_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_fallback_mode", True)
+        object.__setattr__(wrapper, "_serving", True)
+        object.__setattr__(wrapper, "_charge_blocked", False)
+        object.__setattr__(wrapper, "_discharge_blocked", False)
+        wrapper.bms_cable_alarm = 0
+        return wrapper
+
+    def test_a_healthy_serving_fallback_guards(self, monkeypatch):
+        assert self._guarding_wrapper(monkeypatch).fallback_guarding() is True
+
+    def test_no_guarding_outside_fallback_mode(self, monkeypatch):
+        wrapper = self._guarding_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_fallback_mode", False)
+        assert wrapper.fallback_guarding() is False
+
+    def test_no_guarding_when_the_shunt_stops_serving(self, monkeypatch):
+        """Both instruments gone is the one case the stock ladder must own."""
+        wrapper = self._guarding_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_serving", False)
+        assert wrapper.fallback_guarding() is False
+
+    def test_no_guarding_when_projected_cells_left_the_safe_band(self, monkeypatch):
+        wrapper = self._guarding_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_charge_blocked", True)
+        assert wrapper.fallback_guarding() is False
+        object.__setattr__(wrapper, "_charge_blocked", False)
+        object.__setattr__(wrapper, "_discharge_blocked", True)
+        assert wrapper.fallback_guarding() is False
+
+    def test_no_guarding_once_the_suppression_window_expires(self, monkeypatch):
+        """After 8 h the outage is the alarm's to report; guarding must not mute it."""
+        wrapper = self._guarding_wrapper(monkeypatch)
+        wrapper.bms_cable_alarm = 1
+        assert wrapper.fallback_guarding() is False
