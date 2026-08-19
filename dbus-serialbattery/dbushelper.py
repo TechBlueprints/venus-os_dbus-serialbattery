@@ -1259,10 +1259,22 @@ class DbusHelper:
                         + f"Threshold: {self.battery.get_seconds_to_string(self.disconnect_threshold, 3)}"
                     )
 
+                    # While a healthy fallback is serving, the outage's one voice is
+                    # the wrapper's own BmsCable warning, delayed by
+                    # FALLBACK_BMS_CABLE_WARN_MINUTES: that config is a promise, and
+                    # this 60 s flapping warning was breaking it - three "BMS cable
+                    # fault" pushes in one night (2026-08-19) for radio blips whose
+                    # total data loss was seconds, each echoed again by
+                    # AggregateBatteries. There is no cable fault while data is
+                    # flowing; when guarding ends, this warning runs as stock.
+                    fallback_guarding = getattr(self.battery, "fallback_guarding", None)
+                    fallback_guarding = bool(fallback_guarding()) if callable(fallback_guarding) else False
+
                     # set BMS cable alarm to warning
                     self.bms_cable_alarm = (
                         1
-                        if self.error["timestamp_last"] is not None
+                        if not fallback_guarding
+                        and self.error["timestamp_last"] is not None
                         and self.error["timestamp_first"] is not None
                         and 60 < self.error["timestamp_last"] - self.error["timestamp_first"]
                         else 0
@@ -1280,8 +1292,6 @@ class DbusHelper:
                     # safe. BLOCK_ON_DISCONNECT is an explicit operator choice and
                     # is never vetoed. Batteries without the fallback feature do not
                     # have the attribute and keep stock behavior.
-                    fallback_guarding = getattr(self.battery, "fallback_guarding", None)
-                    fallback_guarding = bool(fallback_guarding()) if callable(fallback_guarding) else False
                     if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (
                         utils.BLOCK_ON_DISCONNECT or (not self.cell_voltages_good and not fallback_guarding)
                     ):
