@@ -1315,8 +1315,15 @@ class DbusHelper:
             # check if recovery failed and exit the loop to restart the driver
             # do this after publishing to dbus to set the alert from warning to error state
             if recovery_failed:
-                # set BMS cable alarm to error before exiting
-                self._dbusservice["/Alarms/BmsCable"] = 2
+                # A BLE gap with a healthy fallback serving is degraded
+                # visibility, not an outage: the system still decides sensibly
+                # from the shunt, and FALLBACK_BMS_CABLE_WARN_MINUTES marks
+                # where that stops being true. An exit while guarding is a
+                # quiet restart; the cable alarm fires only when the fallback
+                # itself can no longer vouch.
+                guarding = getattr(self.battery, "fallback_guarding", None)
+                guarding = bool(guarding()) if callable(guarding) else False
+                self._dbusservice["/Alarms/BmsCable"] = 0 if guarding else 2
                 logger.error(f">>> Battery did not recover in {time_since_first_error} s. Exit driver...")
                 loop.quit()
 
