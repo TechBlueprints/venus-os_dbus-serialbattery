@@ -11,6 +11,7 @@ from time import sleep
 from utils import (
     logger,
     BLUETOOTH_ADAPTERS,
+    BLUETOOTH_ADAPTER_CLAIMS,
     BLUETOOTH_CONNECTION_BACKEND,
     BLUETOOTH_FORCE_RESET_BLE_STACK,
     capture_raw_data,
@@ -52,6 +53,15 @@ def parse_adapter_entries(entries):
 
 
 BLUETOOTH_DEVICE_ADAPTERS, BLUETOOTH_ADAPTER_POOL = parse_adapter_entries(BLUETOOTH_ADAPTERS)
+
+
+def claim_manager_for(address):
+    """This battery's /run/bt-claims manager, or None when not participating."""
+    if BLUETOOTH_ADAPTER_CLAIMS != "soft":
+        return None
+    from bt_claims import ClaimManager
+
+    return ClaimManager(owner=f"dbus-serialbattery.{str(address).replace(':', '').lower()}")
 
 
 def adapters_for(address):
@@ -795,6 +805,13 @@ class BleakRetryBackend(BleConnectionBackend):
     def __init__(self):
         self.adapter_index = 0
         self.current_adapter = None
+        self._claims = None
+        self._claim = None
+
+    def _release_claim(self):
+        if self._claims and self._claim is not None:
+            self._claims.release(self._claim)
+            self._claim = None
 
     def _select_adapter(self, address):
         """
@@ -810,7 +827,16 @@ class BleakRetryBackend(BleConnectionBackend):
         adapters = adapters_in_attempt_order(address)
         if not adapters:
             return None
-        return adapters[self.adapter_index % len(adapters)]
+        if self._claims is None:
+            self._claims = claim_manager_for(address) or False
+        if not self._claims:
+            return adapters[self.adapter_index % len(adapters)]
+        if self._claim is not None:
+            # a held claim keeps a dropped link reconnecting where it was
+            return self._claim.adapter
+        start = self.adapter_index % len(adapters)
+        adapter, self._claim = self._claims.choose(adapters[start:] + adapters[:start])
+        return adapter
 
     def create_client(self, address, disconnected_callback):
         # establish_connection() creates the client itself
@@ -822,7 +848,9 @@ class BleakRetryBackend(BleConnectionBackend):
         try:
             return await self._establish(client, address, notify_char, notify_callback)
         except Exception:
-            # a failed attempt, so the next one goes out on the next adapter
+            # a failed attempt: give up the claim so the next walk can place
+            # freely, and move the index so it starts from the next adapter
+            self._release_claim()
             self.adapter_index += 1
             raise
 
@@ -856,6 +884,8 @@ class BleakRetryBackend(BleConnectionBackend):
         return device
 
     async def release(self, client):
+        # the connection is over, so its claim on the adapter is too
+        self._release_claim()
         await client.disconnect()
 
 
