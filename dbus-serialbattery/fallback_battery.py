@@ -80,6 +80,12 @@ class FallbackBattery:
     #: nothing, so the age of the data is the only honest source selector.
     FRESHNESS_SECONDS = 15.0
 
+    # Continuous shunt SoC alignment: how often the drift check runs, and the
+    # near-full region where the shunt's own charged-voltage sync owns the
+    # value and this feature must not fight it.
+    SOC_SYNC_CHECK_SECONDS = 60.0
+    SOC_SYNC_NEAR_FULL = 95.0
+
     # ── cell projection ──────────────────────────────────────────────────
     #: Re-entry margin for the safe-zone band checks (volts per cell): a
     #: direction blocked at a band edge is only re-allowed once the
@@ -137,6 +143,8 @@ class FallbackBattery:
             "_dbus_connection",
             "_shunt",
             "_shunt_alive",
+            "_shunt_alive_time",
+            "_soc_sync_check_time",
             "_serving",
             "_last_fresh_time",
             "_fallback_mode",
@@ -230,6 +238,7 @@ class FallbackBattery:
         """This cycle's fallback sensor readings, taken once per refresh."""
         self._shunt_alive: bool = False
         self._shunt_alive_time: float = 0.0
+        self._soc_sync_check_time: float = 0.0
         self._serving: bool = False
         """True while this cycle's published values come from the shunt."""
         self._last_fresh_time: float = 0.0
@@ -548,6 +557,9 @@ class FallbackBattery:
         self._serving = want_fallback and self._shunt_alive
 
         self._update_fallback_mode(fresh)
+
+        if not want_fallback:
+            self._sync_shunt_soc()
         self._update_projection()
         self._update_alarms()
         self._update_recovery_ladder()
@@ -556,6 +568,57 @@ class FallbackBattery:
         return True if self._serving else result
 
     # ── governance ───────────────────────────────────────────────────────
+
+    def _sync_shunt_soc(self) -> None:
+        """
+        Keep the shunt's absolute SoC aligned with the BMS while it is truth.
+
+        The BMS and the shunt are independent estimates and drift apart; at a
+        BLE loss the shunt then takes over carrying the wrong absolute value.
+        Rather than reconciling at the handoff, this aligns continuously: while
+        the BMS is healthy, a drift beyond FALLBACK_SHUNT_SOC_SYNC_DRIFT is
+        corrected by programming the BMS value into the shunt, whose coulomb
+        counting continues from the new value. The shunt is then already
+        truth-aligned at any disconnect, and the anchor formula has nothing
+        left to correct.
+
+        Drift-gated and rate-limited: each write is an instrument state change
+        over VE.Direct, so it happens only when the drift says so, at most once
+        per check interval, and every sync is logged with the drift it
+        corrected - the drift rate is the health signal alignment would
+        otherwise hide. Near full the shunt's own charged-voltage detection
+        owns the value and this stays out of its way.
+
+        :return: None
+        """
+        threshold = getattr(utils, "FALLBACK_SHUNT_SOC_SYNC_DRIFT", 0.0)
+        if not threshold or threshold <= 0:
+            return
+        now = time()
+        if now - self._soc_sync_check_time < self.SOC_SYNC_CHECK_SECONDS:
+            return
+        self._soc_sync_check_time = now
+        objects = self.dbus_fallback_objects or {}
+        item = objects.get("Soc")
+        bms_soc = self.battery.soc
+        if item is None or bms_soc is None or not 0 < bms_soc <= 100:
+            return
+        if bms_soc >= self.SOC_SYNC_NEAR_FULL:
+            return
+        try:
+            shunt_soc = item.get_value()
+        except Exception:
+            return
+        if shunt_soc is None:
+            return
+        drift = float(shunt_soc) - float(bms_soc)
+        if abs(drift) < threshold:
+            return
+        try:
+            item.set_value(round(float(bms_soc), 1))
+            logger.info(f"Shunt SoC synced to BMS: {bms_soc:.1f}% (was {float(shunt_soc):.1f}%, drift {drift:+.1f}%)")
+        except Exception as e:
+            logger.warning(f"Shunt SoC sync failed: {repr(e)}")
 
     def _update_fallback_mode(self, fresh: bool) -> None:
         """
