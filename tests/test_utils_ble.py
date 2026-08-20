@@ -7,15 +7,22 @@ registered before the import so the non-BLE logic can be exercised for real.
 Everything that actually talks to a radio is left untested here.
 """
 
+import asyncio
 import configparser
 import importlib.util
 import os
 import sys
+import time
 import types
+
+import pytest
 
 DRIVER_DIR = os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery")
 CONFIG_DEFAULT = os.path.join(DRIVER_DIR, "config.default.ini")
 sys.path.insert(0, DRIVER_DIR)
+# the driver puts ext on sys.path before importing utils_ble; do the same so
+# the vendored bt_claims resolves for the claims tests
+sys.path.insert(1, os.path.join(DRIVER_DIR, "ext"))
 
 if "bleak" not in sys.modules:
     sys.modules["bleak"] = types.SimpleNamespace(BleakClient=type("BleakClient", (), {"__init__": lambda self, *a, **kw: None}))
@@ -333,3 +340,178 @@ def test_the_retry_connector_establish_is_aliased_against_shadowing():
     backend calling the right one, and no other test reaches the connect path.
     """
     assert utils_ble.retry_establish_connection is sys.modules["bleak_retry_connector"].establish_connection
+
+
+# ---------------------------------------------------------------------------
+# /run/bt-claims adapter claims (bt_claims.py)
+
+
+def _manager(tmp_path, owner="svc-a"):
+    from bt_claims import ClaimManager
+
+    return ClaimManager(owner=owner, claim_dir=str(tmp_path))
+
+
+def _age(path, seconds):
+    old = time.time() - seconds
+    os.utime(path, (old, old))
+
+
+def test_a_hard_claim_is_exclusive_and_a_racing_claimant_loses(tmp_path):
+    a = _manager(tmp_path, "scanner-a")
+    b = _manager(tmp_path, "scanner-b")
+    claim = a.claim_hard("hci4")
+    assert claim is not None
+    assert b.claim_hard("hci4") is None
+    a.release(claim)
+    reclaimed = b.claim_hard("hci4")
+    assert reclaimed is not None
+    b.release(reclaimed)
+
+
+def test_a_stale_hard_claim_is_reaped_and_taken(tmp_path):
+    """A dead scanner must not hold its card forever: dead pid + old mtime = free."""
+    a = _manager(tmp_path)
+    path = os.path.join(str(tmp_path), "hci4.scan")
+    with open(path, "w") as f:
+        f.write("99999999 dead-scanner 0\n")
+    _age(path, 3600)
+    claim = a.claim_hard("hci4")
+    assert claim is not None
+    a.release(claim)
+
+
+def test_a_crashed_holders_claim_is_dead_immediately_not_after_the_ttl(tmp_path):
+    """
+    The pid check is what makes crash detection instant: a dead process with
+    a still-fresh heartbeat file must not hold its card for the TTL tail.
+    """
+    b = _manager(tmp_path, "scanner-b")
+    path = os.path.join(str(tmp_path), "hci4.scan")
+    with open(path, "w") as f:
+        f.write("99999999 crashed-scanner 0\n")  # dead pid, fresh mtime
+    taken = b.claim_hard("hci4")
+    assert taken is not None
+    b.release(taken)
+
+
+def test_a_wedged_but_alive_holder_loses_its_claim_after_the_ttl(tmp_path):
+    """
+    Liveness needs BOTH a running pid and a fresh heartbeat. A hung scanner
+    that stops beating must not hold its card forever; the TTL is the bound
+    on how long a wedge can monopolize an adapter.
+    """
+    a = _manager(tmp_path, "scanner-a")
+    b = _manager(tmp_path, "scanner-b")
+    claim = a.claim_hard("hci4")
+    _age(claim.path, 3600)  # pid alive, heartbeat long overdue
+    taken = b.claim_hard("hci4")
+    assert taken is not None
+    b.release(taken)
+
+
+def test_placement_avoids_a_hard_claimed_adapter(tmp_path):
+    scanner = _manager(tmp_path, "scanner")
+    battery = _manager(tmp_path, "battery")
+    hard = scanner.claim_hard("hci1")
+    adapter, claim = battery.choose(["hci1", "hci2"])
+    try:
+        assert adapter == "hci2"
+    finally:
+        battery.release(claim)
+        scanner.release(hard)
+
+
+def test_placement_prefers_the_less_claimed_adapter(tmp_path):
+    other = _manager(tmp_path, "other-service")
+    battery = _manager(tmp_path, "battery")
+    theirs = other.claim_soft("hci1")
+    adapter, claim = battery.choose(["hci1", "hci2"])
+    try:
+        assert adapter == "hci2"
+    finally:
+        battery.release(claim)
+        other.release(theirs)
+
+
+def test_soft_claims_share_when_there_is_no_alternative(tmp_path):
+    """Soft means soft: a fully-claimed world ranks, it never refuses."""
+    other = _manager(tmp_path, "other-service")
+    battery = _manager(tmp_path, "battery")
+    held = [other.claim_soft("hci1"), other.claim_soft("hci2")]
+    adapter, claim = battery.choose(["hci1", "hci2"])
+    try:
+        assert adapter in ("hci1", "hci2")
+        assert claim is not None
+    finally:
+        battery.release(claim)
+        for h in held:
+            other.release(h)
+
+
+def test_a_hard_claim_never_keeps_a_battery_off_the_air(tmp_path):
+    scanner = _manager(tmp_path, "scanner")
+    battery = _manager(tmp_path, "battery")
+    hard = scanner.claim_hard("hci1")
+    adapter, claim = battery.choose(["hci1"])
+    try:
+        assert adapter == "hci1"
+    finally:
+        battery.release(claim)
+        scanner.release(hard)
+
+
+def test_an_unusable_claim_directory_degrades_to_uncoordinated(tmp_path):
+    from bt_claims import ClaimManager
+
+    m = ClaimManager(owner="battery", claim_dir="/proc/definitely/not/writable")
+    adapter, claim = m.choose(["hci1", "hci2"])
+    assert adapter == "hci1"
+    assert claim is None
+
+
+def test_claim_files_carry_pid_service_and_since(tmp_path):
+    m = _manager(tmp_path, "svc")
+    claim = m.claim_soft("hci1")
+    try:
+        with open(claim.path) as f:
+            pid, service, since = f.read().split()
+        assert int(pid) == os.getpid()
+        assert int(since) > 0
+    finally:
+        m.release(claim)
+
+
+def test_backend_reuses_its_claim_so_a_drop_reconnects_on_the_same_adapter(tmp_path):
+    original_devs = utils_ble.BLUETOOTH_ADAPTER_PINS
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": ["hci1", "hci2"]}
+    backend = utils_ble.get_ble_backend("BleakRetryBackend")
+    backend._claims = _manager(tmp_path, "battery")
+    try:
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci1"
+        assert backend._claim is not None and backend._claim.adapter == "hci1"
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci1"
+    finally:
+        backend._release_claim()
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_devs
+
+
+def test_backend_releases_its_claim_on_a_failed_connect_before_rotating(tmp_path):
+    original_devs = utils_ble.BLUETOOTH_ADAPTER_PINS
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": ["hci1", "hci2"]}
+    backend = utils_ble.get_ble_backend("BleakRetryBackend")
+    backend._claims = _manager(tmp_path, "battery")
+    try:
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci1"
+        with pytest.raises(Exception):
+            asyncio.run(backend.establish(None, "C8:47:8C:00:00:00", "char", None))
+        assert backend._claim is None
+        assert not os.path.exists(os.path.join(str(tmp_path), "hci1.use.battery"))
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci2"
+    finally:
+        backend._release_claim()
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_devs
