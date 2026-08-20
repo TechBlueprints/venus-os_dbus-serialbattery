@@ -60,6 +60,64 @@ def adapters_for(address):
     return list(pins) if pins else None
 
 
+def bluez_present_adapters():
+    """
+    Adapter names BlueZ currently exposes, or an empty set for "no answer".
+
+    hciN names are not stable identities: a USB reset or reboot renumbers
+    them, and an adapter a battery is configured for can stop existing while
+    its number lives on pointing at different hardware. Selection therefore
+    asks BlueZ what exists right now rather than trusting the config's names.
+
+    A private connection, closed again before returning: dbus.SystemBus()
+    hands out a cached shared connection, and creating that before the driver
+    installs its main loop breaks every later signal receiver on it.
+    """
+    present = set()
+    bus = None
+    try:
+        import dbus
+
+        bus = dbus.SystemBus(private=True)
+        manager = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
+        for path, interfaces in manager.GetManagedObjects().items():
+            parts = str(path).split("/")
+            if len(parts) >= 4 and "org.bluez.Adapter1" in interfaces:
+                present.add(parts[3])
+    except Exception as e:
+        logger.debug(f"BlueZ adapter state unavailable, using configured order: {repr(e)}")
+        return set()
+    finally:
+        if bus is not None:
+            try:
+                bus.close()
+            except Exception:
+                pass
+    return present
+
+
+def adapters_in_attempt_order(address, present=None):
+    """
+    Adapters to try for this battery, best first.
+
+    A battery uses its own configured adapters, or the shared pool if it has
+    none; either list is walked by index, advancing only after a failed
+    connection attempt. Adapters BlueZ does not currently expose are dropped:
+    a battery whose radio was renumbered away by a USB reset must reach its
+    next adapter rather than keep asking for a name that no longer resolves.
+    If filtering would leave nothing, the configured list is returned
+    unfiltered - refusing to attempt a connection is worse than trying an
+    adapter that may not be there.
+    """
+    adapters = adapters_for(address) or list(BLUETOOTH_ADAPTER_POOL)
+    if not adapters:
+        return []
+    if present is None:
+        present = bluez_present_adapters()
+    usable = [a for a in adapters if a in present] if present else list(adapters)
+    return usable if usable else list(adapters)
+
+
 # Hold flag: while the flag file for a device exists, the reconnect loop makes
 # no connection attempts for that device at all, giving a degraded BMS radio
 # extended quiet. The driver, its dbus service and its published data stay up,
@@ -120,22 +178,38 @@ class BleakBackend(BleConnectionBackend):
     behavior of this driver.
 
     If BLUETOOTH_ADAPTERS is set, connections are made only via the listed
-    adapters: a device pinned with MAC@hciX always uses that adapter, every
-    other device takes the next entry of the shared pool after a failed
-    attempt. An empty list uses the system default adapter.
+    adapters. A device with its own MAC@hciX entries uses those and never the
+    shared pool; every other device uses the pool. Either list is walked in
+    order, moving on only after a failed attempt, so a dropped link reconnects
+    on the adapter it was using, and adapters BlueZ does not currently expose
+    are skipped. An empty list uses the system default adapter.
     """
 
     def __init__(self):
         self.adapter_index = 0
         self.current_adapter = None
 
+    def _select_adapter(self, address):
+        """
+        Adapter for the next attempt, or None when nothing is configured.
+
+        The order is recomputed from live BlueZ state each time, so an adapter
+        that has gone away is accounted for without the driver having to
+        remember anything. The index only advances when an attempt fails, so a
+        dropped link reconnects on the adapter it was already using and only a
+        failed connect moves on to the next one. It is never reset on success:
+        once a battery is talking over an adapter there is no reason to
+        re-probe a preferred one that may be gone, and the modulo brings the
+        list round to it again if this one later fails.
+        """
+        adapters = adapters_in_attempt_order(address)
+        if not adapters:
+            return None
+        return adapters[self.adapter_index % len(adapters)]
+
     def create_client(self, address, disconnected_callback):
         kwargs = {}
-        pinned = adapters_for(address)
-        if pinned:
-            self.current_adapter = pinned[0]
-        elif BLUETOOTH_ADAPTER_POOL:
-            self.current_adapter = BLUETOOTH_ADAPTER_POOL[self.adapter_index % len(BLUETOOTH_ADAPTER_POOL)]
+        self.current_adapter = self._select_adapter(address)
         if self.current_adapter:
             kwargs["adapter"] = self.current_adapter
         return BleakClient(address, disconnected_callback=disconnected_callback, **kwargs)
@@ -144,10 +218,8 @@ class BleakBackend(BleConnectionBackend):
         try:
             return await self._establish(client, address, notify_char, notify_callback)
         except Exception:
-            # rotate to the next pool adapter for the next attempt; pinned
-            # devices never rotate, and an all-pinned config has an empty pool
-            if BLUETOOTH_ADAPTER_POOL:
-                self.adapter_index += 1
+            # a failed attempt, so the next one goes out on the next adapter
+            self.adapter_index += 1
             raise
 
     async def _establish(self, client, address, notify_char, notify_callback):
