@@ -1102,18 +1102,47 @@ class DbusHelper:
                         + f"Threshold: {self.battery.get_seconds_to_string(self.disconnect_threshold, 3)}"
                     )
 
+                    # While fallback coverage exists, the outage's one voice is the
+                    # wrapper's own BmsCable warning, delayed by
+                    # FALLBACK_BMS_CABLE_WARN_MINUTES: that config is a promise, and
+                    # this 60 s flapping warning would break it with a push for
+                    # radio blips whose total data loss is seconds. guarding asks
+                    # whether coverage is ENGAGED and gates the fast exit below;
+                    # the warning gates on covering - coverage EXISTS - because
+                    # serving deliberately waits out a freshness window after a
+                    # drop, and a warning evaluated inside that window would leak.
+                    # When coverage ends, both run as stock. Batteries without the
+                    # fallback feature have neither attribute and are untouched.
+                    fallback_guarding = getattr(self.battery, "fallback_guarding", None)
+                    fallback_guarding = bool(fallback_guarding()) if callable(fallback_guarding) else False
+                    fallback_covering = getattr(self.battery, "fallback_covering", None)
+                    fallback_covering = bool(fallback_covering()) if callable(fallback_covering) else fallback_guarding
+
                     # set BMS cable alarm to warning
                     self.bms_cable_alarm = (
                         1
-                        if self.error["timestamp_last"] is not None
+                        if not fallback_covering
+                        and self.error["timestamp_last"] is not None
                         and self.error["timestamp_first"] is not None
                         and 60 < self.error["timestamp_last"] - self.error["timestamp_first"]
                         else 0
                     )
 
                     # Exit if recovery time exceeded and
-                    # if BLOCK_ON_DISCONNECT is enabled or cell voltages are unsafe
-                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (utils.BLOCK_ON_DISCONNECT or not self.cell_voltages_good):
+                    # if BLOCK_ON_DISCONNECT is enabled or cell voltages are unsafe.
+                    # A guarding fallback vetoes the cell-voltage fast path, and only
+                    # that: the fast exit reasons "running blind near the limits, so
+                    # restart hard and early", and a fallback serving live in-band
+                    # data means the premise is false. Everything that fires on a
+                    # true fact - the flapping warning above, the 30 min ladder, the
+                    # exit's own cable alarm - stays exactly as stock, because an
+                    # alarm with a valid reason must fire even while the system is
+                    # safe. BLOCK_ON_DISCONNECT is an explicit operator choice and
+                    # is never vetoed. Batteries without the fallback feature do not
+                    # have the attribute and keep stock behavior.
+                    if time_since_first_error >= RETRY_CYCLE_LONG_COUNT and (
+                        utils.BLOCK_ON_DISCONNECT or (not self.cell_voltages_good and not fallback_guarding)
+                    ):
                         recovery_failed = True
                     # Exit if extended recovery time exceeded
                     # This is only possible if cell voltages are good and BLOCK_ON_DISCONNECT is disabled else it would have exited earlier
@@ -1134,8 +1163,15 @@ class DbusHelper:
             # check if recovery failed and exit the loop to restart the driver
             # do this after publishing to dbus to set the alert from warning to error state
             if recovery_failed:
-                # set BMS cable alarm to error before exiting
-                self._dbusservice["/Alarms/BmsCable"] = 2
+                # A BLE gap with a healthy fallback serving is degraded
+                # visibility, not an outage: the system still decides sensibly
+                # from the shunt, and FALLBACK_BMS_CABLE_WARN_MINUTES marks
+                # where that stops being true. An exit while guarding is a
+                # quiet restart; the cable alarm fires only when the fallback
+                # itself can no longer vouch.
+                guarding = getattr(self.battery, "fallback_guarding", None)
+                guarding = bool(guarding()) if callable(guarding) else False
+                self._dbusservice["/Alarms/BmsCable"] = 0 if guarding else 2
                 logger.error(f">>> Battery did not recover in {time_since_first_error} s. Exit driver...")
                 loop.quit()
 
@@ -1330,7 +1366,13 @@ class DbusHelper:
         self._dbusservice["/Alarms/LowTemperature"] = self.battery.protection.low_temperature
         # a battery can raise a cable alarm of its own: while a fallback sensor
         # is serving, values keep arriving and this helper sees no error at all
-        bms_cable_alarm = max(self.bms_cable_alarm, getattr(self.battery, "bms_cable_alarm", 0) or 0)
+        covering = getattr(self.battery, "fallback_covering", None)
+        covering = bool(covering()) if callable(covering) else False
+        wrapper_cable_alarm = getattr(self.battery, "bms_cable_alarm", 0) or 0
+        # While coverage exists the wrapper's delayed warning is the one voice;
+        # without it a leaked helper warning latches for the next 60 s even
+        # though the condition that set it is already gone.
+        bms_cable_alarm = wrapper_cable_alarm if covering else max(self.bms_cable_alarm, wrapper_cable_alarm)
         self._dbusservice["/Alarms/BmsCable"] = bms_cable_alarm if utils.BMS_CABLE_ALARM else 0
         self._dbusservice["/Alarms/HighInternalTemperature"] = self.battery.protection.high_internal_temperature
         self._dbusservice["/Alarms/FuseBlown"] = self.battery.protection.fuse_blown

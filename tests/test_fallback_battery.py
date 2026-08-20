@@ -1646,3 +1646,106 @@ class TestUtilsImportTimeConfig:
         errors = self._import_utils_with_config(tmp_path, "[DEFAULT]\n")
         assert not any("FALLBACK_STOP_MINUTES" in error for error in errors)
         assert not hasattr(utils, "FALLBACK_STOP_MINUTES")
+
+
+class TestFallbackGuarding:
+    """
+    fallback_guarding() is what lets DbusHelper skip its blind-operation fast
+    exit and cable alarms: it must be True exactly when the fallback is
+    healthy enough to vouch for the system, and collapse to False the moment
+    any leg of that health stops holding.
+    """
+
+    def _guarding_wrapper(self, monkeypatch):
+        wrapper = _make_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_fallback_mode", True)
+        object.__setattr__(wrapper, "_serving", True)
+        object.__setattr__(wrapper, "_charge_blocked", False)
+        object.__setattr__(wrapper, "_discharge_blocked", False)
+        wrapper.bms_cable_alarm = 0
+        return wrapper
+
+    def test_a_healthy_serving_fallback_guards(self, monkeypatch):
+        assert self._guarding_wrapper(monkeypatch).fallback_guarding() is True
+
+    def test_no_guarding_outside_fallback_mode(self, monkeypatch):
+        wrapper = self._guarding_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_fallback_mode", False)
+        assert wrapper.fallback_guarding() is False
+
+    def test_no_guarding_when_the_shunt_stops_serving(self, monkeypatch):
+        """Both instruments gone is the one case the stock ladder must own."""
+        wrapper = self._guarding_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_serving", False)
+        assert wrapper.fallback_guarding() is False
+
+    def test_no_guarding_when_projected_cells_left_the_safe_band(self, monkeypatch):
+        wrapper = self._guarding_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_charge_blocked", True)
+        assert wrapper.fallback_guarding() is False
+        object.__setattr__(wrapper, "_charge_blocked", False)
+        object.__setattr__(wrapper, "_discharge_blocked", True)
+        assert wrapper.fallback_guarding() is False
+
+    def test_no_guarding_once_the_suppression_window_expires(self, monkeypatch):
+        """After 8 h the outage is the alarm's to report; guarding must not mute it."""
+        wrapper = self._guarding_wrapper(monkeypatch)
+        wrapper.bms_cable_alarm = 1
+        assert wrapper.fallback_guarding() is False
+
+
+class TestFallbackCovering:
+    """
+    fallback_covering() gates the cable warning: it must span the freshness
+    gap where guarding is momentarily false (the 2026-08-19 warning leaks),
+    while never claiming coverage from a shunt that is actually gone.
+    """
+
+    def _covering_wrapper(self, monkeypatch):
+        import time as _time
+
+        wrapper = _make_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_fallback_mode", False)
+        object.__setattr__(wrapper, "_serving", False)
+        object.__setattr__(wrapper, "_charge_blocked", False)
+        object.__setattr__(wrapper, "_discharge_blocked", False)
+        wrapper.bms_cable_alarm = 0
+        object.__setattr__(wrapper, "_shunt_alive_time", _time.time())
+        # a configured fallback is the premise of every covering question
+        object.__setattr__(wrapper, "dbus_fallback_objects", {"voltage": object()})
+        return wrapper
+
+    def test_a_recently_alive_shunt_covers_through_the_freshness_gap(self, monkeypatch):
+        wrapper = self._covering_wrapper(monkeypatch)
+        assert wrapper.fallback_guarding() is False
+        assert wrapper.fallback_covering() is True
+
+    def test_guarding_always_covers(self, monkeypatch):
+        wrapper = self._covering_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_shunt_alive_time", 0.0)
+        object.__setattr__(wrapper, "_fallback_mode", True)
+        object.__setattr__(wrapper, "_serving", True)
+        assert wrapper.fallback_covering() is True
+
+    def test_a_long_dead_shunt_does_not_cover(self, monkeypatch):
+        wrapper = self._covering_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_shunt_alive_time", 0.0)
+        assert wrapper.fallback_covering() is False
+
+    def test_no_cover_without_a_configured_fallback(self, monkeypatch):
+        wrapper = self._covering_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "dbus_fallback_objects", None)
+        assert wrapper.fallback_covering() is False
+
+    def test_no_cover_when_the_band_blocked_charging(self, monkeypatch):
+        wrapper = self._covering_wrapper(monkeypatch)
+        object.__setattr__(wrapper, "_charge_blocked", True)
+        assert wrapper.fallback_covering() is False
+        object.__setattr__(wrapper, "_charge_blocked", False)
+        object.__setattr__(wrapper, "_discharge_blocked", True)
+        assert wrapper.fallback_covering() is False
+
+    def test_no_cover_once_the_wrapper_itself_warns(self, monkeypatch):
+        wrapper = self._covering_wrapper(monkeypatch)
+        wrapper.bms_cable_alarm = 1
+        assert wrapper.fallback_covering() is False
