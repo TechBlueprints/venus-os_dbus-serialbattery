@@ -71,20 +71,26 @@ def adapters_for(address):
     return list(pins) if pins else None
 
 
-def bluez_present_adapters():
+def bluez_adapter_state():
     """
-    Adapter names BlueZ currently exposes, or an empty set for "no answer".
+    (present, discovering): what BlueZ exposes, and where a scan is running.
 
     hciN names are not stable identities: a USB reset or reboot renumbers
     them, and an adapter a battery is configured for can stop existing while
     its number lives on pointing at different hardware. Selection therefore
     asks BlueZ what exists right now rather than trusting the config's names.
 
+    Discovering is per adapter and true while ANY client scans it, including
+    services that follow no convention of ours - it is the system's own
+    answer to "is this card busy listening", and scanning is the one activity
+    on an adapter that degrades everything else sharing it.
+
     A private connection, closed again before returning: dbus.SystemBus()
     hands out a cached shared connection, and creating that before the driver
     installs its main loop breaks every later signal receiver on it.
     """
     present = set()
+    discovering = set()
     bus = None
     try:
         import dbus
@@ -93,21 +99,24 @@ def bluez_present_adapters():
         manager = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
         for path, interfaces in manager.GetManagedObjects().items():
             parts = str(path).split("/")
-            if len(parts) >= 4 and "org.bluez.Adapter1" in interfaces:
+            adapter = interfaces.get("org.bluez.Adapter1")
+            if len(parts) >= 4 and adapter is not None:
                 present.add(parts[3])
+                if bool(adapter.get("Discovering")):
+                    discovering.add(parts[3])
     except Exception as e:
         logger.debug(f"BlueZ adapter state unavailable, using configured order: {repr(e)}")
-        return set()
+        return set(), set()
     finally:
         if bus is not None:
             try:
                 bus.close()
             except Exception:
                 pass
-    return present
+    return present, discovering
 
 
-def adapters_in_attempt_order(address, present=None):
+def adapters_in_attempt_order(address, present=None, discovering=None):
     """
     Adapters to try for this battery, best first.
 
@@ -116,17 +125,27 @@ def adapters_in_attempt_order(address, present=None):
     connection attempt. Adapters BlueZ does not currently expose are dropped:
     a battery whose radio was renumbered away by a USB reset must reach its
     next adapter rather than keep asking for a name that no longer resolves.
-    If filtering would leave nothing, the configured list is returned
-    unfiltered - refusing to attempt a connection is worse than trying an
-    adapter that may not be there.
+
+    Adapters with a scan in progress are dropped the same way, whoever is
+    scanning: BlueZ's per-adapter Discovering flag covers services that follow
+    no convention of ours, and scanning is the one activity that degrades
+    everything else sharing the card. Both filters fall away rather than
+    gate - if filtering would leave nothing, the previous list stands, because
+    refusing to attempt a connection is worse than a degraded attempt.
     """
     adapters = adapters_for(address) or list(BLUETOOTH_ADAPTER_POOL)
     if not adapters:
         return []
-    if present is None:
-        present = bluez_present_adapters()
+    if present is None and discovering is None:
+        present, discovering = bluez_adapter_state()
     usable = [a for a in adapters if a in present] if present else list(adapters)
-    return usable if usable else list(adapters)
+    if not usable:
+        usable = list(adapters)
+    if discovering:
+        quiet = [a for a in usable if a not in discovering]
+        if quiet:
+            usable = quiet
+    return usable
 
 
 # Hold flag: while the flag file for a device exists, the reconnect loop makes
