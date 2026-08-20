@@ -881,3 +881,29 @@ def test_a_foreign_hard_claim_does_not_block_the_fallback_scan(tmp_path, monkeyp
         backend._release_claim()
         scanner.release(foreign)
         utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_devs
+
+
+def test_an_adapter_mid_scan_is_not_picked_while_a_quiet_one_exists():
+    """
+    Scanning is the single point of contention: BlueZ's Discovering flag is
+    the system's own record of it, and it covers services that follow no
+    convention of ours. A card mid-scan is placement's last resort, never its
+    first choice.
+    """
+    original = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
+    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1", "hci2"]}
+    try:
+        order = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci1", "hci2"}, discovering={"hci1"})
+        assert order == ["hci2"]
+    finally:
+        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original
+
+
+def test_a_scan_on_every_adapter_gates_nothing():
+    original = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
+    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1", "hci2"]}
+    try:
+        order = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci1", "hci2"}, discovering={"hci1", "hci2"})
+        assert order == ["hci1", "hci2"]
+    finally:
+        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original
