@@ -19,6 +19,21 @@ sys.path.insert(0, DRIVER_DIR)
 
 if "bleak" not in sys.modules:
     sys.modules["bleak"] = types.SimpleNamespace(BleakClient=type("BleakClient", (), {"__init__": lambda self, *a, **kw: None}))
+    sys.modules["bleak"].BleakScanner = object
+    sys.modules["bleak"].exc = types.SimpleNamespace(BleakError=type("BleakError", (Exception,), {}))
+    sys.modules["bleak.exc"] = sys.modules["bleak"].exc
+if "bleak_retry_connector" not in sys.modules:
+    # utils_ble only needs these four names; stubbing keeps BleakRetryBackend
+    # in supported_ble_backends so the generic backend tests cover it too.
+    async def _not_under_test(*args, **kwargs):
+        raise NotImplementedError
+
+    sys.modules["bleak_retry_connector"] = types.SimpleNamespace(
+        close_stale_connections=_not_under_test,
+        establish_connection=_not_under_test,
+        get_device=_not_under_test,
+        get_device_by_adapter=_not_under_test,
+    )
 
 
 def _load_utils_ble():
@@ -278,3 +293,43 @@ def test_a_battery_with_its_own_adapters_never_uses_the_default_pool():
 def test_bluez_state_is_unavailable_rather_than_raising_without_dbus():
     """utils_ble must stay importable and usable where python-dbus is absent."""
     assert utils_ble.bluez_present_adapters() == set()
+
+
+def test_bleak_retry_backend_registers_when_the_connector_is_importable():
+    assert utils_ble.HAS_BLEAK_RETRY_CONNECTOR
+    assert utils_ble.BleakRetryBackend in utils_ble.supported_ble_backends
+
+
+def test_bleak_retry_backend_defers_client_creation_to_establish():
+    backend = utils_ble.get_ble_backend("BleakRetryBackend")
+    sentinel = object()
+    assert backend.create_client("C8:47:8C:00:00:00", sentinel) is None
+    assert backend.disconnected_callback is sentinel
+
+
+def test_bleak_retry_backend_rotates_after_a_failed_attempt():
+    import asyncio
+
+    original = utils_ble.adapters_in_attempt_order
+    utils_ble.adapters_in_attempt_order = lambda address, present=None: ["hci5", "hci6"]
+    try:
+        backend = utils_ble.get_ble_backend("BleakRetryBackend")
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci5"
+        try:
+            asyncio.run(backend.establish(None, "C8:47:8C:00:00:00", "char", None))
+        except Exception:
+            pass
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci6"
+    finally:
+        utils_ble.adapters_in_attempt_order = original
+
+
+def test_the_retry_connector_establish_is_aliased_against_shadowing():
+    """
+    Managed backends stacked on this branch import establish_connection from
+    their own library later in the module; the alias is what keeps this
+    backend calling the right one, and no other test reaches the connect path.
+    """
+    assert utils_ble.retry_establish_connection is sys.modules["bleak_retry_connector"].establish_connection
