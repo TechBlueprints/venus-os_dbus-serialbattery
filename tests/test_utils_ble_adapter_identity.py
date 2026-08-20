@@ -115,3 +115,22 @@ def test_no_answer_is_not_cached_as_an_answer(monkeypatch):
     assert utils_ble.bluez_adapters() == {}
     assert utils_ble._adapter_identity_cache["adapters"] == {}
     _clear_cache()
+
+
+def test_a_mac_pin_still_resolves_through_the_kernel_path(monkeypatch):
+    """End to end: the reason the lookup exists at all is that a MAC-pinned
+    battery must reach its adapter under whatever number it currently holds."""
+    _clear_cache()
+    monkeypatch.setattr(utils_ble, "_adapters_from_sysfs", lambda: {})
+    monkeypatch.setattr(utils_ble.subprocess, "run", lambda cmd, **kw: _Result())
+
+    original_pins = utils_ble.BLUETOOTH_ADAPTER_PINS
+    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": ["00:01:95:CC:2C:53"]}
+    utils_ble.BLUETOOTH_ADAPTER_POOL = []
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00") == ["hci3"]
+    finally:
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original_pins
+        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+        _clear_cache()

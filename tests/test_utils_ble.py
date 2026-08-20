@@ -18,7 +18,7 @@ CONFIG_DEFAULT = os.path.join(DRIVER_DIR, "config.default.ini")
 sys.path.insert(0, DRIVER_DIR)
 
 if "bleak" not in sys.modules:
-    sys.modules["bleak"] = types.SimpleNamespace(BleakClient=object)
+    sys.modules["bleak"] = types.SimpleNamespace(BleakClient=type("BleakClient", (), {"__init__": lambda self, *a, **kw: None}))
 
 
 def _load_utils_ble():
@@ -162,3 +162,212 @@ def test_a_repeated_pin_to_the_same_adapter_is_not_duplicated():
     pins, _ = utils_ble.parse_adapter_entries(["AA:BB@hci4", "AA:BB@hci4"])
 
     assert pins == {"AA:BB": ["hci4"]}
+
+
+def _configure(devices, pool):
+    utils_ble.BLUETOOTH_ADAPTER_PINS = devices
+    utils_ble.BLUETOOTH_ADAPTER_POOL = pool
+
+
+def test_an_adapter_bluez_does_not_expose_is_skipped():
+    """
+    The failure this exists for: a USB reset renumbers the radios, the adapter
+    a battery is configured for stops existing, and asking BlueZ for it by
+    name fails forever. The battery has to reach its next adapter instead.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci6"}) == ["hci6"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_battery_is_never_stranded_when_bluez_knows_none_of_its_adapters():
+    """
+    An empty or odd answer from BlueZ must degrade to the configured order,
+    not to an empty list - refusing to attempt a connection is worse than
+    trying an adapter that may not be there.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=set()) == ["hci5", "hci6"]
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci9"}) == ["hci5", "hci6"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_battery_advances_to_its_next_adapter_after_a_failed_attempt():
+    """
+    Why multi-adapter entries exist: the preferred radio can vanish, and the
+    battery has to reach its second one or the driver blocks charging for a
+    bank that is perfectly healthy.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+    try:
+        backend = utils_ble.get_ble_backend("BleakBackend")
+        monkey = lambda address, present=None: ["hci5", "hci6"]  # noqa: E731
+        original = utils_ble.adapters_in_attempt_order
+        utils_ble.adapters_in_attempt_order = monkey
+        try:
+            assert backend._select_adapter("C8:47:8C:00:00:00") == "hci5"
+            backend.adapter_index += 1
+            assert backend._select_adapter("C8:47:8C:00:00:00") == "hci6"
+            # and round again, so a radio that comes back is reachable
+            backend.adapter_index += 1
+            assert backend._select_adapter("C8:47:8C:00:00:00") == "hci5"
+        finally:
+            utils_ble.adapters_in_attempt_order = original
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_failed_connect_is_what_advances_the_adapter():
+    import asyncio
+
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+    original = utils_ble.adapters_in_attempt_order
+    utils_ble.adapters_in_attempt_order = lambda address, present=None: ["hci5", "hci6"]
+    try:
+        backend = utils_ble.get_ble_backend("BleakBackend")
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci5"
+        try:
+            asyncio.run(backend.establish(None, "C8:47:8C:00:00:00", "char", None))
+        except Exception:
+            pass
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci6"
+    finally:
+        utils_ble.adapters_in_attempt_order = original
+        _configure(original_pins, original_pool)
+
+
+def test_a_dropped_link_reconnects_on_the_same_adapter():
+    """
+    A disconnect is not a failed attempt: the reconnect loop calls
+    create_client again without establish() having raised, and that must not
+    move the battery off a radio that is working.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+    original = utils_ble.adapters_in_attempt_order
+    utils_ble.adapters_in_attempt_order = lambda address, present=None: ["hci5", "hci6"]
+    try:
+        backend = utils_ble.get_ble_backend("BleakBackend")
+        for _ in range(5):
+            backend.create_client("C8:47:8C:00:00:00", None)
+            assert backend.current_adapter == "hci5"
+    finally:
+        utils_ble.adapters_in_attempt_order = original
+        _configure(original_pins, original_pool)
+
+
+def test_a_battery_with_its_own_adapters_never_uses_the_default_pool():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5"]}, ["hci0", "hci1"])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci5", "hci0", "hci1"}) == ["hci5"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_bluez_state_is_unavailable_rather_than_raising_without_dbus():
+    """utils_ble must stay importable and usable where python-dbus is absent."""
+    assert utils_ble.bluez_present_adapters() == set()
+
+
+# --------- adapter pinning by MAC ---------
+#
+# hciN numbering is assigned in probe order: a reboot or USB reset can renumber
+# the dongles, silently re-pointing every pin at different hardware while the
+# batteries still connect and nothing looks wrong. An adapter's MAC does not
+# move, so configuration may name that instead and be resolved against live
+# BlueZ state.
+
+ADAPTERS = {"hci3": "00:1A:7D:DA:71:13", "hci4": "00:1A:7D:DA:71:14"}
+
+
+def test_a_mac_entry_resolves_to_the_adapters_current_name():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:14"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci4"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_mac_pin_follows_its_adapter_across_renumbering():
+    """The whole point: the same config resolves to whatever number the
+    dongle currently answers to."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:13"]}, [])
+    try:
+        before = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci3": "00:1A:7D:DA:71:13"})
+        after = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci0": "00:1A:7D:DA:71:13"})
+        assert before == ["hci3"]
+        assert after == ["hci0"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_mac_matching_ignores_case():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1a:7d:da:71:13"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci3"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_hci_and_mac_entries_mix_and_keep_their_order():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:14", "hci3"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci4", "hci3"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_mac_whose_adapter_is_gone_is_dropped():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99", "hci3"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci3"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_only_unresolvable_macs_degrade_to_the_default_adapter_not_to_garbage():
+    """
+    A MAC is not a name bleak can use. Where an unresolvable hciN list is
+    handed back unfiltered (better to try than to refuse), an unresolvable MAC
+    list must come back empty so the caller falls back to the system default
+    adapter instead of passing a MAC into the connect.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == []
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_the_pool_accepts_macs_too():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["00:1A:7D:DA:71:14"])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:11", present=ADAPTERS) == ["hci4"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_is_adapter_mac_distinguishes_the_two_forms():
+    assert utils_ble.is_adapter_mac("00:1A:7D:DA:71:13")
+    assert utils_ble.is_adapter_mac(" 00:1a:7d:da:71:13 ")
+    assert not utils_ble.is_adapter_mac("hci0")
+    assert not utils_ble.is_adapter_mac("00:1A:7D:DA:71")
+    assert not utils_ble.is_adapter_mac("")
