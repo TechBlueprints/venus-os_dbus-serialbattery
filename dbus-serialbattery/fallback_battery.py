@@ -574,8 +574,11 @@ class FallbackBattery:
 
         The BMS is the authority on state of charge; the shunt is not. If the
         shunt says something different than the BMS, the shunt is wrong - so
-        whenever their values differ, the BMS value is programmed into it and
-        its coulomb counting continues from there. No threshold, no tuning.
+        when their values differ, the BMS value is programmed into it and its
+        coulomb counting continues from there. The margin below which nothing
+        is written (FALLBACK_SHUNT_SOC_SYNC_MARGIN) is indifference to
+        measurement noise, not tolerance of drift: a shunt at 12.0000006
+        against a BMS at 12.0 is not wrong in any sense worth a write.
         The shunt is then truth-aligned at any disconnect, in VRM as well as
         in the served values, and the anchor formula has nothing left to
         correct. There is no carve-out near full either: a shunt that snapped
@@ -604,7 +607,8 @@ class FallbackBattery:
             return
         target = round(float(bms_soc), 1)
         drift = float(shunt_soc) - float(bms_soc)
-        if round(float(shunt_soc), 1) == target:
+        margin = max(0.0, getattr(utils, "FALLBACK_SHUNT_SOC_SYNC_MARGIN", 0.5))
+        if abs(drift) <= margin:
             return
         try:
             item.set_value(target)

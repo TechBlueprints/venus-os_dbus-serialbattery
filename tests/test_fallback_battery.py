@@ -1785,16 +1785,27 @@ class TestShuntSocSync:
         wrapper._sync_shunt_soc()
         assert item.writes == [90.0]
 
-    def test_any_disagreement_at_all_is_corrected(self, monkeypatch):
+    def test_a_disagreeing_shunt_is_corrected(self, monkeypatch):
         """If the shunt says something different than the BMS, the shunt is wrong."""
-        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=90.1)
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=91.0)
         wrapper._sync_shunt_soc()
         assert item.writes == [90.0]
 
-    def test_an_agreeing_shunt_is_not_rewritten(self, monkeypatch):
-        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=90.0)
+    def test_measurement_noise_is_not_worth_a_write(self, monkeypatch):
+        """12.0000006 against 12.0 is not wrong in any sense worth a write."""
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=12.0, shunt_soc=12.0000006)
         wrapper._sync_shunt_soc()
         assert item.writes == []
+
+    def test_the_margin_is_configurable(self, monkeypatch):
+        monkeypatch.setattr(utils, "FALLBACK_SHUNT_SOC_SYNC_MARGIN", 2.0, raising=False)
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=91.5)
+        wrapper._sync_shunt_soc()
+        assert item.writes == []
+        object.__setattr__(wrapper, "_soc_sync_check_time", 0.0)
+        item.value = 93.0
+        wrapper._sync_shunt_soc()
+        assert item.writes == [90.0]
 
     def test_the_bms_is_the_authority_near_full_too(self, monkeypatch):
         """A shunt that snapped itself to 100 while the BMS reads lower is a drift to correct."""
