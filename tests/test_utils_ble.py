@@ -811,3 +811,73 @@ def test_backend_releases_its_claim_on_a_failed_connect_before_rotating(tmp_path
     finally:
         backend._release_claim()
         utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_devs
+
+
+def _claiming_backend(tmp_path, adapters):
+    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": adapters}
+    backend = utils_ble.get_ble_backend("BleakRetryBackend")
+    backend._claims = _manager(tmp_path, "battery")
+    return backend
+
+
+def test_the_fallback_scan_holds_the_hard_claim_for_its_duration(tmp_path, monkeypatch):
+    """
+    A scan is a scan, however brief. The ten-second cache-miss fallback must be
+    visible to other services' placement while it runs, and gone the moment it
+    ends - and a hard claim someone else holds must not block the scan.
+    """
+    original_devs = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
+    backend = _claiming_backend(tmp_path, ["hci1"])
+    hard_path = os.path.join(str(tmp_path), "hci1.scan")
+    seen = {}
+
+    async def fake_get_device_by_adapter(address, adapter):
+        return None
+
+    class FakeScanner:
+        @staticmethod
+        async def find_device_by_address(address, timeout, **kwargs):
+            seen["held_during_scan"] = os.path.exists(hard_path)
+            return object()
+
+    monkeypatch.setattr(utils_ble, "get_device_by_adapter", fake_get_device_by_adapter)
+    monkeypatch.setattr(utils_ble, "BleakScanner", FakeScanner)
+    try:
+        backend.create_client("C8:47:8C:00:00:00", None)
+        asyncio.run(backend._resolve_device("C8:47:8C:00:00:00"))
+        assert seen["held_during_scan"] is True
+        assert not os.path.exists(hard_path)  # released with the scan
+    finally:
+        backend._release_claim()
+        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_devs
+
+
+def test_a_foreign_hard_claim_does_not_block_the_fallback_scan(tmp_path, monkeypatch):
+    original_devs = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
+    backend = _claiming_backend(tmp_path, ["hci1"])
+    scanner = _manager(tmp_path, "someone-else")
+    foreign = scanner.claim_hard("hci1")
+    ran = {}
+
+    async def fake_get_device_by_adapter(address, adapter):
+        return None
+
+    class FakeScanner:
+        @staticmethod
+        async def find_device_by_address(address, timeout, **kwargs):
+            ran["scanned"] = True
+            return object()
+
+    monkeypatch.setattr(utils_ble, "get_device_by_adapter", fake_get_device_by_adapter)
+    monkeypatch.setattr(utils_ble, "BleakScanner", FakeScanner)
+    try:
+        backend.create_client("C8:47:8C:00:00:00", None)
+        asyncio.run(backend._resolve_device("C8:47:8C:00:00:00"))
+        assert ran.get("scanned") is True
+        # and their claim survived: not released, file still present
+        assert not foreign.released
+        assert os.path.exists(foreign.path)
+    finally:
+        backend._release_claim()
+        scanner.release(foreign)
+        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_devs

@@ -880,7 +880,17 @@ class BleakRetryBackend(BleConnectionBackend):
         if device is None:
             logger.info(f"bluetooth device {address} not in BlueZ cache, scanning")
             kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
-            device = await BleakScanner.find_device_by_address(address, timeout=10.0, **kwargs)
+            # a scan is a scan, however brief: hold the adapter's hard claim
+            # for its duration so other services' placement can steer around
+            # the burst. An unavailable claim never blocks the scan itself.
+            scan_claim = None
+            if self._claims and self.current_adapter:
+                scan_claim = self._claims.claim_hard(self.current_adapter)
+            try:
+                device = await BleakScanner.find_device_by_address(address, timeout=10.0, **kwargs)
+            finally:
+                if scan_claim is not None:
+                    self._claims.release(scan_claim)
         return device
 
     async def release(self, client):
