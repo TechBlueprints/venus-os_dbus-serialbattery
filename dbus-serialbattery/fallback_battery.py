@@ -229,6 +229,7 @@ class FallbackBattery:
         self._shunt: dict = {}
         """This cycle's fallback sensor readings, taken once per refresh."""
         self._shunt_alive: bool = False
+        self._shunt_alive_time: float = 0.0
         self._serving: bool = False
         """True while this cycle's published values come from the shunt."""
         self._last_fresh_time: float = 0.0
@@ -542,6 +543,8 @@ class FallbackBattery:
 
         self._shunt = self._read_shunt() if want_fallback else {}
         self._shunt_alive = bool(self._shunt)
+        if self._shunt_alive:
+            self._shunt_alive_time = time()
         self._serving = want_fallback and self._shunt_alive
 
         self._update_fallback_mode(fresh)
@@ -796,6 +799,31 @@ class FallbackBattery:
             # Not serving: either everything is fine, or both instruments are
             # gone and DbusHelper's own cable alarm ladder is running.
             self.bms_cable_alarm = 0
+
+    def fallback_covering(self) -> bool:
+        """
+        Whether fallback coverage exists, engaged or not.
+
+        fallback_guarding() is momentary: it goes false in the short window
+        between a BLE drop and serving engaging, because serving waits for the
+        data to go stale. The cable warning must not fire in that window - the
+        shunt is right there and about to take over - so its gate asks the
+        broader question: is a fallback configured, recently proven alive, and
+        allowed to serve? "Recently" is generous on purpose; a shunt that
+        answered within the last 10 minutes has not gone anywhere, and a shunt
+        that really died fails this the moment the window passes.
+
+        :return: True while coverage exists for the warning to defer to
+        """
+        if self.fallback_guarding():
+            return True
+        return bool(
+            self.dbus_fallback_objects is not None
+            and not self._charge_blocked
+            and not self._discharge_blocked
+            and not self.bms_cable_alarm
+            and (time() - self._shunt_alive_time) < 600
+        )
 
     def fallback_guarding(self) -> bool:
         """

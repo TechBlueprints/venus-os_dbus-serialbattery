@@ -1269,11 +1269,17 @@ class DbusHelper:
                     # flowing; when guarding ends, this warning runs as stock.
                     fallback_guarding = getattr(self.battery, "fallback_guarding", None)
                     fallback_guarding = bool(fallback_guarding()) if callable(fallback_guarding) else False
+                    # The warning gate asks the broader question - does coverage
+                    # exist - because guarding is momentarily false in the gap
+                    # between a drop and serving engaging, and two warnings
+                    # leaked through exactly that gap on 2026-08-19.
+                    fallback_covering = getattr(self.battery, "fallback_covering", None)
+                    fallback_covering = bool(fallback_covering()) if callable(fallback_covering) else fallback_guarding
 
                     # set BMS cable alarm to warning
                     self.bms_cable_alarm = (
                         1
-                        if not fallback_guarding
+                        if not fallback_covering
                         and self.error["timestamp_last"] is not None
                         and self.error["timestamp_first"] is not None
                         and 60 < self.error["timestamp_last"] - self.error["timestamp_first"]
@@ -1530,7 +1536,13 @@ class DbusHelper:
         self._dbusservice["/Alarms/LowTemperature"] = self.battery.protection.low_temperature
         # a battery can raise a cable alarm of its own: while a fallback sensor
         # is serving, values keep arriving and this helper sees no error at all
-        bms_cable_alarm = max(self.bms_cable_alarm, getattr(self.battery, "bms_cable_alarm", 0) or 0)
+        covering = getattr(self.battery, "fallback_covering", None)
+        covering = bool(covering()) if callable(covering) else False
+        wrapper_cable_alarm = getattr(self.battery, "bms_cable_alarm", 0) or 0
+        # While coverage exists the wrapper's delayed warning is the one voice;
+        # without it a leaked helper warning latches for the next 60 s even
+        # though the condition that set it is already gone.
+        bms_cable_alarm = wrapper_cable_alarm if covering else max(self.bms_cable_alarm, wrapper_cable_alarm)
         self._dbusservice["/Alarms/BmsCable"] = bms_cable_alarm if utils.BMS_CABLE_ALARM else 0
         self._dbusservice["/Alarms/HighInternalTemperature"] = self.battery.protection.high_internal_temperature
         self._dbusservice["/Alarms/FuseBlown"] = self.battery.protection.fuse_blown
