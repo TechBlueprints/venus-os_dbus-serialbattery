@@ -80,7 +80,9 @@ class FallbackBattery:
     #: nothing, so the age of the data is the only honest source selector.
     FRESHNESS_SECONDS = 15.0
 
-    # Continuous shunt SoC alignment: how often the drift check runs.
+    # Continuous shunt SoC alignment: how often the check runs. This is write
+    # plumbing, not policy - there is no amount of disagreement that is
+    # acceptable, only a bound on how often VE.Direct is written.
     SOC_SYNC_CHECK_SECONDS = 60.0
 
     # ── cell projection ──────────────────────────────────────────────────
@@ -568,30 +570,23 @@ class FallbackBattery:
 
     def _sync_shunt_soc(self) -> None:
         """
-        Keep the shunt's absolute SoC aligned with the BMS while it is truth.
+        Keep the shunt's absolute SoC equal to the BMS's while it is truth.
 
-        The BMS and the shunt are independent estimates and drift apart; at a
-        BLE loss the shunt then takes over carrying the wrong absolute value.
-        Rather than reconciling at the handoff, this aligns continuously: while
-        the BMS is healthy, a drift beyond FALLBACK_SHUNT_SOC_SYNC_DRIFT is
-        corrected by programming the BMS value into the shunt, whose coulomb
-        counting continues from the new value. The shunt is then already
-        truth-aligned at any disconnect, and the anchor formula has nothing
-        left to correct.
+        The BMS is the authority on state of charge; the shunt is not. If the
+        shunt says something different than the BMS, the shunt is wrong - so
+        whenever their values differ, the BMS value is programmed into it and
+        its coulomb counting continues from there. No threshold, no tuning.
+        The shunt is then truth-aligned at any disconnect, in VRM as well as
+        in the served values, and the anchor formula has nothing left to
+        correct. There is no carve-out near full either: a shunt that snapped
+        itself to 100 while the BMS reads lower is exactly what gets fixed.
 
-        Drift-gated and rate-limited: each write is an instrument state change
-        over VE.Direct, so it happens only when the drift says so, at most once
-        per check interval, and every sync is logged with the drift it
-        corrected - the drift rate is the health signal alignment would
-        otherwise hide. There is no carve-out near full: the BMS is the
-        authority at every state of charge, and a shunt that snapped itself to
-        100 while the BMS reads lower is exactly a drift to correct.
+        Rate-limited to one check a minute as write hygiene, and every sync is
+        logged with the difference it corrected - the correction rate is the
+        instrument-health signal that alignment would otherwise hide.
 
         :return: None
         """
-        threshold = getattr(utils, "FALLBACK_SHUNT_SOC_SYNC_DRIFT", 0.0)
-        if not threshold or threshold <= 0:
-            return
         now = time()
         if now - self._soc_sync_check_time < self.SOC_SYNC_CHECK_SECONDS:
             return
@@ -607,11 +602,12 @@ class FallbackBattery:
             return
         if shunt_soc is None:
             return
+        target = round(float(bms_soc), 1)
         drift = float(shunt_soc) - float(bms_soc)
-        if abs(drift) < threshold:
+        if round(float(shunt_soc), 1) == target:
             return
         try:
-            item.set_value(round(float(bms_soc), 1))
+            item.set_value(target)
             logger.info(f"Shunt SoC synced to BMS: {bms_soc:.1f}% (was {float(shunt_soc):.1f}%, drift {drift:+.1f}%)")
         except Exception as e:
             logger.warning(f"Shunt SoC sync failed: {repr(e)}")

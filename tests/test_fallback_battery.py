@@ -1772,8 +1772,7 @@ class TestShuntSocSync:
     charged-voltage sync owns the value.
     """
 
-    def _sync_wrapper(self, monkeypatch, bms_soc=90.0, shunt_soc=93.0, threshold=2.0):
-        monkeypatch.setattr(utils, "FALLBACK_SHUNT_SOC_SYNC_DRIFT", threshold, raising=False)
+    def _sync_wrapper(self, monkeypatch, bms_soc=90.0, shunt_soc=93.0):
         wrapper = _make_wrapper(monkeypatch)
         wrapper.battery.soc = bms_soc
         item = _FakeSocItem(shunt_soc)
@@ -1786,13 +1785,14 @@ class TestShuntSocSync:
         wrapper._sync_shunt_soc()
         assert item.writes == [90.0]
 
-    def test_drift_below_threshold_leaves_the_shunt_alone(self, monkeypatch):
-        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=91.5)
+    def test_any_disagreement_at_all_is_corrected(self, monkeypatch):
+        """If the shunt says something different than the BMS, the shunt is wrong."""
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=90.1)
         wrapper._sync_shunt_soc()
-        assert item.writes == []
+        assert item.writes == [90.0]
 
-    def test_disabled_by_default_writes_nothing_ever(self, monkeypatch):
-        wrapper, item = self._sync_wrapper(monkeypatch, threshold=0)
+    def test_an_agreeing_shunt_is_not_rewritten(self, monkeypatch):
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=90.0)
         wrapper._sync_shunt_soc()
         assert item.writes == []
 
