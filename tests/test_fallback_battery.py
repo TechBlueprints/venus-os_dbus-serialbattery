@@ -1796,10 +1796,11 @@ class TestShuntSocSync:
         wrapper._sync_shunt_soc()
         assert item.writes == []
 
-    def test_near_full_the_shunts_own_sync_owns_the_value(self, monkeypatch):
-        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=96.0, shunt_soc=91.0)
+    def test_the_bms_is_the_authority_near_full_too(self, monkeypatch):
+        """A shunt that snapped itself to 100 while the BMS reads lower is a drift to correct."""
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=97.0, shunt_soc=100.0)
         wrapper._sync_shunt_soc()
-        assert item.writes == []
+        assert item.writes == [97.0]
 
     def test_the_rate_limit_holds_between_checks(self, monkeypatch):
         wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=93.0)

@@ -80,11 +80,8 @@ class FallbackBattery:
     #: nothing, so the age of the data is the only honest source selector.
     FRESHNESS_SECONDS = 15.0
 
-    # Continuous shunt SoC alignment: how often the drift check runs, and the
-    # near-full region where the shunt's own charged-voltage sync owns the
-    # value and this feature must not fight it.
+    # Continuous shunt SoC alignment: how often the drift check runs.
     SOC_SYNC_CHECK_SECONDS = 60.0
-    SOC_SYNC_NEAR_FULL = 95.0
 
     # ── cell projection ──────────────────────────────────────────────────
     #: Re-entry margin for the safe-zone band checks (volts per cell): a
@@ -586,8 +583,9 @@ class FallbackBattery:
         over VE.Direct, so it happens only when the drift says so, at most once
         per check interval, and every sync is logged with the drift it
         corrected - the drift rate is the health signal alignment would
-        otherwise hide. Near full the shunt's own charged-voltage detection
-        owns the value and this stays out of its way.
+        otherwise hide. There is no carve-out near full: the BMS is the
+        authority at every state of charge, and a shunt that snapped itself to
+        100 while the BMS reads lower is exactly a drift to correct.
 
         :return: None
         """
@@ -602,8 +600,6 @@ class FallbackBattery:
         item = objects.get("Soc")
         bms_soc = self.battery.soc
         if item is None or bms_soc is None or not 0 < bms_soc <= 100:
-            return
-        if bms_soc >= self.SOC_SYNC_NEAR_FULL:
             return
         try:
             shunt_soc = item.get_value()
