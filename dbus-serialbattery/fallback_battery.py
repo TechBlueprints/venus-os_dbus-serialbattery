@@ -80,6 +80,11 @@ class FallbackBattery:
     #: nothing, so the age of the data is the only honest source selector.
     FRESHNESS_SECONDS = 15.0
 
+    # Continuous shunt SoC alignment: how often the check runs. This is write
+    # plumbing, not policy - there is no amount of disagreement that is
+    # acceptable, only a bound on how often VE.Direct is written.
+    SOC_SYNC_CHECK_SECONDS = 60.0
+
     # ── cell projection ──────────────────────────────────────────────────
     #: Re-entry margin for the safe-zone band checks (volts per cell): a
     #: direction blocked at a band edge is only re-allowed once the
@@ -137,6 +142,8 @@ class FallbackBattery:
             "_dbus_connection",
             "_shunt",
             "_shunt_alive",
+            "_shunt_alive_time",
+            "_soc_sync_check_time",
             "_serving",
             "_last_fresh_time",
             "_fallback_mode",
@@ -230,6 +237,7 @@ class FallbackBattery:
         """This cycle's fallback sensor readings, taken once per refresh."""
         self._shunt_alive: bool = False
         self._shunt_alive_time: float = 0.0
+        self._soc_sync_check_time: float = 0.0
         self._serving: bool = False
         """True while this cycle's published values come from the shunt."""
         self._last_fresh_time: float = 0.0
@@ -548,6 +556,9 @@ class FallbackBattery:
         self._serving = want_fallback and self._shunt_alive
 
         self._update_fallback_mode(fresh)
+
+        if not want_fallback:
+            self._sync_shunt_soc()
         self._update_projection()
         self._update_alarms()
         self._update_recovery_ladder()
@@ -556,6 +567,54 @@ class FallbackBattery:
         return True if self._serving else result
 
     # ── governance ───────────────────────────────────────────────────────
+
+    def _sync_shunt_soc(self) -> None:
+        """
+        Keep the shunt's absolute SoC equal to the BMS's while it is truth.
+
+        The BMS is the authority on state of charge; the shunt is not. If the
+        shunt says something different than the BMS, the shunt is wrong - so
+        when their values differ, the BMS value is programmed into it and its
+        coulomb counting continues from there. The margin below which nothing
+        is written (FALLBACK_SHUNT_SOC_SYNC_MARGIN) is indifference to
+        measurement noise, not tolerance of drift: a shunt at 12.0000006
+        against a BMS at 12.0 is not wrong in any sense worth a write.
+        The shunt is then truth-aligned at any disconnect, in VRM as well as
+        in the served values, and the anchor formula has nothing left to
+        correct. There is no carve-out near full either: a shunt that snapped
+        itself to 100 while the BMS reads lower is exactly what gets fixed.
+
+        Rate-limited to one check a minute as write hygiene, and every sync is
+        logged with the difference it corrected - the correction rate is the
+        instrument-health signal that alignment would otherwise hide.
+
+        :return: None
+        """
+        now = time()
+        if now - self._soc_sync_check_time < self.SOC_SYNC_CHECK_SECONDS:
+            return
+        self._soc_sync_check_time = now
+        objects = self.dbus_fallback_objects or {}
+        item = objects.get("Soc")
+        bms_soc = self.battery.soc
+        if item is None or bms_soc is None or not 0 < bms_soc <= 100:
+            return
+        try:
+            shunt_soc = item.get_value()
+        except Exception:
+            return
+        if shunt_soc is None:
+            return
+        target = round(float(bms_soc), 1)
+        drift = float(shunt_soc) - float(bms_soc)
+        margin = max(0.0, getattr(utils, "FALLBACK_SHUNT_SOC_SYNC_MARGIN", 0.5))
+        if abs(drift) <= margin:
+            return
+        try:
+            item.set_value(target)
+            logger.info(f"Shunt SoC synced to BMS: {bms_soc:.1f}% (was {float(shunt_soc):.1f}%, drift {drift:+.1f}%)")
+        except Exception as e:
+            logger.warning(f"Shunt SoC sync failed: {repr(e)}")
 
     def _update_fallback_mode(self, fresh: bool) -> None:
         """

@@ -1749,3 +1749,82 @@ class TestFallbackCovering:
         wrapper = self._covering_wrapper(monkeypatch)
         wrapper.bms_cable_alarm = 1
         assert wrapper.fallback_covering() is False
+
+
+class _FakeSocItem:
+    def __init__(self, value):
+        self.value = value
+        self.writes = []
+
+    def get_value(self):
+        return self.value
+
+    def set_value(self, value):
+        self.writes.append(value)
+        self.value = value
+
+
+class TestShuntSocSync:
+    """
+    Drift-gated continuous alignment: the shunt is programmed with the BMS
+    SoC only when the BMS is truth, the drift crosses the threshold, the
+    rate limit allows it, and the shunt is not near full where its own
+    charged-voltage sync owns the value.
+    """
+
+    def _sync_wrapper(self, monkeypatch, bms_soc=90.0, shunt_soc=93.0):
+        wrapper = _make_wrapper(monkeypatch)
+        wrapper.battery.soc = bms_soc
+        item = _FakeSocItem(shunt_soc)
+        object.__setattr__(wrapper, "dbus_fallback_objects", {"Soc": item})
+        object.__setattr__(wrapper, "_soc_sync_check_time", 0.0)
+        return wrapper, item
+
+    def test_drift_beyond_threshold_programs_the_bms_value(self, monkeypatch):
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=93.0)
+        wrapper._sync_shunt_soc()
+        assert item.writes == [90.0]
+
+    def test_a_disagreeing_shunt_is_corrected(self, monkeypatch):
+        """If the shunt says something different than the BMS, the shunt is wrong."""
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=91.0)
+        wrapper._sync_shunt_soc()
+        assert item.writes == [90.0]
+
+    def test_measurement_noise_is_not_worth_a_write(self, monkeypatch):
+        """12.0000006 against 12.0 is not wrong in any sense worth a write."""
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=12.0, shunt_soc=12.0000006)
+        wrapper._sync_shunt_soc()
+        assert item.writes == []
+
+    def test_the_margin_is_configurable(self, monkeypatch):
+        monkeypatch.setattr(utils, "FALLBACK_SHUNT_SOC_SYNC_MARGIN", 2.0, raising=False)
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=91.5)
+        wrapper._sync_shunt_soc()
+        assert item.writes == []
+        object.__setattr__(wrapper, "_soc_sync_check_time", 0.0)
+        item.value = 93.0
+        wrapper._sync_shunt_soc()
+        assert item.writes == [90.0]
+
+    def test_the_bms_is_the_authority_near_full_too(self, monkeypatch):
+        """A shunt that snapped itself to 100 while the BMS reads lower is a drift to correct."""
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=97.0, shunt_soc=100.0)
+        wrapper._sync_shunt_soc()
+        assert item.writes == [97.0]
+
+    def test_the_rate_limit_holds_between_checks(self, monkeypatch):
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=93.0)
+        wrapper._sync_shunt_soc()
+        wrapper.battery.soc = 85.0
+        item.value = 93.0
+        wrapper._sync_shunt_soc()
+        assert item.writes == [90.0]
+
+    def test_an_unreadable_or_absurd_bms_soc_never_syncs(self, monkeypatch):
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=None, shunt_soc=93.0)
+        wrapper._sync_shunt_soc()
+        object.__setattr__(wrapper, "_soc_sync_check_time", 0.0)
+        wrapper.battery.soc = 0.0
+        wrapper._sync_shunt_soc()
+        assert item.writes == []
