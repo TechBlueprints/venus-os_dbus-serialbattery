@@ -456,6 +456,19 @@ def main():
             logger.error(">>> Bluetooth address is missing in the command line arguments")
             exit_driver(None, None, 1)
         else:
+            from utils import BLUETOOTH_ADAPTERS
+
+            if BLUETOOTH_ADAPTERS:
+                # Route the library's bleak clients through the configured
+                # adapters. Must run before aiobmsble's BMS modules are
+                # imported (Generic_AioBmsBle imports them in __init__),
+                # because BaseBMS captures bleak.BleakClient at import time -
+                # the same ordering habluetooth relies on when it installs
+                # its catcher before Home Assistant integrations load.
+                from utils_ble import install_bleak_catcher
+
+                install_bleak_catcher()
+
             from bms.generic_aiobmsble import Generic_AioBmsBle  # noqa: F401
 
             ble_address = sys.argv[2]
