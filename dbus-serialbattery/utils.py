@@ -266,6 +266,15 @@ BLUETOOTH_CONNECTION_BACKEND: str = config["DEFAULT"]["BLUETOOTH_CONNECTION_BACK
 # joins the shared pool, an entry of the form MAC@hciX pins that device to that
 # adapter. Empty list = use the system default adapter.
 BLUETOOTH_ADAPTERS: List[str] = get_list_from_config("DEFAULT", "BLUETOOTH_ADAPTERS", str)
+# Opt-in: route every bleak client in this process through the vendored
+# bleak-connection-manager (claim-aware adapter selection, link slots,
+# connection parameter tuning), coordinated across processes via /run/bt-claims
+BLUETOOTH_CONNECTION_MANAGER: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER")
+# Established-link capacity per adapter, hciX:N entries; only used with
+# BLUETOOTH_CONNECTION_MANAGER = True, and an uncapped adapter is never gated
+BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS: List[str] = get_list_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS", str)
+# Also rebind bleak.BleakScanner to the catcher's adapter-bound scanner
+BLUETOOTH_CONNECTION_MANAGER_WRAP_SCANNER: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER_WRAP_SCANNER")
 
 # --------- Daisy Chain Configuration (Multiple BMS on one cable) ---------
 BATTERY_ADDRESSES: list = get_list_from_config("DEFAULT", "BATTERY_ADDRESSES", str)
