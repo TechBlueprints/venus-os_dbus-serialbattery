@@ -12,7 +12,7 @@ integration. Installed (opt-in) by `utils_ble_manager.py` when
 |---|---|
 | Upstream project | <https://github.com/TechBlueprints/bleak-connection-manager> |
 | Upstream version | 2.0.0.dev0 |
-| Vendored commit | `6e6e0b6` (2026-08-21, `main`) |
+| Vendored commit | `b6a5496` (2026-08-21, `main`) |
 | Upstream path | `src/bleak_connection_manager/` |
 | Licence | Apache License 2.0 — see `LICENSE` |
 
@@ -21,9 +21,10 @@ connection-lifecycle manager wrapped around `establish_connection`, briefly
 proposed for this driver as `BCMBackend` in upstream PR #512 and withdrawn)
 lives on the upstream `v1-main` branch; the two share no code.
 
-The upstream `LICENSE` file was carried over from the upstream `v1-main`
-branch: the v2 rewrite on `main` dropped the file while `pyproject.toml`
-continues to declare `license = "Apache-2.0"`.
+Not vendored from upstream: its test suite, its own `ext/` (`bt_claims.py`,
+the bt-claims reference library that `claims.py` reimplements, and a copy of
+dbus-fast for consumers whose system copy is too old for current bleak -
+this repository vendors its own BLE dependency chain under `ext/` already).
 
 ## Contents
 
@@ -47,10 +48,6 @@ The complete `src/bleak_connection_manager/` package, unmodified:
   optional `bluetooth-auto-recovery` package, which is **not** vendored
   here, so a reset degrades to a logged no-op; the gating and the scanner
   watchdog's restart tier still work.
-
-Not vendored: the upstream test suite and `ext/bt_claims.py` (the upstream
-repository's own vendored copy of the bt-claims reference library, which
-`bleak_connection_manager.claims` reimplements).
 
 The library wraps whoever drives the client — it routes, it never retries.
 Retry semantics stay with

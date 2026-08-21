@@ -197,6 +197,49 @@ def _hci_sort_key(name):
     return (0, int(match.group(1))) if match else (1, name)
 
 
+def _device_path_adapter(address_or_ble_device):
+    """The adapter baked into a resolved BLEDevice's BlueZ D-Bus path.
+
+    bleak's BlueZ backend connects via device.details["path"] whenever the
+    device carries one - the adapter argument is only honored when it has to
+    scan - so for a cache-resolved BLEDevice (bleak-retry-connector's
+    get_device, scanner-discovered devices) the device's own adapter is the
+    truth. Treating it as caller-explicit keeps claims, cap gating and
+    conn-param tuning on the adapter the link will actually use, instead of
+    on one the backend would silently ignore.
+    """
+    details = getattr(address_or_ble_device, "details", None)
+    if not isinstance(details, dict):
+        return None
+    match = re.match(r"/org/bluez/(hci\d+)/", str(details.get("path") or ""))
+    return match.group(1) if match else None
+
+
+def _responsive_adapters(candidates):
+    """Drop adapters whose sysfs MAC is all-zeros - the kernel's signal for
+    a failed or unserved controller (habluetooth's FAILED_ADAPTER_MAC): a
+    dead onboard UART controller stays listed in /sys/class/bluetooth
+    forever and would otherwise win every tie. Never gates: when nothing
+    passes (including hosts with no sysfs at all), the unfiltered list is
+    used."""
+    live = [a for a in candidates if recovery.adapter_mac(a) != recovery.UNKNOWN_MAC]
+    return live or candidates
+
+
+# adapter -> consecutive failed scanner starts, feeding scan placement;
+# a successful start there clears it
+_scan_failures = {}
+
+
+def _scan_finished(adapter, started):
+    if not adapter:
+        return
+    if started:
+        _scan_failures.pop(adapter, None)
+    else:
+        _scan_failures[adapter] = _scan_failures.get(adapter, 0) + 1
+
+
 # addresses already warned about bare connect() calls, once per process -
 # a reconnect loop hitting this every few seconds would flood the log
 _warned_bare_connect_addresses = set()
@@ -387,6 +430,7 @@ def _acquire_adapter(address):
     if not usable:
         # refusing to attempt is worse than trying an adapter that may be gone
         usable = candidates
+    usable = _responsive_adapters(usable)
     snapshot = config.claims.claims()
     own_pid = os.getpid()
 
@@ -426,23 +470,27 @@ def _acquire_adapter(address):
 
 
 def _claim_explicit(adapter, address):
-    """Claims for an adapter the caller chose explicitly.
+    """Claims for an adapter fixed by the caller - an explicit kwarg, or a
+    resolved BLEDevice whose BlueZ path already names its adapter.
 
-    The choice is never overridden, but a configured link cap still gates
-    it: the cap is physics, not coordination - the connect is doomed when
-    the card is full, and the typed error buys correct pacing from
-    bleak-retry-connector. Defensible precisely because caps are opt-in:
-    with no cap configured this is byte-for-byte plain bleak behavior.
+    The choice is never overridden. A soft claim is always written so the
+    connection counts in every process's occupancy score - most real
+    connects arrive as cache-resolved BLEDevices, and leaving them
+    invisible would blind least-used placement fleet-wide. A configured
+    link cap still gates: the cap is physics, not coordination - the
+    connect is doomed when the card is full, and the typed error buys
+    correct pacing from bleak-retry-connector.
     """
     config = _config
     if config is None:
         return []
     cap = config.link_caps.get(adapter)
-    if not cap:
-        return []
-    slot = config.claims.claim_slot(adapter, cap)
-    if slot is None:
-        raise _out_of_slots_error(address, [(adapter, cap)], config)
+    if cap:
+        slot = config.claims.claim_slot(adapter, cap)
+        if slot is None:
+            raise _out_of_slots_error(address, [(adapter, cap)], config)
+    else:
+        slot = None
     soft = config.claims.claim_soft(adapter, qualifier=_mac_qualifier(address))
     return [c for c in (slot, soft) if c is not None]
 
@@ -543,7 +591,11 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             # running event loop is guaranteed
             config.sweeper.ensure_running()
         adapter = None
-        explicit = init_kwargs.get("adapter") or (init_kwargs.get("bluez") or {}).get("adapter")
+        explicit = (
+            init_kwargs.get("adapter")
+            or (init_kwargs.get("bluez") or {}).get("adapter")
+            or _device_path_adapter(address_or_ble_device)
+        )
         if explicit:
             self._catcher_claims = _claim_explicit(explicit, self._catcher_address)
         else:
@@ -686,13 +738,19 @@ def _acquire_scan_adapter():
     if not usable:
         # refusing to scan is worse than scanning an adapter that may be gone
         usable = candidates
+    usable = _responsive_adapters(usable)
     snapshot = config.claims.claims()
 
-    def occupancy(adapter):
+    def rank(adapter):
+        # occupancy first, like connect scoring - but scans also carry
+        # start-failure memory: scan selection has no failure-driven walk,
+        # so without it a dead-but-listed adapter would win every tie
+        # forever (a successful start clears the count)
         entry = snapshot.get(adapter) or {}
-        return entry.get("soft", 0) + entry.get("links", 0)
+        occupancy = entry.get("soft", 0) + entry.get("links", 0)
+        return (occupancy + _scan_failures.get(adapter, 0), usable.index(adapter))
 
-    ranked = sorted(usable, key=lambda a: (occupancy(a), usable.index(a)))
+    ranked = sorted(usable, key=rank)
     for adapter in ranked:
         claim = config.claims.claim_hard(adapter)
         if claim is not None:
@@ -865,12 +923,18 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         try:
             result = await _ORIGINAL_BLEAK_SCANNER.start(self)
             started = True
+        except Exception:
+            # a failed start counts against this adapter in scan placement
+            # (cancellation does not - it says nothing about the radio)
+            _scan_finished(explicit or adapter, False)
+            raise
         finally:
             if not started:
                 # finally, not except: a cancelled start must release the
                 # scan claim too, and drop the partially-initialised backend
                 self._release_scan_claim()
                 self._backend = None
+        _scan_finished(explicit or adapter, True)
         self._catcher_adapter = explicit or adapter
         now = _monotonic()
         self._catcher_start_time = now

@@ -33,9 +33,11 @@ Three claim kinds, visible in the filename:
                                 bound established-link capacity, not
                                 connection-attempt pacing.
 
-File content is one line: "<pid> <service> <since-epoch>". The writer
-touches its file every HEARTBEAT_INTERVAL seconds; the mtime is the
-heartbeat.
+File content is one line: "<pid> <service> <since-epoch>". This
+implementation writes the manager's sanitized owner string as <service>, so
+an ls-level debugger can see who holds a card; a bare participant may write
+its process name instead. The writer touches its file every
+HEARTBEAT_INTERVAL seconds; the mtime is the heartbeat.
 
 A claim is live when the pid in it is alive (kill -0, or /proc/<pid> from
 shell) AND the file's mtime is within CLAIM_TTL. A dead process is therefore
@@ -113,10 +115,11 @@ class Claim:
     such a claim live until process exit.
     """
 
-    def __init__(self, adapter, path, exclusive):
+    def __init__(self, adapter, path, exclusive, service=None):
         self.adapter = adapter
         self.path = path
         self.exclusive = exclusive
+        self.service = service
         self.released = False
         self.validity = None
 
@@ -131,7 +134,7 @@ class Claim:
             # concedes if another process took the name meanwhile - stealing
             # it back would ping-pong the card between two owners.
             try:
-                _write_claim_file(self.path, exclusive=self.exclusive)
+                _write_claim_file(self.path, exclusive=self.exclusive, service=self.service)
             except FileExistsError:
                 self.released = True
                 logger.warning(f"bt-claims: lost exclusive claim {os.path.basename(self.path)} to another process")
@@ -146,13 +149,16 @@ class Claim:
             pass
 
 
-def _write_claim_file(path, exclusive):
+def _write_claim_file(path, exclusive, service=None):
     flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
     if exclusive:
         flags |= os.O_EXCL
     fd = os.open(path, flags, 0o644)
     try:
-        service = os.path.basename(os.readlink("/proc/self/exe")) if os.path.exists("/proc/self/exe") else "python"
+        if service is None:
+            # fallback for bare use; managers pass their owner string, which
+            # is what makes `ls`-level debugging name the actual holder
+            service = os.path.basename(os.readlink("/proc/self/exe")) if os.path.exists("/proc/self/exe") else "python"
         os.write(fd, f"{os.getpid()} {service} {int(time.time())}\n".encode())
     finally:
         os.close(fd)
@@ -270,8 +276,8 @@ class ClaimManager:
         try:
             os.makedirs(self.claim_dir, exist_ok=True)
             path = self._soft_path(adapter, qualifier)
-            _write_claim_file(path, exclusive=False)
-            claim = Claim(adapter, path, exclusive=False)
+            _write_claim_file(path, exclusive=False, service=self.owner)
+            claim = Claim(adapter, path, exclusive=False, service=self.owner)
             self._hold(claim)
             return claim
         except OSError as e:
@@ -283,7 +289,7 @@ class ClaimManager:
         path = os.path.join(self.claim_dir, f"{adapter}.scan")
         try:
             os.makedirs(self.claim_dir, exist_ok=True)
-            _write_claim_file(path, exclusive=True)
+            _write_claim_file(path, exclusive=True, service=self.owner)
         except FileExistsError:
             if self._is_live(path):
                 return None
@@ -297,13 +303,13 @@ class ClaimManager:
             except OSError:
                 return None
             try:
-                _write_claim_file(path, exclusive=True)
+                _write_claim_file(path, exclusive=True, service=self.owner)
             except OSError:
                 return None
         except OSError as e:
             logger.debug(f"bt-claims: could not hard-claim {adapter}: {repr(e)}")
             return None
-        claim = Claim(adapter, path, exclusive=True)
+        claim = Claim(adapter, path, exclusive=True, service=self.owner)
         self._hold(claim)
         return claim
 
@@ -325,7 +331,7 @@ class ClaimManager:
         for k in range(cap):
             path = os.path.join(self.claim_dir, f"{adapter}.link.{k}")
             try:
-                _write_claim_file(path, exclusive=True)
+                _write_claim_file(path, exclusive=True, service=self.owner)
             except FileExistsError:
                 if self._is_live(path):
                     continue
@@ -336,7 +342,7 @@ class ClaimManager:
                 except OSError:
                     continue
                 try:
-                    _write_claim_file(path, exclusive=True)
+                    _write_claim_file(path, exclusive=True, service=self.owner)
                 except FileExistsError:
                     continue
                 except OSError as e:
@@ -345,7 +351,7 @@ class ClaimManager:
             except OSError as e:
                 logger.debug(f"bt-claims: could not slot-claim {adapter}: {repr(e)}")
                 return self._phantom(adapter)
-            claim = Claim(adapter, path, exclusive=True)
+            claim = Claim(adapter, path, exclusive=True, service=self.owner)
             self._hold(claim)
             return claim
         return None
