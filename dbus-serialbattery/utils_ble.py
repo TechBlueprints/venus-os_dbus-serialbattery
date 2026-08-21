@@ -374,6 +374,140 @@ def get_ble_backend(name=None):
     return BleakBackend()
 
 
+# --------- bleak catcher ---------
+#
+# The same mechanism Home Assistant uses to put habluetooth underneath every
+# BLE integration: rebind bleak.BleakClient, process wide, to a wrapper that
+# routes connections through this module's adapter selection. Libraries that
+# build their own clients - above all the vendored aiobmsble, whose
+# BaseBMS._connect is @final and cannot be pointed at our backend seam - pick
+# up the wrapper through their own `from bleak import BleakClient`, provided
+# the catcher is installed before they are imported. No vendored code is
+# forked.
+#
+# The wrapper routes; it does not retry. Retry semantics belong to whoever
+# drives the client (bleak-retry-connector inside aiobmsble, the selected
+# backend in this module's seam), exactly as in Home Assistant, where
+# HaBleakClientWrapper routes to the right radio and establish_connection
+# above it does the retrying. Nesting retry inside the wrapper would multiply
+# every caller's retry budget.
+#
+# This module's own name bindings were taken at import time, before any
+# install, so the seam's backends keep constructing the original class and
+# can never recurse into the wrapper.
+
+_ORIGINAL_BLEAK_CLIENT = BleakClient
+
+
+class BleAdapterRouter:
+    """
+    Failure-driven adapter choice for clients the seam never sees.
+
+    Same contract as the backends' _select_adapter: the order is recomputed
+    from live BlueZ state each call, the per-device index advances only when
+    a connect fails, and it never resets on success - so a dropped link
+    reconnects on the adapter it was using and the modulo brings a recovered
+    radio back into rotation. State is per address and process wide, because
+    one battery's client may be rebuilt many times per session (bleak's
+    context managers, bleak-retry-connector's attempts) and each rebuild must
+    continue the walk, not restart it.
+    """
+
+    def __init__(self):
+        self._attempt_index = {}
+
+    def select(self, address):
+        adapters = adapters_in_attempt_order(address)
+        if not adapters:
+            return None
+        return adapters[self._attempt_index.get(str(address).strip().upper(), 0) % len(adapters)]
+
+    def connect_failed(self, address):
+        key = str(address).strip().upper()
+        self._attempt_index[key] = self._attempt_index.get(key, 0) + 1
+
+
+ble_adapter_router = BleAdapterRouter()
+
+
+class RoutedBleakClient(_ORIGINAL_BLEAK_CLIENT):
+    """
+    Drop-in BleakClient that picks its adapter at connect time.
+
+    Construction stores the arguments and builds nothing, because the
+    adapter can only be chosen when the connection is actually attempted -
+    bleak wires the adapter into its platform backend inside __init__, and
+    callers like aiobmsble construct placeholder clients long before they
+    connect. connect() runs the real __init__ with the routed adapter merged
+    into the bluez args, then delegates; every reconnect on the same
+    instance re-runs the selection, which is what lets a retrying caller
+    walk on to the next radio after a failure.
+    """
+
+    def __init__(self, address_or_ble_device, disconnected_callback=None, services=None, **kwargs):
+        self._routed_args = (address_or_ble_device, disconnected_callback, services)
+        self._routed_kwargs = kwargs
+        self._routed_address = getattr(address_or_ble_device, "address", address_or_ble_device)
+        self._backend = None
+        self._pair_before_connect = False
+
+    async def connect(self, **kwargs):
+        address_or_ble_device, disconnected_callback, services = self._routed_args
+        init_kwargs = dict(self._routed_kwargs)
+        adapter = ble_adapter_router.select(self._routed_address)
+        # an adapter the caller chose explicitly is never overridden
+        if adapter and "adapter" not in init_kwargs:
+            bluez = dict(init_kwargs.get("bluez") or {})
+            bluez.setdefault("adapter", adapter)
+            init_kwargs["bluez"] = bluez
+        _ORIGINAL_BLEAK_CLIENT.__init__(
+            self,
+            address_or_ble_device,
+            disconnected_callback=disconnected_callback,
+            services=services,
+            **init_kwargs,
+        )
+        try:
+            return await _ORIGINAL_BLEAK_CLIENT.connect(self, **kwargs)
+        except Exception:
+            # a failed attempt, so the next one goes out on the next adapter
+            ble_adapter_router.connect_failed(self._routed_address)
+            raise
+
+    @property
+    def is_connected(self):
+        # queried by callers on never-connected placeholders (aiobmsble does)
+        if self._backend is None:
+            return False
+        return self._backend.is_connected
+
+    @property
+    def address(self):
+        if self._backend is None:
+            return self._routed_address
+        return self._backend.address
+
+    async def disconnect(self):
+        if self._backend is None:
+            return
+        await _ORIGINAL_BLEAK_CLIENT.disconnect(self)
+
+
+def install_bleak_catcher():
+    """Route every bleak client in this process through the adapter router."""
+    import bleak
+
+    bleak.BleakClient = RoutedBleakClient
+    logger.info("bleak catcher installed: BLE clients are routed per BLUETOOTH_ADAPTERS")
+
+
+def uninstall_bleak_catcher():
+    """Restore bleak's own client class (used by tests)."""
+    import bleak
+
+    bleak.BleakClient = _ORIGINAL_BLEAK_CLIENT
+
+
 # Class that enables synchronous writing and reading to a bluetooh device
 class Syncron_Ble:
 
