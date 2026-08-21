@@ -333,3 +333,140 @@ def test_the_retry_connector_establish_is_aliased_against_shadowing():
     backend calling the right one, and no other test reaches the connect path.
     """
     assert utils_ble.retry_establish_connection is sys.modules["bleak_retry_connector"].establish_connection
+
+
+class _FakeClient:
+    """Just enough client for the backend establish path."""
+
+    def __init__(self):
+        self.connected = False
+        self.notify_chars = []
+
+    async def connect(self):
+        self.connected = True
+
+    async def start_notify(self, char, callback):
+        self.notify_chars.append(char)
+
+
+def test_establish_subscribes_when_a_notify_char_is_given():
+    import asyncio
+
+    backend = utils_ble.get_ble_backend("BleakBackend")
+    client = _FakeClient()
+    returned = asyncio.run(backend.establish(client, "C8:47:8C:00:00:00", "char", lambda s, d: None))
+    assert returned is client
+    assert client.connected
+    assert client.notify_chars == ["char"]
+
+
+def test_establish_with_no_notify_char_connects_without_subscribing():
+    """
+    Drivers whose read characteristic is only known after connecting
+    (auto-detected UUIDs, failover handles) pass None and subscribe
+    themselves; the backend must not try to start_notify(None).
+    """
+    import asyncio
+
+    backend = utils_ble.get_ble_backend("BleakBackend")
+    client = _FakeClient()
+    returned = asyncio.run(backend.establish(client, "C8:47:8C:00:00:00", None, None))
+    assert returned is client
+    assert client.connected
+    assert client.notify_chars == []
+
+
+def test_retry_backend_establish_honors_a_none_notify_char():
+    import asyncio
+
+    fake_client = _FakeClient()
+
+    async def fake_get_device(address):
+        return object()
+
+    async def fake_close_stale(device):
+        pass
+
+    async def fake_establish(client_class, device, name, **kwargs):
+        fake_client.connected = True
+        return fake_client
+
+    originals = (utils_ble.get_device, utils_ble.close_stale_connections, utils_ble.retry_establish_connection)
+    utils_ble.get_device = fake_get_device
+    utils_ble.close_stale_connections = fake_close_stale
+    utils_ble.retry_establish_connection = fake_establish
+    try:
+        backend = utils_ble.get_ble_backend("BleakRetryBackend")
+        backend.create_client("C8:47:8C:00:00:00", None)
+        returned = asyncio.run(backend.establish(None, "C8:47:8C:00:00:00", None, None))
+        assert returned is fake_client
+        assert fake_client.connected
+        assert fake_client.notify_chars == []
+    finally:
+        utils_ble.get_device, utils_ble.close_stale_connections, utils_ble.retry_establish_connection = originals
+
+
+def _hold_dir(tmp_path):
+    """Point the hold-flag machinery at a private directory for one test."""
+    original = utils_ble.BLE_HOLD_FLAG_DIR
+    utils_ble.BLE_HOLD_FLAG_DIR = str(tmp_path)
+    return original
+
+
+def test_hold_is_inactive_without_a_flag_file(tmp_path):
+    original = _hold_dir(tmp_path)
+    try:
+        assert not utils_ble.ble_hold_active("C8:47:8C:00:00:00")
+    finally:
+        utils_ble.BLE_HOLD_FLAG_DIR = original
+
+
+def test_an_operator_hold_persists_no_matter_how_old(tmp_path):
+    """Only "auto" flags expire; an operator hold waits for the operator."""
+    original = _hold_dir(tmp_path)
+    try:
+        flag = utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00")
+        with open(flag, "w") as f:
+            f.write("radio swap in progress")
+        stale = os.path.getmtime(flag) - 10 * utils_ble.BLE_HOLD_AUTO_EXPIRY
+        os.utime(flag, (stale, stale))
+        assert utils_ble.ble_hold_active("C8:47:8C:00:00:00")
+        assert os.path.exists(flag)
+    finally:
+        utils_ble.BLE_HOLD_FLAG_DIR = original
+
+
+def test_a_fresh_auto_hold_is_active(tmp_path):
+    original = _hold_dir(tmp_path)
+    try:
+        flag = utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00")
+        with open(flag, "w") as f:
+            f.write("auto")
+        assert utils_ble.ble_hold_active("C8:47:8C:00:00:00")
+    finally:
+        utils_ble.BLE_HOLD_FLAG_DIR = original
+
+
+def test_an_expired_auto_hold_releases_and_removes_its_flag(tmp_path):
+    original = _hold_dir(tmp_path)
+    try:
+        flag = utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00")
+        with open(flag, "w") as f:
+            f.write("auto")
+        stale = os.path.getmtime(flag) - 2 * utils_ble.BLE_HOLD_AUTO_EXPIRY
+        os.utime(flag, (stale, stale))
+        assert not utils_ble.ble_hold_active("C8:47:8C:00:00:00")
+        assert not os.path.exists(flag)
+    finally:
+        utils_ble.BLE_HOLD_FLAG_DIR = original
+
+
+def test_an_unreadable_flag_counts_as_held(tmp_path):
+    """A hold that fails open would defeat its purpose."""
+    original = _hold_dir(tmp_path)
+    try:
+        # a directory at the flag path makes open() raise
+        os.mkdir(utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00"))
+        assert utils_ble.ble_hold_active("C8:47:8C:00:00:00")
+    finally:
+        utils_ble.BLE_HOLD_FLAG_DIR = original
