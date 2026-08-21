@@ -327,7 +327,9 @@ class RssiSweeper:
                 if rssi is not None:
                     self.record(adapter, getattr(device, "address", device), rssi)
 
-            scanner = _ORIGINAL_BLEAK_SCANNER(_seen, adapter=adapter)
+            # both spellings with a fresh bluez dict, for the same
+            # generation split and shared-default poison as BLEScanner.start
+            scanner = _ORIGINAL_BLEAK_SCANNER(_seen, adapter=adapter, bluez={"adapter": adapter})
             await scanner.start()
             await asyncio.sleep(RSSI_SWEEP_DURATION)
         except Exception as e:
@@ -766,8 +768,9 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
     Deferred init, like BLEConnection: bleak wires the adapter into its
     platform scanner backend inside __init__, so construction stores the
     arguments and builds nothing, and start() runs the real __init__ with
-    the routed adapter merged in (via the backwards-compat adapter kwarg,
-    which is how this bleak's BlueZ scanner backend receives it). The hard
+    the routed adapter merged in - as BOTH a fresh bluez={"adapter": ...}
+    dict and the adapter kwarg, because bleak generations disagree on which
+    one the BlueZ scanner backend reads (see start()). The hard
     claim (hciN.scan) is held per scan activity: taken at start(), released
     at stop() or on a failed start - so other processes' placement steers
     connections and scans away from a card while it is actually scanning,
@@ -907,6 +910,18 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
             adapter, self._catcher_claim = _acquire_scan_adapter()
         try:
             if adapter:
+                # Both spellings, deliberately. Older bleak 3.x BlueZ
+                # scanner backends read the adapter kwarg; current bleak
+                # reads bluez["adapter"] - and its deprecation shim mutates
+                # a SHARED default {} when the kwarg arrives alone (`bluez:
+                # BlueZScannerArgs = {}` plus in-place assignment), so the
+                # first scanner's adapter poisons every later one in the
+                # process. Handing it a fresh bluez dict that already
+                # carries the adapter sidesteps the poison on new bleak
+                # while the kwarg keeps old backends routed.
+                bluez = dict(init_kwargs.get("bluez") or {})
+                bluez.setdefault("adapter", adapter)
+                init_kwargs["bluez"] = bluez
                 init_kwargs.setdefault("adapter", adapter)
             _ORIGINAL_BLEAK_SCANNER.__init__(
                 self,

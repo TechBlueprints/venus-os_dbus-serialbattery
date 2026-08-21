@@ -13,6 +13,8 @@ without it reset_adapter degrades to a logged no-op.
 
 import logging
 import re
+import subprocess
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -26,15 +28,45 @@ except ImportError:
 
 UNKNOWN_MAC = "00:00:00:00:00:00"
 
+# adapter -> (mac, monotonic); short-lived because a reset can take a card
+# from all-zeros to a real address, and long enough that selection (which
+# asks per candidate per connect) does not spawn hciconfig in a tight loop
+# on kernels with no sysfs address attribute
+_MAC_CACHE_TTL = 30.0
+_mac_cache = {}
 
-def adapter_mac(adapter):
-    """The adapter's own MAC from sysfs, or the all-zeros unknown value
-    (which is also what a genuinely failed adapter reports)."""
+
+def _read_adapter_mac(adapter):
+    # sysfs first - but some kernels (Venus OS Cerbos among them) expose no
+    # address attribute under /sys/class/bluetooth/hciN/ at all, so fall
+    # back to parsing hciconfig, which does report BD Address there
     try:
         with open(f"/sys/class/bluetooth/{adapter}/address") as f:
-            return f.read().strip().upper() or UNKNOWN_MAC
+            mac = f.read().strip().upper()
+            if mac:
+                return mac
     except OSError:
-        return UNKNOWN_MAC
+        pass
+    try:
+        result = subprocess.run(["hciconfig", str(adapter)], capture_output=True, text=True, timeout=5)
+        match = re.search(r"BD Address:\s*([0-9A-Fa-f:]{17})", result.stdout)
+        if match:
+            return match.group(1).upper()
+    except Exception:
+        pass
+    return UNKNOWN_MAC
+
+
+def adapter_mac(adapter):
+    """The adapter's own MAC (sysfs, then hciconfig), or the all-zeros
+    unknown value - which is also what a genuinely failed adapter reports."""
+    now = time.monotonic()
+    cached = _mac_cache.get(adapter)
+    if cached is not None and now - cached[1] < _MAC_CACHE_TTL:
+        return cached[0]
+    mac = _read_adapter_mac(adapter)
+    _mac_cache[adapter] = (mac, now)
+    return mac
 
 
 async def reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False):
