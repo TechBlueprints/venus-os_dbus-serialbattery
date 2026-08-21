@@ -48,7 +48,9 @@ class RichBleakClient:
 
     def __init__(self, address_or_ble_device, disconnected_callback=None, services=None, *, timeout=30, pair=False, bluez=None, backend=None, **kwargs):
         adapter = (bluez or {}).get("adapter")
-        RECORDED_INITS.append({"address": getattr(address_or_ble_device, "address", address_or_ble_device), "adapter": adapter, "services": services})
+        RECORDED_INITS.append(
+            {"address": getattr(address_or_ble_device, "address", address_or_ble_device), "adapter": adapter, "services": services, "extra": sorted(kwargs)}
+        )
         self._backend = _RichBackend(adapter)
         self._pair_before_connect = pair
 
@@ -109,6 +111,7 @@ def catcher(monkeypatch):
     """Rich bleak in sys.modules, fresh router state, uninstalled on exit."""
     CONNECT_RESULTS.clear()
     RECORDED_INITS.clear()
+    utils_ble._warned_unretried_addresses.clear()
     monkeypatch.setattr(utils_ble, "ble_adapter_router", utils_ble.BleAdapterRouter())
     with _rich_bleak_installed():
         yield utils_ble
@@ -213,8 +216,50 @@ def test_without_configured_adapters_the_wrapper_is_a_passthrough(catcher, monke
 
     asyncio.run(client.connect())
 
-    assert RECORDED_INITS == [{"address": ADDRESS, "adapter": None, "services": ["fff0"]}]
+    assert RECORDED_INITS == [{"address": ADDRESS, "adapter": None, "services": ["fff0"], "extra": []}]
     assert client.is_connected is True
+
+
+UNRETRIED_WARNING = "called without bleak-retry-connector"
+
+
+def test_a_client_built_by_establish_connection_connects_without_the_warning(catcher, caplog):
+    """
+    bleak-retry-connector marks the clients it constructs with
+    _is_retry_client=True (our vendored copy does too); the marker must
+    silence the warning and must not leak into the real client's kwargs.
+    """
+    catcher.install_bleak_catcher()
+    client = sys.modules["bleak"].BleakClient(ADDRESS, _is_retry_client=True)
+
+    asyncio.run(client.connect())
+
+    assert UNRETRIED_WARNING not in caplog.text
+    assert RECORDED_INITS[0]["extra"] == []  # marker was popped, not passed down
+
+
+def test_a_bare_connect_warns_that_it_has_no_retry(catcher, caplog):
+    catcher.install_bleak_catcher()
+    client = sys.modules["bleak"].BleakClient(ADDRESS)
+
+    asyncio.run(client.connect())
+
+    assert UNRETRIED_WARNING in caplog.text
+    assert ADDRESS in caplog.text
+
+
+def test_the_bare_connect_warning_fires_once_per_address(catcher, caplog):
+    """A reconnect loop must not repeat this into the GX log every pass."""
+    catcher.install_bleak_catcher()
+    client = sys.modules["bleak"].BleakClient(ADDRESS)
+
+    asyncio.run(client.connect())
+    asyncio.run(client.disconnect())
+    asyncio.run(client.connect())
+    other = sys.modules["bleak"].BleakClient(ADDRESS)
+    asyncio.run(other.connect())
+
+    assert caplog.text.count(UNRETRIED_WARNING) == 1
 
 
 def test_router_state_is_shared_across_client_instances(catcher, monkeypatch):

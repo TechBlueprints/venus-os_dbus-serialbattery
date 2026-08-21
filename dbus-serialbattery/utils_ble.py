@@ -429,6 +429,10 @@ class BleAdapterRouter:
 
 ble_adapter_router = BleAdapterRouter()
 
+# addresses already warned about bare connect() calls, once per process -
+# a reconnect loop hitting this every few seconds would flood the GX log
+_warned_unretried_addresses = set()
+
 
 class RoutedBleakClient(_ORIGINAL_BLEAK_CLIENT):
     """
@@ -445,6 +449,10 @@ class RoutedBleakClient(_ORIGINAL_BLEAK_CLIENT):
     """
 
     def __init__(self, address_or_ble_device, disconnected_callback=None, services=None, **kwargs):
+        # bleak-retry-connector marks every client its establish_connection
+        # constructs; habluetooth's wrapper checks the same marker. Without
+        # it, connect() below is a single unretried attempt.
+        self._routed_is_retry_client = kwargs.pop("_is_retry_client", False)
         self._routed_args = (address_or_ble_device, disconnected_callback, services)
         self._routed_kwargs = kwargs
         self._routed_address = getattr(address_or_ble_device, "address", address_or_ble_device)
@@ -452,6 +460,15 @@ class RoutedBleakClient(_ORIGINAL_BLEAK_CLIENT):
         self._pair_before_connect = False
 
     async def connect(self, **kwargs):
+        if not self._routed_is_retry_client:
+            key = str(self._routed_address).strip().upper()
+            if key not in _warned_unretried_addresses:
+                _warned_unretried_addresses.add(key)
+                logger.warning(
+                    f"BLE [{self._routed_address}]: BleakClient.connect() called without bleak-retry-connector. "
+                    "A bare connect() is a single attempt with no recovery; connect through the driver's "
+                    "connection backend (get_ble_backend) or bleak_retry_connector.establish_connection() instead."
+                )
         address_or_ble_device, disconnected_callback, services = self._routed_args
         init_kwargs = dict(self._routed_kwargs)
         adapter = ble_adapter_router.select(self._routed_address)
