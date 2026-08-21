@@ -66,6 +66,12 @@ class Generic_AioBmsBle(Battery):
         self._coro_lock = threading.Lock()
         # timeouts (seconds)
         self._run_timeout: int = 10
+        # The first connection races a BMS that may be advertising sparsely:
+        # establish_connection waits for the device's next connectable
+        # advertisement, and a JBD module idling between app sessions can sit
+        # on a multi-second interval. 10 s loses that race; the initial
+        # attempt gets a budget that wins it.
+        self._initial_connect_timeout: int = 40
         self._grace_timeout: int = 2
         self._cancel_timeout: int = 1
         # track the currently scheduled Future on the background loop
@@ -117,6 +123,31 @@ class Generic_AioBmsBle(Battery):
             logger.debug("aiobmsble: using __aexit__ to close connection")
             await aexit(None, None, None)
             logger.debug("aiobmsble: disconnected via context manager")
+
+    async def _resolve_device(self) -> BLEDevice | None:
+        """BLEDevice for this address from the BlueZ cache, scanning as fallback.
+
+        A sleeping BMS can advertise too sparsely for an active scan window
+        to catch, while a connect to its cached device object still works -
+        BlueZ's create-connection waits for the next connectable
+        advertisement instead of needing a scan report. Same cache-first
+        contract as utils_ble's BleakRetryBackend; the scan remains the
+        fallback for a device BlueZ has never seen.
+        """
+        try:
+            from bleak_retry_connector import get_device
+        except ImportError:
+            get_device = None
+        if get_device is not None:
+            try:
+                device = await get_device(self.address)
+            except Exception as e:
+                logger.debug("BlueZ cache lookup failed for %s: %r", self.address, e)
+                device = None
+            if device is not None:
+                logger.debug("aiobmsble: %s resolved from BlueZ cache", self.address)
+                return device
+        return await BleakScanner.find_device_by_address(self.address)
 
     def _ensure_aiobmsble(self, device: BLEDevice):
         # Instantiate the aiobmsble client once, keep for reuse
@@ -328,7 +359,7 @@ class Generic_AioBmsBle(Battery):
         result = False
 
         async def run_async():
-            device: BLEDevice | None = await BleakScanner.find_device_by_address(self.address)
+            device: BLEDevice | None = await self._resolve_device()
 
             if device is None:
                 logger.error(f'Battery "{self.BATTERYTYPE}" with MAC "{self.address}" not found. Is it powered on and in range?')
@@ -376,7 +407,7 @@ class Generic_AioBmsBle(Battery):
                 return False
 
         try:
-            result = self._run_coro(run_async)
+            result = self._run_coro(run_async, timeout=self._initial_connect_timeout)
 
             # get settings to check if the data is valid and the connection is working
             result = result and self.get_settings()
