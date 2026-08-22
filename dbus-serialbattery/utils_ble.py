@@ -1,6 +1,7 @@
 import threading
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import time
@@ -20,14 +21,20 @@ def parse_adapter_entries(entries):
     """
     Split BLUETOOTH_ADAPTERS into pinned devices and the shared pool.
 
-    Entries of the form MAC@hciX pin that device to that adapter, with no
-    fallback to the shared pool. Repeating a MAC pins it to several adapters
-    in order: the first is used for every connection attempt, the rest are
-    tried only when it cannot be resolved there. That keeps a battery on a
-    known good radio while leaving it somewhere to go if that radio fails,
-    without returning it to a pool shared with other devices.
+    Entries of the form DEVICE@ADAPTER pin that device to that adapter, with
+    no fallback to the shared pool. Repeating a device pins it to several
+    adapters in order: the first is used for every connection attempt, the
+    rest are tried only when it cannot be resolved there. That keeps a
+    battery on a known good radio while leaving it somewhere to go if that
+    radio fails, without returning it to a pool shared with other devices.
 
-    Plain hciX entries form the pool used by every device that is not pinned.
+    ADAPTER may be an hciX name or the adapter's own MAC. Prefer the MAC:
+    hciX numbering is assigned in probe order and a reboot or USB reset can
+    renumber the dongles, silently re-pointing a pin at different hardware
+    while everything still appears to work. The adapter's MAC does not move.
+
+    Entries without an "@" form the pool used by every device that is not
+    pinned, and may likewise be hciX names or adapter MACs.
     Returns (pins, pool), with pins keyed by upper case MAC address and each
     value a list of adapters in priority order.
     """
@@ -61,20 +68,33 @@ def adapters_for(address):
     return list(pins) if pins else None
 
 
-def bluez_present_adapters():
+MAC_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+
+def is_adapter_mac(entry):
+    """Whether a configured adapter entry names a MAC rather than an hciN."""
+    return bool(MAC_PATTERN.match(str(entry).strip()))
+
+
+def bluez_adapters():
     """
-    Adapter names BlueZ currently exposes, or an empty set for "no answer".
+    {hciN: MAC} for the adapters BlueZ currently exposes, or {} for "no answer".
 
     hciN names are not stable identities: a USB reset or reboot renumbers
     them, and an adapter a battery is configured for can stop existing while
-    its number lives on pointing at different hardware. Selection therefore
-    asks BlueZ what exists right now rather than trusting the config's names.
+    its number lives on pointing at different hardware. The adapter's own MAC
+    is stable, so configuration can name that instead and be resolved against
+    live BlueZ state here.
+
+    BlueZ is asked rather than sysfs because Venus OS kernels expose no
+    address attribute under /sys/class/bluetooth at all - the ObjectManager
+    reply carries Adapter1.Address for every adapter, in one round trip.
 
     A private connection, closed again before returning: dbus.SystemBus()
     hands out a cached shared connection, and creating that before the driver
     installs its main loop breaks every later signal receiver on it.
     """
-    present = set()
+    adapters = {}
     bus = None
     try:
         import dbus
@@ -83,40 +103,85 @@ def bluez_present_adapters():
         manager = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
         for path, interfaces in manager.GetManagedObjects().items():
             parts = str(path).split("/")
-            if len(parts) >= 4 and "org.bluez.Adapter1" in interfaces:
-                present.add(parts[3])
+            properties = interfaces.get("org.bluez.Adapter1")
+            if len(parts) >= 4 and properties is not None:
+                adapters[parts[3]] = str(properties.get("Address", "")).upper()
     except Exception as e:
         logger.debug(f"BlueZ adapter state unavailable, using configured order: {repr(e)}")
-        return set()
+        return {}
     finally:
         if bus is not None:
             try:
                 bus.close()
             except Exception:
                 pass
-    return present
+    return adapters
+
+
+def bluez_present_adapters():
+    """Adapter names BlueZ currently exposes, or an empty set for "no answer"."""
+    return set(bluez_adapters())
+
+
+def resolve_adapter(entry, adapters=None):
+    """
+    A configured adapter entry as the hciN name to hand to bleak, or None.
+
+    An hciN entry is returned unchanged - it is already what bleak wants, and
+    configuration written that way keeps working. A MAC entry is looked up in
+    live BlueZ state, which is the whole point of allowing MACs: the dongle
+    keeps its address across the renumbering that invalidates its name. A MAC
+    that matches nothing present returns None, meaning that radio is gone.
+    """
+    entry = str(entry).strip()
+    if not is_adapter_mac(entry):
+        return entry
+    if adapters is None:
+        adapters = bluez_adapters()
+    target = entry.upper()
+    for name, mac in adapters.items():
+        if mac and mac.upper() == target:
+            return name
+    return None
 
 
 def adapters_in_attempt_order(address, present=None):
     """
-    Adapters to try for this battery, best first.
+    Adapters to try for this battery, best first, as hciN names.
 
     A battery uses its own configured adapters, or the shared pool if it has
     none; either list is walked by index, advancing only after a failed
-    connection attempt. Adapters BlueZ does not currently expose are dropped:
-    a battery whose radio was renumbered away by a USB reset must reach its
-    next adapter rather than keep asking for a name that no longer resolves.
-    If filtering would leave nothing, the configured list is returned
-    unfiltered - refusing to attempt a connection is worse than trying an
-    adapter that may not be there.
+    connection attempt. Entries are resolved against live BlueZ state, so a
+    battery whose radio was renumbered away reaches it again under its new
+    name (MAC entries) or moves on to its next adapter (hciN entries) rather
+    than asking for a name that no longer resolves.
+
+    When nothing resolves the answer differs by entry kind, deliberately. An
+    unresolvable hciN list is returned unfiltered, preserving the long
+    standing contract that refusing to attempt a connection is worse than
+    trying an adapter that may not be there. An unresolvable MAC list returns
+    empty, so the caller falls back to the system default adapter: a MAC is
+    not a name bleak can use, and passing one through would fail every
+    attempt instead of degrading.
     """
-    adapters = adapters_for(address) or list(BLUETOOTH_ADAPTER_POOL)
-    if not adapters:
+    configured = adapters_for(address) or list(BLUETOOTH_ADAPTER_POOL)
+    if not configured:
         return []
     if present is None:
-        present = bluez_present_adapters()
-    usable = [a for a in adapters if a in present] if present else list(adapters)
-    return usable if usable else list(adapters)
+        present = bluez_adapters()
+    # a bare set of names is accepted as well as the {name: MAC} mapping, so
+    # callers that only know what exists keep working - MAC entries simply
+    # cannot resolve against it, which is the honest answer
+    adapters = present if isinstance(present, dict) else {name: "" for name in present}
+    resolved = []
+    for entry in configured:
+        name = resolve_adapter(entry, adapters)
+        if name and (not adapters or name in adapters) and name not in resolved:
+            resolved.append(name)
+    if resolved:
+        return resolved
+    names = [entry for entry in configured if not is_adapter_mac(entry)]
+    return names
 
 
 # Hold flag: while the flag file for a device exists, the reconnect loop makes

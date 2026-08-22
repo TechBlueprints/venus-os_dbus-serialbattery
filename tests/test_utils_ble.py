@@ -333,3 +333,96 @@ def test_the_retry_connector_establish_is_aliased_against_shadowing():
     backend calling the right one, and no other test reaches the connect path.
     """
     assert utils_ble.retry_establish_connection is sys.modules["bleak_retry_connector"].establish_connection
+
+
+# --------- adapter pinning by MAC ---------
+#
+# hciN numbering is assigned in probe order: a reboot or USB reset can renumber
+# the dongles, silently re-pointing every pin at different hardware while the
+# batteries still connect and nothing looks wrong. An adapter's MAC does not
+# move, so configuration may name that instead and be resolved against live
+# BlueZ state.
+
+ADAPTERS = {"hci3": "00:1A:7D:DA:71:13", "hci4": "00:1A:7D:DA:71:14"}
+
+
+def test_a_mac_entry_resolves_to_the_adapters_current_name():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:14"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci4"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_mac_pin_follows_its_adapter_across_renumbering():
+    """The whole point: the same config resolves to whatever number the
+    dongle currently answers to."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:13"]}, [])
+    try:
+        before = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci3": "00:1A:7D:DA:71:13"})
+        after = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci0": "00:1A:7D:DA:71:13"})
+        assert before == ["hci3"]
+        assert after == ["hci0"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_mac_matching_ignores_case():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1a:7d:da:71:13"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci3"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_hci_and_mac_entries_mix_and_keep_their_order():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:14", "hci3"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci4", "hci3"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_mac_whose_adapter_is_gone_is_dropped():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99", "hci3"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci3"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_only_unresolvable_macs_degrade_to_the_default_adapter_not_to_garbage():
+    """
+    A MAC is not a name bleak can use. Where an unresolvable hciN list is
+    handed back unfiltered (better to try than to refuse), an unresolvable MAC
+    list must come back empty so the caller falls back to the system default
+    adapter instead of passing a MAC into the connect.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == []
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_the_pool_accepts_macs_too():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["00:1A:7D:DA:71:14"])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:11", present=ADAPTERS) == ["hci4"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_is_adapter_mac_distinguishes_the_two_forms():
+    assert utils_ble.is_adapter_mac("00:1A:7D:DA:71:13")
+    assert utils_ble.is_adapter_mac(" 00:1a:7d:da:71:13 ")
+    assert not utils_ble.is_adapter_mac("hci0")
+    assert not utils_ble.is_adapter_mac("00:1A:7D:DA:71")
+    assert not utils_ble.is_adapter_mac("")

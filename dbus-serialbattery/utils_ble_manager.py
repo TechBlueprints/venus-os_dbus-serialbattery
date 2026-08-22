@@ -18,17 +18,19 @@ def parse_link_caps(entries):
     """
     Split BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS into {adapter: capacity}.
 
-    Entries have the form hciX:N with N a positive integer, the
-    established-link capacity of that adapter. Malformed entries are logged
-    and skipped rather than guessed at: a wrong cap silently gates
-    connections.
+    Entries have the form ADAPTER:N with N a positive integer, the
+    established-link capacity of that adapter, and ADAPTER an hciX name or
+    the adapter's own MAC (the same identities BLUETOOTH_ADAPTERS accepts).
+    The split is on the LAST colon, because a MAC is full of them.
+    Malformed entries are logged and skipped rather than guessed at: a wrong
+    cap silently gates connections.
     """
     caps = {}
     for entry in entries:
         entry = entry.strip()
         if not entry:
             continue
-        adapter, sep, cap = entry.partition(":")
+        adapter, sep, cap = entry.rpartition(":")
         adapter = adapter.strip()
         try:
             cap_value = int(cap.strip()) if sep else 0

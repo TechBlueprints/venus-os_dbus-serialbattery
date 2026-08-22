@@ -43,6 +43,18 @@ class TestParseLinkCaps:
     def test_last_duplicate_wins(self):
         assert utils_ble_manager.parse_link_caps(["hci0:5", "hci0:3"]) == {"hci0": 3}
 
+    def test_adapter_macs_survive_the_split(self):
+        # a MAC is full of colons: the split has to be on the last one, or
+        # the adapter comes out as "00:1A:7D:DA:71" with a cap of 13
+        assert utils_ble_manager.parse_link_caps(["00:1A:7D:DA:71:13:5"]) == {"00:1A:7D:DA:71:13": 5}
+        assert utils_ble_manager.parse_link_caps(["00:1A:7D:DA:71:13:5", "hci4:7"]) == {
+            "00:1A:7D:DA:71:13": 5,
+            "hci4": 7,
+        }
+
+    def test_a_mac_without_a_cap_is_still_rejected(self):
+        assert utils_ble_manager.parse_link_caps(["00:1A:7D:DA:71:13:x"]) == {}
+
 
 class TestInstallBleConnectionManager:
     @pytest.fixture
