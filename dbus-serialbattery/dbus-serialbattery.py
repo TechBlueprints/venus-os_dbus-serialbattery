@@ -417,6 +417,12 @@ def main():
 
             install_ble_connection_manager(ble_address)
 
+            # After the install, never before: utils_ble imports bleak at
+            # module scope, and the catcher has to be in place first.
+            from utils_ble import pin_adapters_by_mac
+
+            pin_adapters_by_mac()
+
             if port == "Jkbms_Ble":
                 # noqa: F401 --> ignore flake "imported but unused" error
                 from bms.jkbms_ble import Jkbms_Ble  # noqa: F401
@@ -473,6 +479,12 @@ def main():
             from utils_ble_manager import install_ble_connection_manager
 
             install_ble_connection_manager(ble_address)
+
+            # After the install, never before: utils_ble imports bleak at
+            # module scope, and the catcher has to be in place first.
+            from utils_ble import pin_adapters_by_mac
+
+            pin_adapters_by_mac()
 
             from bms.generic_aiobmsble import Generic_AioBmsBle  # noqa: F401
 
