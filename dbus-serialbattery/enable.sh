@@ -291,6 +291,16 @@ if [ "$bluetooth_length" -gt 0 ]; then
         {
             echo "#!/bin/sh"
             echo
+            # The BLE stack dies natively now and then - SIGSEGV and
+            # malloc_consolidate aborts inside the C libraries under bleak,
+            # always within a second of initiating a connect or scan. Without
+            # faulthandler those deaths leave nothing behind but a shell line
+            # in the log, and the process restarts with the cause unrecorded.
+            # With it, the crashing thread's Python stack (and every other
+            # thread's) is printed into the service log as it dies.
+            echo "# Print Python thread stacks if the process dies natively"
+            echo "export PYTHONFAULTHANDLER=1"
+            echo
             echo "# Forward signals to the child process"
             echo "trap 'kill -TERM \$PID' TERM INT"
             echo
