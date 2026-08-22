@@ -37,7 +37,7 @@ from bleak import BleakScanner as _ORIGINAL_BLEAK_SCANNER
 from bleak.exc import BleakError
 
 from . import mgmt, recovery
-from .claims import CLAIM_DIR, ClaimManager
+from .claims import CLAIM_DIR, CLAIM_TTL, HEARTBEAT_INTERVAL, ClaimManager
 
 # habluetooth's scanner watchdog thresholds (const.py:96-108), derived
 # backwards from BlueZ's 180s device expiry: restart after 90s of silence,
@@ -55,6 +55,12 @@ NO_RSSI_VALUE = -127
 RSSI_SWEEP_INTERVAL = 300.0
 RSSI_SWEEP_DURATION = 10.0
 RSSI_STALE_SECONDS = RSSI_SWEEP_INTERVAL * 2 + RSSI_SWEEP_DURATION
+
+# Notifications are proof the link is alive whatever bleak's connected flag
+# says (field 2026-08-21: a broken D-Bus view read disconnected while data
+# flowed). Evidence goes stale on the same bound the claim convention uses
+# for its own liveness, so a silently dead link is swept within one TTL.
+LINK_EVIDENCE_SECONDS = CLAIM_TTL
 
 try:
     import bleak_retry_connector as _brc_module
@@ -524,6 +530,16 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         self._catcher_address = str(getattr(address_or_ble_device, "address", address_or_ble_device))
         self._catcher_claims = []
         self._catcher_manager = None
+        # each connect() call is a generation; a disconnected callback may
+        # only release the claims of the generation that created it
+        self._catcher_generation = 0
+        self._catcher_adapter_used = None
+        # True while there is deliberately nothing to account for (never
+        # connected, or disconnect() ran): data arriving then must not
+        # re-arm claims
+        self._catcher_settled = True
+        self._catcher_last_evidence = None
+        self._catcher_last_rearm = None
         self._backend = None
         # bleak's backend_id property reads this, but the real __init__ that
         # would set it only runs at connect(); seed it so placeholders answer
@@ -550,42 +566,127 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             "bleak_retry_connector.establish_connection() instead."
         )
 
-    def _make_disconnected_callback(self, raw_callback):
+    def _make_disconnected_callback(self, raw_callback, generation):
         # bleak wraps the raw callable in functools.partial(cb, self) inside
         # the real __init__, so this wrapping must happen on the raw
         # callable: claims are released before the caller hears about the
-        # drop, and an unexpected drop frees its link slot.
+        # drop, and an unexpected drop frees its link slot. Release is
+        # guarded twice (field 2026-08-21: claims vanished while the link
+        # lived): only the callback of the CURRENT connect generation may
+        # release - a reconnect on this instance leaves the previous
+        # backend's late disconnect event closing over the same wrapper,
+        # and the claims it would free were never its to account for - and
+        # only when the wrapper's own view agrees the link is down. A
+        # spurious event with the link still up releases nothing; if the
+        # link really is gone, the validity heartbeat sweeps within a beat.
         def _disconnected(client):
-            self._release_claims()
+            if generation == self._catcher_generation and not self.is_connected:
+                self._release_claims()
             if raw_callback is not None:
                 raw_callback(client)
 
         return _disconnected
+
+    def _recent_link_evidence(self):
+        stamp = self._catcher_last_evidence
+        return stamp is not None and _monotonic() - stamp <= LINK_EVIDENCE_SECONDS
 
     def _arm_claim_validity(self):
         # Backstop for the release paths: once the connection is up, its
         # claims are validity-checked on every heartbeat, so if the link
         # dies without the disconnected callback ever firing (a torn-down
         # D-Bus watch, an abandoned client object) the slot and soft claim
-        # free themselves within a beat instead of living until process
+        # free themselves within a TTL instead of living until process
         # exit. Armed only after a successful connect - a slow in-flight
-        # attempt reads as not-connected and must not be swept.
+        # attempt reads as not-connected and must not be swept. Validity is
+        # link truth, not wrapper liveness: recent notification traffic
+        # counts even when is_connected reads False (a broken D-Bus view),
+        # and a wrapper collected while its backend still holds the BlueZ
+        # link leaves the backend as the link's representative.
         ref = weakref.ref(self)
+        backend_ref = weakref.ref(self._backend) if self._backend is not None else (lambda: None)
 
-        def _still_connected():
+        def _link_alive():
             client = ref()
-            return client is not None and client.is_connected
+            if client is not None:
+                return client.is_connected or client._recent_link_evidence()
+            backend = backend_ref()
+            return backend is not None and bool(getattr(backend, "is_connected", False))
 
         for claim in self._catcher_claims:
-            claim.validity = _still_connected
+            claim.validity = _link_alive
+
+    def _make_notify_tap(self, callback):
+        # every notification is the link's proof of life; the tap mirrors
+        # the caller's coroutine-ness because bleak decides sync-vs-async
+        # handling by inspecting the callback it is handed
+        if inspect.iscoroutinefunction(callback):
+
+            async def _notify(sender, data):
+                self._note_link_evidence()
+                await callback(sender, data)
+
+            return _notify
+
+        def _notify(sender, data):
+            self._note_link_evidence()
+            return callback(sender, data)
+
+        return _notify
+
+    def _note_link_evidence(self):
+        self._catcher_last_evidence = _monotonic()
+        if self._catcher_settled or self._backend is None:
+            return
+        if any(not claim.released for claim in self._catcher_claims):
+            return
+        now = _monotonic()
+        if self._catcher_last_rearm is not None and now - self._catcher_last_rearm < HEARTBEAT_INTERVAL:
+            return
+        self._catcher_last_rearm = now
+        self._rearm_claims()
+
+    def _rearm_claims(self):
+        # The recovery for claims lost while the link lived (a spurious
+        # release the guards could not see): data is flowing, so the
+        # connection re-acquires the accounting it held at connect time.
+        # The link exists regardless of what the files say - losing the
+        # slot race to another process degrades to a soft claim, never to
+        # dropping the connection.
+        config = _config
+        adapter = self._catcher_adapter_used
+        if config is None or not adapter:
+            return
+        claims = []
+        cap = config.link_caps.get(adapter)
+        if cap:
+            slot = config.claims.claim_slot(adapter, cap)
+            if slot is not None:
+                claims.append(slot)
+        soft = config.claims.claim_soft(adapter, qualifier=_mac_qualifier(self._catcher_address))
+        if soft is not None:
+            claims.append(soft)
+        if not claims:
+            return
+        logger.warning(
+            f"BLE [{self._catcher_address}]: link on {adapter} is alive (notifications flowing) "
+            "but its claims were lost, re-claimed"
+        )
+        self._catcher_claims = claims
+        self._catcher_manager = config.claims
+        self._arm_claim_validity()
 
     async def connect(self, **kwargs):
         if not self._catcher_is_retry_client:
             self._warn_bare_connect()
         address_or_ble_device, raw_callback, services = self._catcher_args
         init_kwargs = dict(self._catcher_kwargs)
-        # a reconnect on this instance must not leak the previous claims
+        # a reconnect on this instance must not leak the previous claims,
+        # and opens a new generation: stale disconnect events from the
+        # backend being replaced lose their power to release
         self._release_claims()
+        self._catcher_generation += 1
+        generation = self._catcher_generation
         config = _config
         self._catcher_manager = config.claims if config is not None else None
         if config is not None and config.sweeper is not None:
@@ -609,7 +710,7 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
                 init_kwargs["bluez"] = bluez
             callback = raw_callback
             if self._catcher_claims or raw_callback is not None:
-                callback = self._make_disconnected_callback(raw_callback)
+                callback = self._make_disconnected_callback(raw_callback, generation)
             _ORIGINAL_BLEAK_CLIENT.__init__(
                 self,
                 address_or_ble_device,
@@ -650,6 +751,8 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         _connect_finished(adapter_used, self._catcher_address, True)
         if tune:
             mgmt.load_medium(adapter_used, self._catcher_address)
+        self._catcher_adapter_used = adapter_used
+        self._catcher_settled = False
         self._arm_claim_validity()
         return result
 
@@ -666,7 +769,15 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             return self._catcher_address
         return self._backend.address
 
+    async def start_notify(self, char_specifier, callback, **kwargs):
+        if callable(callback):
+            callback = self._make_notify_tap(callback)
+        return await _ORIGINAL_BLEAK_CLIENT.start_notify(self, char_specifier, callback, **kwargs)
+
     async def disconnect(self):
+        # an intentional teardown settles the accounting: a straggler
+        # notification racing it must not re-arm the claims
+        self._catcher_settled = True
         if self._backend is None:
             return
         try:
