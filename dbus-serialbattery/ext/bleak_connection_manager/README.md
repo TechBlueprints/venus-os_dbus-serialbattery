@@ -12,7 +12,7 @@ integration. Installed (opt-in) by `utils_ble_manager.py` when
 |---|---|
 | Upstream project | <https://github.com/TechBlueprints/bleak-connection-manager> |
 | Upstream version | 2.0.0.dev0 |
-| Vendored commit | `482ff7f` (2026-08-22, `main`) |
+| Vendored commit | `9f74825` (2026-08-22, `main`) |
 | Upstream path | `src/bleak_connection_manager/` |
 | Licence | Apache License 2.0 — see `LICENSE` |
 

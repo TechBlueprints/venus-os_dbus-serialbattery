@@ -12,9 +12,14 @@ This is the minimal slice of that machinery: open the mgmt control channel
 (a raw AF_BLUETOOTH/BTPROTO_HCI socket bound to HCI_CHANNEL_CONTROL - the
 bind needs ctypes because CPython's socket module cannot express the
 channel), and fire LOAD_CONN_PARAM packets without waiting for replies.
-Everything degrades: no AF_BLUETOOTH (non-Linux, or a Python built without
-Bluetooth), no NET_ADMIN (bind refused), or any send error just turns the
-module off for the process. We do not know a peripheral's address type, so
+The socket itself also falls back to ctypes: Venus OS ships a CPython
+built without Bluetooth support (no socket.AF_BLUETOOTH - field
+2026-08-22, both Cerbos), but the kernel supports the family fine, so
+open_bt_socket makes the socket(2) syscall through libc and wraps the fd
+- btsocket's technique (MIT), the reason bluetooth-auto-recovery would
+have worked on that platform. Everything still degrades: a refused
+syscall (non-Linux), no NET_ADMIN (bind refused), or any send error just
+turns the module off for the process. We do not know a peripheral's address type, so
 every load carries both the LE-public and LE-random entry - the kernel
 matches whichever applies and ignores the other.
 """
@@ -55,6 +60,7 @@ class _SockaddrHci(ctypes.Structure):
 _lock = threading.Lock()
 _sock = None
 _available = None
+_announced = False
 
 
 def _pack_bdaddr(address):
@@ -75,13 +81,33 @@ def _conn_param_packet(hci_index, address, params):
     return struct.pack("<HHH", MGMT_OP_LOAD_CONN_PARAM, hci_index, len(payload)) + payload
 
 
+def open_bt_socket():
+    """A raw AF_BLUETOOTH/BTPROTO_HCI socket, or an OSError.
+
+    Preferring the socket module where the build exposes AF_BLUETOOTH,
+    else the libc syscall directly with the fd wrapped via fileno= - the
+    address family is just the integer 31 to the kernel, and only
+    CPython's constant table needs Bluetooth headers at build time.
+    Shared with the recovery module's interface bounce.
+    """
+    if hasattr(socket, "AF_BLUETOOTH"):
+        return socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, BTPROTO_HCI)
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.socket(AF_BLUETOOTH, socket.SOCK_RAW, BTPROTO_HCI)
+    if fd < 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, f"socket(AF_BLUETOOTH) failed (errno {errno})")
+    return socket.socket(AF_BLUETOOTH, socket.SOCK_RAW, BTPROTO_HCI, fileno=fd)
+
+
 def _open_control_socket():
     """The mgmt control channel, or None: CPython's socket module cannot
     set hci_channel, so the bind goes through libc with a hand-built
     sockaddr_hci."""
-    if not hasattr(socket, "AF_BLUETOOTH"):
+    try:
+        sock = open_bt_socket()
+    except OSError:
         return None
-    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, BTPROTO_HCI)
     sock.setblocking(False)
     libc = ctypes.CDLL(None, use_errno=True)
     addr = _SockaddrHci(AF_BLUETOOTH, HCI_DEV_NONE, HCI_CHANNEL_CONTROL)
@@ -113,7 +139,7 @@ def load_conn_params(adapter, address, params):
     Never raises and never waits for the reply; any failure turns tuning
     off for the process rather than perturbing the connect path it serves.
     """
-    global _available
+    global _available, _announced
     match = re.match(r"hci(\d+)$", str(adapter))
     if not match or not available():
         return False
@@ -131,6 +157,13 @@ def load_conn_params(adapter, address, params):
                 except (BlockingIOError, InterruptedError):
                     break
             sock.send(packet)
+            if not _announced:
+                # once per process, at INFO: "tuning is active" must be a
+                # greppable fact, not an inference from a socket opening
+                # (field 2026-08-22: it silently no-opped on Venus for the
+                # platform's entire history and nobody could tell)
+                _announced = True
+                logger.info(f"conn-param tuning active: mgmt channel open, parameters loading (first: {adapter})")
             return True
         except OSError as e:
             logger.debug(f"mgmt LOAD_CONN_PARAM failed, disabling tuning: {repr(e)}")

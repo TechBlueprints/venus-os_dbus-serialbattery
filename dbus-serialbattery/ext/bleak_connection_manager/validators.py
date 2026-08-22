@@ -183,9 +183,6 @@ def tolerate_late_gatt(validator, waits=LATE_GATT_WAITS):
             return True
         cumulative = 0.0
         for wait in waits:
-            if not client.is_connected:
-                logger.info(f"BLE [{client.address}]: link dropped during GATT retry wait, abandoning re-validation")
-                return False
             cumulative += wait
             logger.info(
                 f"BLE [{client.address}]: validation failed, waiting {wait:.0f}s for late GATT services "
@@ -193,6 +190,19 @@ def tolerate_late_gatt(validator, waits=LATE_GATT_WAITS):
             )
             await asyncio.sleep(wait)
             if not await refresh_services(client):
+                # is_connected alone is not evidence of a dropped link: after
+                # an adapter reset or a device object being removed and
+                # re-added, BlueZ sends no property signal and bleak's cached
+                # view is stranded False while GATT still works (field
+                # 2026-08-22, and the easytouch driver's _exchange() has
+                # routed around the same property since v1). A rejection here
+                # disconnects the link, releases its claims and rotates the
+                # radio, so it takes the real failure - a GATT re-read that
+                # did not run - corroborated by the property, before
+                # abandoning.
+                if not client.is_connected:
+                    logger.info(f"BLE [{client.address}]: link dropped during GATT retry wait, abandoning re-validation")
+                    return False
                 continue
             if await _safe(validator, client):
                 logger.info(f"BLE [{client.address}]: late GATT services appeared after {cumulative:.0f}s, validation passed")

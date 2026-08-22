@@ -24,6 +24,8 @@ _CATCHER_EXPORTS = (
     "BLEScanner",
     "OutOfConnectionSlotsError",
     "ConnectionValidationError",
+    "parse_adapter_entries",
+    "rewrite_adapter_config",
 )
 
 _VALIDATOR_EXPORTS = (

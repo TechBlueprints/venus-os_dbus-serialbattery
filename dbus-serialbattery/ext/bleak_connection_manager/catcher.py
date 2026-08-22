@@ -37,6 +37,7 @@ from bleak import BleakScanner as _ORIGINAL_BLEAK_SCANNER
 from bleak.exc import BleakError
 
 from . import mgmt, recovery
+from . import claims as claims
 from .claims import CLAIM_DIR, CLAIM_TTL, HEARTBEAT_INTERVAL, ClaimManager
 
 # habluetooth's scanner watchdog thresholds (const.py:96-108), derived
@@ -114,7 +115,15 @@ def parse_adapter_entries(entries):
     without returning it to a pool shared with other devices.
 
     Plain hciX entries form the pool used by every device that is not pinned.
-    Returns (pins, pool), with pins keyed by upper case MAC address and each
+
+    An adapter may be named either by its hciN number or by its OWN MAC, in
+    any spelling (colons, dashes, dots, spaces or none; any case). The MAC
+    is the stable identity - hciN numbering changes under a USB reset or a
+    replug - so a MAC entry is kept verbatim and resolved to whatever hciN
+    the card answers to at the moment it is used. A device MAC pinned to an
+    adapter MAC is written the same way: DEVICE@ADAPTER.
+
+    Returns (pins, pool), with pins keyed by upper case device MAC and each
     value a list of adapters in priority order.
     """
     pins = {}
@@ -236,6 +245,75 @@ def _device_path_adapter(address_or_ble_device):
     return match.group(1) if match else None
 
 
+def _resolve_adapter_entry(entry):
+    """A configured adapter entry -> the hciN it names right now, or None.
+
+    hciN entries pass through; a MAC entry is looked up against the cards
+    the kernel currently exposes. None means "not present at the moment" -
+    a card can be unplugged, or renumbered while we were not looking - and
+    callers treat that the way they already treat an absent adapter.
+    """
+    text = str(entry).strip()
+    if not text:
+        return None
+    key = claims.mac_key(text)
+    if key is None:
+        return text  # an hciN name (or something the kernel will reject)
+    return claims.hci_for(text)
+
+
+def _resolve_entries(entries):
+    """Configured entries -> present hciN names, order preserved, dropping
+    the ones no card answers to. Also records every hciN entry that turned
+    out to name a card with a readable MAC, for the config rewrite."""
+    resolved = []
+    for entry in entries:
+        name = _resolve_adapter_entry(entry)
+        if name is None:
+            continue
+        _note_adapter_identity(entry, name)
+        if name not in resolved:
+            resolved.append(name)
+    return resolved
+
+
+# configured hciN entries observed to carry a real MAC: {entry: mac}. Filled
+# on first successful read of each card and drained by the config rewrite.
+_observed_identities = {}
+
+
+def _note_adapter_identity(entry, hci_name):
+    text = str(entry).strip()
+    if claims.mac_key(text) is not None or text in _observed_identities:
+        return
+    mac = claims.adapter_mac(hci_name)
+    if mac == claims.UNKNOWN_MAC:
+        return
+    _observed_identities[text] = mac
+    config = _config
+    if config is not None and config.adapter_config_path:
+        rewrite_adapter_config(config.adapter_config_path, {text: mac})
+
+
+def _cap_for(config, adapter):
+    """The configured link cap for an adapter, whichever way it was keyed.
+
+    Caps may be written against hciN or against the card's MAC; the lookup
+    canonicalizes both sides so a renumbered card keeps its cap.
+    """
+    # accepts the config object or a bare caps mapping
+    caps = getattr(config, "link_caps", config)
+    if not caps:
+        return None
+    if adapter in caps:
+        return caps[adapter]
+    key = claims.adapter_key(adapter)
+    for name, cap in caps.items():
+        if claims.adapter_key(name) == key:
+            return cap
+    return None
+
+
 def _responsive_adapters(candidates):
     """Drop adapters whose sysfs MAC is all-zeros - the kernel's signal for
     a failed or unserved controller (habluetooth's FAILED_ADAPTER_MAC): a
@@ -245,6 +323,15 @@ def _responsive_adapters(candidates):
     used."""
     live = [a for a in candidates if recovery.adapter_mac(a) != recovery.UNKNOWN_MAC]
     return live or candidates
+
+
+def _undrained_adapters(candidates, snapshot):
+    """Drop adapters with a live drain claim - some process is emptying the
+    card to reset it, and new work placed there would land in the blast
+    radius (or hold the reset off forever). Never gates: when everything is
+    draining, the unfiltered list is used - a drain steers, never refuses."""
+    clear = [a for a in candidates if not (snapshot.get(a) or {}).get("drain")]
+    return clear or candidates
 
 
 # adapter -> consecutive failed scanner starts, feeding scan placement;
@@ -261,6 +348,138 @@ def _scan_finished(adapter, started):
         _scan_failures[adapter] = _scan_failures.get(adapter, 0) + 1
 
 
+# every connected client and started scanner, for the drain watcher; weak
+# so the watcher can never keep a wrapper alive
+_live_clients = weakref.WeakSet()
+_live_scanners = weakref.WeakSet()
+_migration_tasks = set()
+
+
+def _spawn_migration(coro_fn, label):
+    # runs inside the wrapper's own event loop (scheduled with
+    # call_soon_threadsafe from the heartbeat thread)
+    try:
+        task = asyncio.get_running_loop().create_task(coro_fn())
+    except RuntimeError:
+        return
+    _migration_tasks.add(task)
+    task.add_done_callback(_migration_tasks.discard)
+
+
+def _drain_watch():
+    """Honor foreign drain claims: migrate our work off a draining card.
+
+    Runs on the claim heartbeat thread (ClaimManager.on_beat). A connected
+    client on a draining adapter is disconnected - the driver's retry loop
+    above (bleak-retry-connector) reconnects it, selection steers the new
+    attempt elsewhere, and the released claims let the resetter proceed. A
+    running scanner is restarted the same way. "If possible" is literal:
+    a client on its only usable card, an operator-pinned device with every
+    pin draining, or a caller-chosen explicit adapter stays put - its live
+    claims keep vetoing the reset, which is the safe outcome. Each wrapper
+    is kicked at most once per adapter per connect, so a migration that
+    lands back on the draining card (nothing else worked) is not bounced
+    forever.
+    """
+    config = _config
+    if config is None:
+        return
+    snapshot = config.claims.claims()
+    draining = {a for a, entry in snapshot.items() if entry.get("drain")}
+    if not draining:
+        return
+    present = present_adapters()
+    for client in list(_live_clients):
+        adapter = client._catcher_adapter_used
+        if adapter not in draining or client._catcher_settled:
+            continue
+        if client._catcher_drain_kicked == adapter or client._catcher_explicit:
+            continue
+        pins = config.pins.get(_address_key(client._catcher_address))
+        if pins:
+            alternatives = [a for a in pins if a not in draining]
+        else:
+            pool = list(config.pool) or sorted(present, key=_hci_sort_key)
+            alternatives = [a for a in pool if a not in draining]
+        if present:
+            alternatives = [a for a in alternatives if a in present] or alternatives
+        if not alternatives:
+            continue
+        loop = client._catcher_loop
+        if loop is None or loop.is_closed():
+            continue
+        client._catcher_drain_kicked = adapter
+        logger.warning(
+            f"BLE [{client._catcher_address}]: {adapter} is draining, migrating "
+            f"(will reconnect on one of {alternatives})"
+        )
+        loop.call_soon_threadsafe(_spawn_migration, client.disconnect, "migrate")
+    for scanner in list(_live_scanners):
+        adapter = scanner._catcher_adapter
+        if adapter not in draining or scanner._catcher_restarting:
+            continue
+        if scanner._catcher_drain_kicked == adapter or scanner._catcher_explicit:
+            continue
+        others = [a for a in sorted(present, key=_hci_sort_key) if a not in draining]
+        if not others:
+            continue
+        loop = scanner._catcher_loop
+        if loop is None or loop.is_closed():
+            continue
+        scanner._catcher_drain_kicked = adapter
+        logger.warning(f"BLE scan: {adapter} is draining, moving the scanner")
+        loop.call_soon_threadsafe(_spawn_migration, scanner._drain_restart, "rescan")
+
+
+# addresses already warned about a duplicate claimant, once per process
+_warned_duplicate_claimants = set()
+
+
+def _warn_duplicate_claimant(address):
+    """Flag a second live instance of THIS service claiming the same device.
+
+    The field signature of an orphaned driver process (prod 2026-08-22): a
+    TERM-immune leftover survives the supervisor's restart and fights the
+    new instance for the same battery, a ~8s connect/disconnect flap that
+    reads exactly like radio failure and burned 45 minutes of diagnosis.
+    The claim files already carry everything needed to name it: same owner
+    base, different pid, same MAC qualifier. Warn once per address."""
+    config = _config
+    if config is None:
+        return
+    key = _address_key(address)
+    if key in _warned_duplicate_claimants:
+        return
+    mac = _mac_qualifier(address)
+    if not mac:
+        return
+    # the manager's owner is the sanitized "<service>-<pid>"; the base is
+    # everything before our own pid suffix
+    own = f"-{os.getpid()}"
+    full = config.claims.owner
+    base = full[: -len(own)] if full.endswith(own) else full
+    try:
+        names = os.listdir(config.claims.claim_dir)
+    except OSError:
+        return
+    for name in names:
+        rest = name.partition(".use.")[2]
+        if not rest or not rest.endswith(f".{mac}"):
+            continue
+        holder = rest[: -len(mac) - 1]
+        if not holder.startswith(f"{base}-") or holder == full:
+            continue
+        if not config.claims._is_live(os.path.join(config.claims.claim_dir, name)):
+            continue
+        _warned_duplicate_claimants.add(key)
+        logger.warning(
+            f"BLE [{address}]: another live instance of this service ({holder}) also claims this "
+            "device - an orphaned process fighting this one produces a connect/disconnect flap "
+            "that looks like radio failure. Check for a leftover pid."
+        )
+        return
+
+
 # addresses already warned about bare connect() calls, once per process -
 # a reconnect loop hitting this every few seconds would flood the log
 _warned_bare_connect_addresses = set()
@@ -271,6 +490,7 @@ class _CatcherConfig:
         self.owner = owner
         self.pins = pins
         self.pool = pool
+        self.adapter_config_path = None
         self.link_caps = link_caps
         self.claims = claims
         self.tune_conn_params = tune_conn_params
@@ -376,7 +596,7 @@ def _out_of_slots_error(address, exhausted, config):
     return OutOfConnectionSlotsError(f"connection slot exhausted for {address}: {detail}")
 
 
-def _score_order(eligible, address_key, snapshot, caps, rssi=None):
+def _score_order(eligible, address_key, snapshot, config, rssi=None):
     """Candidates best-first, by habluetooth-parity connect scoring.
 
     habluetooth scores connection paths as RSSI minus penalties
@@ -402,7 +622,7 @@ def _score_order(eligible, address_key, snapshot, caps, rssi=None):
     scored = []
     for index, adapter in enumerate(eligible):
         entry = snapshot.get(adapter) or {}
-        cap = caps.get(adapter)
+        cap = _cap_for(config, adapter)
         free = (cap - entry.get("links", 0)) if cap else None
         score = float(rssi.get(adapter, NO_RSSI_VALUE)) if rssi else 0.0
         score -= entry.get("soft", 0) * 1.01 * unit
@@ -441,9 +661,9 @@ def _acquire_adapter(address):
     pins = config.pins.get(address_key)
     present = present_adapters()
     if pins:
-        candidates = list(pins)
+        candidates = _resolve_entries(pins)
     elif config.pool:
-        candidates = list(config.pool)
+        candidates = _resolve_entries(config.pool)
     elif present:
         candidates = sorted(present, key=_hci_sort_key)
     else:
@@ -466,12 +686,13 @@ def _acquire_adapter(address):
     if not eligible:
         logger.info(f"BLE [{address}]: every usable adapter is scan-claimed by another process, using them anyway")
         eligible = usable
+    eligible = _undrained_adapters(eligible, snapshot)
     if pins:
         start = _rotation.index(address) % len(eligible)
         ordered = eligible[start:] + eligible[:start]
     else:
         rssi = config.sweeper.rssi_for(eligible, address_key) if config.sweeper is not None else None
-        ordered = _score_order(eligible, address_key, snapshot, config.link_caps, rssi)
+        ordered = _score_order(eligible, address_key, snapshot, config, rssi)
     if logger.isEnabledFor(logging.DEBUG):
         occupancy = {a: (snapshot.get(a) or {}) for a in ordered}
         logger.debug(
@@ -480,7 +701,7 @@ def _acquire_adapter(address):
         )
     exhausted = []
     for adapter in ordered:
-        cap = config.link_caps.get(adapter)
+        cap = _cap_for(config, adapter)
         if cap:
             slot = config.claims.claim_slot(adapter, cap)
             if slot is None:
@@ -561,6 +782,11 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         self._catcher_settled = True
         self._catcher_last_evidence = None
         self._catcher_last_rearm = None
+        self._catcher_loop = None
+        self._catcher_explicit = False
+        # the adapter this client was already kicked off during a drain -
+        # at most one forced migration per adapter per connect
+        self._catcher_drain_kicked = None
         self._backend = None
         # bleak's backend_id property reads this, but the real __init__ that
         # would set it only runs at connect(); seed it so placeholders answer
@@ -602,6 +828,15 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # link really is gone, the validity heartbeat sweeps within a beat.
         def _disconnected(client):
             if generation == self._catcher_generation and not self.is_connected:
+                if any(not c.released for c in self._catcher_claims):
+                    # the release reason, on the record: if the next line is
+                    # followed by traffic-based re-arm, the property lied
+                    stamp = self._catcher_last_evidence
+                    age = "never" if stamp is None else f"{_monotonic() - stamp:.0f}s ago"
+                    logger.info(
+                        f"BLE [{self._catcher_address}]: disconnect event, is_connected False, "
+                        f"releasing claims (last link traffic: {age})"
+                    )
                 self._release_claims()
             if raw_callback is not None:
                 raw_callback(client)
@@ -620,8 +855,9 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # free themselves within a TTL instead of living until process
         # exit. Armed only after a successful connect - a slow in-flight
         # attempt reads as not-connected and must not be swept. Validity is
-        # link truth, not wrapper liveness: recent notification traffic
-        # counts even when is_connected reads False (a broken D-Bus view),
+        # link truth, not wrapper liveness: recent link traffic - a
+        # notification or a completed GATT read/write - counts even when
+        # is_connected reads False (a broken D-Bus view),
         # and a wrapper collected while its backend still holds the BlueZ
         # link leaves the backend as the link's representative.
         ref = weakref.ref(self)
@@ -669,8 +905,9 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
 
     def _rearm_claims(self):
         # The recovery for claims lost while the link lived (a spurious
-        # release the guards could not see): data is flowing, so the
-        # connection re-acquires the accounting it held at connect time.
+        # release the guards could not see): traffic is flowing - notified
+        # or polled - so the connection re-acquires the accounting it held
+        # at connect time.
         # The link exists regardless of what the files say - losing the
         # slot race to another process degrades to a soft claim, never to
         # dropping the connection.
@@ -679,7 +916,7 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         if config is None or not adapter:
             return
         claims = []
-        cap = config.link_caps.get(adapter)
+        cap = _cap_for(config, adapter)
         if cap:
             slot = config.claims.claim_slot(adapter, cap)
             if slot is not None:
@@ -690,7 +927,7 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         if not claims:
             return
         logger.warning(
-            f"BLE [{self._catcher_address}]: link on {adapter} is alive (notifications flowing) "
+            f"BLE [{self._catcher_address}]: link on {adapter} is alive (traffic flowing) "
             "but its claims were lost, re-claimed"
         )
         self._catcher_claims = claims
@@ -826,6 +1063,11 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             mgmt.load_medium(adapter_used, self._catcher_address)
         self._catcher_adapter_used = adapter_used
         self._catcher_settled = False
+        _warn_duplicate_claimant(self._catcher_address)
+        self._catcher_explicit = bool(explicit)
+        self._catcher_drain_kicked = None
+        self._catcher_loop = asyncio.get_running_loop()
+        _live_clients.add(self)
         self._arm_claim_validity()
         return result
 
@@ -847,9 +1089,37 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             callback = self._make_notify_tap(callback)
         return await _ORIGINAL_BLEAK_CLIENT.start_notify(self, char_specifier, callback, **kwargs)
 
+    async def _gatt_traffic(self, coro):
+        # A completed GATT exchange is the link's proof of life exactly as a
+        # notification is - and for a polling consumer it is the only proof
+        # there will ever be (field 2026-08-22: a thermostat driver that
+        # only ever calls read_gatt_char lost its claims to a transient
+        # is_connected false negative, and the notification tap could not
+        # re-arm them because it never subscribes to anything). Noted after
+        # the await, never before: an operation that raised proves nothing.
+        result = await coro
+        self._note_link_evidence()
+        return result
+
+    # *args/**kwargs throughout: these signatures drift across the bleak
+    # versions this package rides on (write_gatt_char's response default
+    # went bool -> None), and the wrapper has no reason to know them - it
+    # only needs to see that the call returned.
+    async def read_gatt_char(self, *args, **kwargs):
+        return await self._gatt_traffic(_ORIGINAL_BLEAK_CLIENT.read_gatt_char(self, *args, **kwargs))
+
+    async def write_gatt_char(self, *args, **kwargs):
+        return await self._gatt_traffic(_ORIGINAL_BLEAK_CLIENT.write_gatt_char(self, *args, **kwargs))
+
+    async def read_gatt_descriptor(self, *args, **kwargs):
+        return await self._gatt_traffic(_ORIGINAL_BLEAK_CLIENT.read_gatt_descriptor(self, *args, **kwargs))
+
+    async def write_gatt_descriptor(self, *args, **kwargs):
+        return await self._gatt_traffic(_ORIGINAL_BLEAK_CLIENT.write_gatt_descriptor(self, *args, **kwargs))
+
     async def disconnect(self):
         # an intentional teardown settles the accounting: a straggler
-        # notification racing it must not re-arm the claims
+        # notification or a late read racing it must not re-arm the claims
         self._catcher_settled = True
         if self._backend is None:
             return
@@ -889,14 +1159,14 @@ def _scan_candidates(config, present):
     adapter the kernel exposes - like connection placement, an unconfigured
     install uses everything and the config acts as an allowlist."""
     if config.pool:
-        return list(config.pool)
+        return _resolve_entries(config.pool)
     seen = []
     for adapters in config.pins.values():
         for adapter in adapters:
             if adapter not in seen:
                 seen.append(adapter)
     if seen:
-        return seen
+        return _resolve_entries(seen)
     if present:
         return sorted(present, key=_hci_sort_key)
     return []
@@ -926,6 +1196,7 @@ def _acquire_scan_adapter():
         usable = candidates
     usable = _responsive_adapters(usable)
     snapshot = config.claims.claims()
+    usable = _undrained_adapters(usable, snapshot)
 
     def rank(adapter):
         # occupancy first, like connect scoring - but scans also carry
@@ -976,6 +1247,9 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         self._catcher_watchdog = None
         self._catcher_restarting = False
         self._catcher_tasks = set()
+        self._catcher_loop = None
+        self._catcher_explicit = False
+        self._catcher_drain_kicked = None
         self._backend = None
         self._backend_id = ""
 
@@ -1135,12 +1409,30 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
                 self._backend = None
         _scan_finished(explicit or adapter, True)
         self._catcher_adapter = explicit or adapter
+        self._catcher_explicit = bool(explicit)
+        self._catcher_drain_kicked = None
+        self._catcher_loop = asyncio.get_running_loop()
+        _live_scanners.add(self)
         now = _monotonic()
         self._catcher_start_time = now
         self._catcher_last_detection = now
         self._schedule_watchdog()
         self._arm_claim_validity()
         return result
+
+    async def _drain_restart(self):
+        # the drain watcher's migration: stop and start, nothing more - the
+        # restart re-runs selection, which steers off the draining card
+        if self._catcher_restarting:
+            return
+        self._catcher_restarting = True
+        try:
+            await self.stop()
+            await self.start()
+        except Exception:
+            logger.exception("BLE scan: drain migration failed")
+        finally:
+            self._catcher_restarting = False
 
     async def stop(self):
         self._cancel_watchdog()
@@ -1162,7 +1454,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         return self._backend.discovered_devices
 
 
-def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None):
+def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None, adapter_config_path=None):
     """Route every bleak client in this process through the catcher.
 
     Must run before consumer libraries are imported: they capture `from
@@ -1173,9 +1465,16 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     owner names this process's claims; the pid is appended to disambiguate
     restart races (the old process's claims awaiting reap while the new one
     starts). adapters are raw config strings, verbatim ("MAC@hciX" pins,
-    plain "hciX" pools - see parse_adapter_entries). link_caps maps adapter
-    name to its established-link capacity; caps are opt-in, an uncapped
-    adapter is never slot-gated. wrap_scanner additionally rebinds
+    plain "hciX" pools - see parse_adapter_entries). An adapter may be named
+    by hciN or by its own MAC in any spelling; the MAC is the stable
+    identity, since hciN numbering changes under a USB reset or a replug,
+    and a MAC entry is resolved to the current number at use time. Pass
+    adapter_config_path to have the FIRST successful read of an hciN entry
+    rewrite that entry in the consumer's config file to the MAC it proved
+    to be, with a comment recording the substitution - the number stops
+    being load-bearing without anyone having to hand-edit anything.
+    link_caps maps adapter name (either spelling) to its established-link
+    capacity; caps are opt-in, an uncapped adapter is never slot-gated. wrap_scanner additionally rebinds
     bleak.BleakScanner to the adapter-bound, hard-claiming BLEScanner -
     opt-in because it changes which adapter unrelated code scans on.
     tune_conn_params loads habluetooth's fast-then-medium connection
@@ -1221,6 +1520,8 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         tune_conn_params=tune_conn_params,
         validate_connection=validate_connection,
     )
+    _config.claims.on_beat = _drain_watch
+    _config.adapter_config_path = adapter_config_path
     if scan_to_score:
         _config.sweeper = RssiSweeper(_config)
     bleak.BleakClient = BLEConnection
@@ -1246,3 +1547,59 @@ def uninstall_bleak_catcher():
             _config.sweeper.stop()
         _config.claims.release_all()
         _config = None
+
+
+def rewrite_adapter_config(path, mapping):
+    """Rewrite hciN adapter names in a config file to the MACs they proved
+    to be, leaving a comment recording what happened.
+
+    Line-oriented and format-agnostic on purpose: it substitutes the hciN
+    token wherever it appears in a value and inserts a comment above that
+    line, which is what INI, conf and shell-style files all understand. A
+    line already commented out is left alone. Best effort in every failure
+    mode - a config that cannot be read or written is not worth breaking a
+    connection over, and the resolution itself is unaffected.
+
+        # bcm: hci3 was detected as AA:BB:CC:DD:EE:FF and rewritten
+        adapters = AA:BB:CC:DD:EE:FF,hci5
+    """
+    if not path or not mapping:
+        return False
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError as e:
+        logger.debug(f"adapter config rewrite: cannot read {path}: {repr(e)}")
+        return False
+    out = []
+    changed = False
+    for line in lines:
+        stripped = line.strip()
+        replaced = line
+        hits = []
+        if stripped and not stripped.startswith(("#", ";")):
+            for entry, mac in mapping.items():
+                # word-boundary so hci1 never matches inside hci10
+                pattern = rf"(?<![0-9A-Za-z]){re.escape(entry)}(?![0-9A-Za-z])"
+                if re.search(pattern, replaced):
+                    replaced = re.sub(pattern, mac, replaced)
+                    hits.append((entry, mac))
+        if hits:
+            indent = line[: len(line) - len(line.lstrip())]
+            for entry, mac in hits:
+                out.append(f"{indent}# bcm: {entry} was detected as {mac} and rewritten\n")
+            changed = True
+        out.append(replaced)
+    if not changed:
+        return False
+    try:
+        tmp = f"{path}.bcm-tmp"
+        with open(tmp, "w") as f:
+            f.writelines(out)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.debug(f"adapter config rewrite: cannot write {path}: {repr(e)}")
+        return False
+    for entry, mac in mapping.items():
+        logger.warning(f"adapter config: {entry} was detected as {mac}, rewritten in {path}")
+    return True
