@@ -421,6 +421,16 @@ async def reset_adapter(adapter, claims_manager=None, force=False, gone_silent=F
             return False
         claims.invalidate_adapter_mac(adapter)
         if ok:
+            # the card was just power-cycled: its accumulated failure record
+            # describes a radio that no longer exists in that state, and for
+            # scans it is self-reinforcing (ranked last, so never selected to
+            # earn the success that would clear it)
+            try:
+                from .catcher import forget_adapter_failures
+
+                forget_adapter_failures(adapter)
+            except Exception:
+                pass
             if not await restart_bluetoothd():
                 logger.error(f"bt-recovery: {adapter} reset but bluetoothd could not be revived")
                 return False

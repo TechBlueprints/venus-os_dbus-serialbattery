@@ -207,15 +207,19 @@ class BleAdapterRotation:
 
 _rotation = BleAdapterRotation()
 
-# (adapter, address) -> consecutive failed connect attempts, feeding the
-# placement score; a success there clears it (habluetooth's model)
+# (adapter-identity, address) -> consecutive failed connect attempts,
+# feeding the placement score; a success there clears it (habluetooth's
+# model). Keyed by the card's identity rather than its number for the same
+# reason claims are: after a renumber, penalties keyed by hciN would follow
+# the NUMBER - a healthy card inheriting a bad one's number would inherit
+# its record, and the bad card would shed it by moving.
 _connect_failures = {}
 
 
 def _connect_finished(adapter, address, connected):
     if not adapter:
         return
-    key = (adapter, _address_key(address))
+    key = (claims.adapter_key(adapter), _address_key(address))
     if connected:
         _connect_failures.pop(key, None)
     else:
@@ -295,6 +299,19 @@ def _note_adapter_identity(entry, hci_name):
         rewrite_adapter_config(config.adapter_config_path, {text: mac})
 
 
+def _entry(snapshot, adapter):
+    """One adapter's row from a claims() snapshot, or an empty row.
+
+    The snapshot is keyed by adapter IDENTITY (the card's MAC) while the
+    catcher works in hciN, because that is what the kernel and bleak want.
+    Every lookup has to cross that boundary, and a raw .get silently
+    returns nothing on any host where MACs actually resolve - which is
+    every real deployment, and none of the unit tests, which is exactly
+    how this survived a green suite.
+    """
+    return snapshot.get(claims.adapter_key(adapter)) or {}
+
+
 def _cap_for(config, adapter):
     """The configured link cap for an adapter, whichever way it was keyed.
 
@@ -330,22 +347,40 @@ def _undrained_adapters(candidates, snapshot):
     card to reset it, and new work placed there would land in the blast
     radius (or hold the reset off forever). Never gates: when everything is
     draining, the unfiltered list is used - a drain steers, never refuses."""
-    clear = [a for a in candidates if not (snapshot.get(a) or {}).get("drain")]
+    clear = [a for a in candidates if not _entry(snapshot, a).get("drain")]
     return clear or candidates
 
 
-# adapter -> consecutive failed scanner starts, feeding scan placement;
-# a successful start there clears it
+# adapter identity -> consecutive failed scanner starts, feeding scan
+# placement; a successful start there clears it. Keyed by identity, not
+# number, for the reason above.
 _scan_failures = {}
 
 
 def _scan_finished(adapter, started):
     if not adapter:
         return
+    key = claims.adapter_key(adapter)
     if started:
-        _scan_failures.pop(adapter, None)
+        _scan_failures.pop(key, None)
     else:
-        _scan_failures[adapter] = _scan_failures.get(adapter, 0) + 1
+        _scan_failures[key] = _scan_failures.get(key, 0) + 1
+
+
+def forget_adapter_failures(adapter):
+    """Drop an adapter's accumulated failure record.
+
+    Called after a successful hardware reset: every penalty in there was
+    charged to a card that has since been power-cycled, so it is stale
+    evidence about a radio that no longer exists in that state. Leaving it
+    is not merely unfair, it is self-reinforcing for scans - the scan
+    penalty ranks a card last, and a card ranked last is never selected to
+    have the success that would clear it.
+    """
+    key = claims.adapter_key(adapter)
+    _scan_failures.pop(key, None)
+    for pair in [k for k in _connect_failures if k[0] == key]:
+        _connect_failures.pop(pair, None)
 
 
 # every connected client and started scanner, for the drain watcher; weak
@@ -592,7 +627,7 @@ def _out_of_slots_error(address, exhausted, config):
     """The typed exhaustion error, with per-adapter occupancy: when this
     fires on a GX device the occupancy detail is the whole diagnosis."""
     snapshot = config.claims.claims()
-    detail = ", ".join(f"{adapter} ({(snapshot.get(adapter) or {}).get('links', cap)}/{cap} links held)" for adapter, cap in exhausted)
+    detail = ", ".join(f"{adapter} ({_entry(snapshot, adapter).get('links', cap)}/{cap} links held)" for adapter, cap in exhausted)
     return OutOfConnectionSlotsError(f"connection slot exhausted for {address}: {detail}")
 
 
@@ -621,12 +656,12 @@ def _score_order(eligible, address_key, snapshot, config, rssi=None):
             unit = max(known[0] - known[1], 1.0)
     scored = []
     for index, adapter in enumerate(eligible):
-        entry = snapshot.get(adapter) or {}
+        entry = _entry(snapshot, adapter)
         cap = _cap_for(config, adapter)
         free = (cap - entry.get("links", 0)) if cap else None
         score = float(rssi.get(adapter, NO_RSSI_VALUE)) if rssi else 0.0
         score -= entry.get("soft", 0) * 1.01 * unit
-        score -= _connect_failures.get((adapter, address_key), 0) * 0.51 * unit
+        score -= _connect_failures.get((claims.adapter_key(adapter), address_key), 0) * 0.51 * unit
         if free is not None:
             if free <= 0:
                 score -= 100000.0
@@ -679,7 +714,7 @@ def _acquire_adapter(address):
     own_pid = os.getpid()
 
     def foreign_scan(adapter):
-        entry = snapshot.get(adapter)
+        entry = _entry(snapshot, adapter)
         return bool(entry and entry["hard"] and entry["hard_pid"] != own_pid)
 
     eligible = [a for a in usable if not foreign_scan(a)]
@@ -694,7 +729,7 @@ def _acquire_adapter(address):
         rssi = config.sweeper.rssi_for(eligible, address_key) if config.sweeper is not None else None
         ordered = _score_order(eligible, address_key, snapshot, config, rssi)
     if logger.isEnabledFor(logging.DEBUG):
-        occupancy = {a: (snapshot.get(a) or {}) for a in ordered}
+        occupancy = {a: _entry(snapshot, a) for a in ordered}
         logger.debug(
             f"BLE [{address}]: adapter order {ordered} "
             f"({'pinned walk' if pins else 'scored'}, occupancy {occupancy})"
@@ -729,7 +764,7 @@ def _claim_explicit(adapter, address):
     config = _config
     if config is None:
         return []
-    cap = config.link_caps.get(adapter)
+    cap = _cap_for(config, adapter)
     if cap:
         slot = config.claims.claim_slot(adapter, cap)
         if slot is None:
@@ -1203,9 +1238,9 @@ def _acquire_scan_adapter():
         # start-failure memory: scan selection has no failure-driven walk,
         # so without it a dead-but-listed adapter would win every tie
         # forever (a successful start clears the count)
-        entry = snapshot.get(adapter) or {}
+        entry = _entry(snapshot, adapter)
         occupancy = entry.get("soft", 0) + entry.get("links", 0)
-        return (occupancy + _scan_failures.get(adapter, 0), usable.index(adapter))
+        return (occupancy + _scan_failures.get(claims.adapter_key(adapter), 0), usable.index(adapter))
 
     ranked = sorted(usable, key=rank)
     for adapter in ranked:
