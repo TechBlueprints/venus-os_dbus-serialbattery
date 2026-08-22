@@ -12,7 +12,7 @@ integration. Installed (opt-in) by `utils_ble_manager.py` when
 |---|---|
 | Upstream project | <https://github.com/TechBlueprints/bleak-connection-manager> |
 | Upstream version | 2.0.0.dev0 |
-| Vendored commit | `bc31d9a` (2026-08-21, `main`) |
+| Vendored commit | `482ff7f` (2026-08-22, `main`) |
 | Upstream path | `src/bleak_connection_manager/` |
 | Licence | Apache License 2.0 — see `LICENSE` |
 
@@ -41,6 +41,12 @@ The complete `src/bleak_connection_manager/` package, unmodified:
   habluetooth's silence watchdog; opt-in), habluetooth-parity connect
   scoring for unpinned devices, per-adapter link slots and
   `OutOfConnectionSlotsError`.
+* **`validators.py`** — v1's post-connect validators, stdlib-only and
+  duck-typed (imports without bleak): `validate_gatt_services`,
+  `validate_char_exists(uuid)`, `validate_read_char(uuid)`, and
+  `tolerate_late_gatt(...)` for chips that register vendor services after
+  ServicesResolved. Used with the catcher's optional `validate_connection`
+  hook; with no validator configured, connects behave exactly as before.
 * **`mgmt.py`** — habluetooth's fast-then-medium connection parameters
   loaded over the BlueZ management socket; degrades to a no-op without
   `AF_BLUETOOTH`/NET_ADMIN.

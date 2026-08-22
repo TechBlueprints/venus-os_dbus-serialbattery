@@ -62,6 +62,11 @@ RSSI_STALE_SECONDS = RSSI_SWEEP_INTERVAL * 2 + RSSI_SWEEP_DURATION
 # for its own liveness, so a silently dead link is swept within one TTL.
 LINK_EVIDENCE_SECONDS = CLAIM_TTL
 
+# Ceiling on the courtesy disconnect of a link that failed validation: it is
+# already known bad, so waiting on BlueZ past this costs the caller's retry
+# budget for nothing (v1's DISCONNECT_TIMEOUT).
+DISCONNECT_TIMEOUT = 5.0
+
 try:
     import bleak_retry_connector as _brc_module
 
@@ -84,6 +89,16 @@ class OutOfConnectionSlotsError(BleakError):
     identity. It is raised before any backend is constructed and costs file
     stats only: brc draws it from the transient budget, so one
     establish_connection call may absorb it up to ~9 times.
+    """
+
+
+class ConnectionValidationError(BleakError):
+    """A connect succeeded but the caller's validator rejected the link.
+
+    Raised after the link has been torn down and its claims released, so
+    the retry loop above (bleak-retry-connector) sees an ordinary connect
+    failure and attempts again - on the next adapter, since the failure is
+    scored against the one that produced the unusable link.
     """
 
 
@@ -252,13 +267,14 @@ _warned_bare_connect_addresses = set()
 
 
 class _CatcherConfig:
-    def __init__(self, owner, pins, pool, link_caps, claims, tune_conn_params):
+    def __init__(self, owner, pins, pool, link_caps, claims, tune_conn_params, validate_connection=None):
         self.owner = owner
         self.pins = pins
         self.pool = pool
         self.link_caps = link_caps
         self.claims = claims
         self.tune_conn_params = tune_conn_params
+        self.validate_connection = validate_connection
         self.sweeper = None
 
 
@@ -523,6 +539,11 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         # it, connect() below is a single unretried attempt. Popped, never
         # passed down: the real __init__ does not know it.
         self._catcher_is_retry_client = kwargs.pop("_is_retry_client", False)
+        # Popped for the same reason: the real __init__ does not know it.
+        # establish_connection passes its surplus kwargs straight to the
+        # client class, which is how a caller reaches this without ever
+        # constructing the client itself.
+        self._catcher_validate = kwargs.pop("validate_connection", None)
         self._catcher_args = (address_or_ble_device, disconnected_callback, services)
         self._catcher_kwargs = kwargs
         # str() in case a caller hands us a subclassed str (habluetooth
@@ -676,7 +697,52 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
         self._catcher_manager = config.claims
         self._arm_claim_validity()
 
-    async def connect(self, **kwargs):
+    async def _run_validation(self, validate, adapter):
+        """Run the caller's validator; tear the link down if it says no.
+
+        v1's contract, kept whole: a validator that returns False - or
+        raises, which counts as False - fails the connect. The link is
+        disconnected first, because a rejected link left up is exactly the
+        phantom the caller was validating against, and BlueZ would hold it
+        until something else cleared it. The claims and the failure scoring
+        are the caller's ordinary connect-failure path, which the raise
+        below hands back to.
+        """
+        try:
+            valid = bool(await validate(self))
+        except asyncio.CancelledError:
+            await self._teardown_rejected()
+            raise
+        except Exception:
+            logger.debug(
+                f"BLE [{self._catcher_address}]: validate_connection raised, treating as failed",
+                exc_info=True,
+            )
+            valid = False
+        if valid:
+            return
+        logger.info(
+            f"BLE [{self._catcher_address}]: connected on {adapter or 'the caller-chosen adapter'} "
+            "but validate_connection rejected the link, tearing it down"
+        )
+        await self._teardown_rejected()
+        raise ConnectionValidationError(f"{self._catcher_address}: connection failed validation")
+
+    async def _teardown_rejected(self):
+        # Best effort by design: the link is known bad either way, and the
+        # claims it held are released by connect()'s own failure path.
+        # Settled first so a straggler notification cannot re-arm claims
+        # for a link being taken down.
+        self._catcher_settled = True
+        try:
+            await asyncio.wait_for(_ORIGINAL_BLEAK_CLIENT.disconnect(self), timeout=DISCONNECT_TIMEOUT)
+        except Exception:
+            logger.debug(
+                f"BLE [{self._catcher_address}]: disconnect after failed validation raised",
+                exc_info=True,
+            )
+
+    async def connect(self, *, validate_connection=None, **kwargs):
         if not self._catcher_is_retry_client:
             self._warn_bare_connect()
         address_or_ble_device, raw_callback, services = self._catcher_args
@@ -729,9 +795,16 @@ class BLEConnection(_ORIGINAL_BLEAK_CLIENT):
             # habluetooth's fast-then-medium: pre-seed the kernel so the
             # fast parameters apply to the connection being established
             mgmt.load_fast(adapter_used, self._catcher_address)
+        validate = validate_connection or self._catcher_validate
+        if validate is None and config is not None:
+            validate = config.validate_connection
         connected = False
         try:
             result = await _ORIGINAL_BLEAK_CLIENT.connect(self, **kwargs)
+            if validate is not None:
+                # inside the try: a link the caller calls unusable is a
+                # failed connect, scored and rotated like any other
+                await self._run_validation(validate, adapter_used)
             connected = True
         except Exception:
             # a failed attempt: penalize this adapter in the score and, for
@@ -1089,7 +1162,7 @@ class BLEScanner(_ORIGINAL_BLEAK_SCANNER):
         return self._backend.discovered_devices
 
 
-def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False):
+def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DIR, wrap_scanner=False, tune_conn_params=True, scan_to_score=False, validate_connection=None):
     """Route every bleak client in this process through the catcher.
 
     Must run before consumer libraries are imported: they capture `from
@@ -1112,7 +1185,14 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
     routes unpinned devices least-used (occupancy and failures only), True
     additionally runs periodic short RSSI sweeps per adapter (RssiSweeper)
     so the score gains its habluetooth RSSI base - a driver that scans can
-    place by signal, one that will not scan still spreads load. Idempotent.
+    place by signal, one that will not scan still spreads load.
+    validate_connection is the process-wide post-connect validator, `async
+    (client) -> bool`: a link it rejects is torn down and raised as a
+    connect failure for the retry loop above (see the validators module).
+    It is the fallback, applying to every routed connect that does not
+    carry its own `validate_connection=` client kwarg - which is how a
+    driver validates connections made deep inside a library it does not
+    call directly. Idempotent.
     """
     global _config
     import bleak
@@ -1139,6 +1219,7 @@ def install_bleak_catcher(owner, adapters=(), link_caps=None, claim_dir=CLAIM_DI
         link_caps=caps,
         claims=ClaimManager(owner=f"{owner}-{os.getpid()}", claim_dir=claim_dir),
         tune_conn_params=tune_conn_params,
+        validate_connection=validate_connection,
     )
     if scan_to_score:
         _config.sweeper = RssiSweeper(_config)

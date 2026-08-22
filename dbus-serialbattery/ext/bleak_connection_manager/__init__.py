@@ -9,6 +9,9 @@ Two layers, deliberately separable:
 - ``bleak_connection_manager.catcher``: the process-wide bleak client
   rebinding layer (requires bleak), exposed lazily here so importing the
   package - or the claims module - never drags bleak in.
+- ``bleak_connection_manager.validators``: post-connect validators for the
+  routed client (stdlib only, duck-typed on the client, so it imports
+  without bleak too).
 """
 
 __version__ = "2.0.0.dev0"
@@ -20,9 +23,18 @@ _CATCHER_EXPORTS = (
     "BLEConnectionWithServiceCache",
     "BLEScanner",
     "OutOfConnectionSlotsError",
+    "ConnectionValidationError",
 )
 
-__all__ = list(_CATCHER_EXPORTS) + ["claims", "reset_adapter"]
+_VALIDATOR_EXPORTS = (
+    "validate_gatt_services",
+    "validate_char_exists",
+    "validate_read_char",
+    "tolerate_late_gatt",
+    "refresh_services",
+)
+
+__all__ = list(_CATCHER_EXPORTS) + list(_VALIDATOR_EXPORTS) + ["claims", "validators", "reset_adapter"]
 
 
 def __getattr__(name):
@@ -30,6 +42,10 @@ def __getattr__(name):
         from bleak_connection_manager import catcher
 
         return getattr(catcher, name)
+    if name in _VALIDATOR_EXPORTS:
+        from bleak_connection_manager import validators
+
+        return getattr(validators, name)
     if name == "reset_adapter":
         # claims-gated adapter recovery; stdlib unless the reset actually
         # runs, so importing it never drags bleak in
