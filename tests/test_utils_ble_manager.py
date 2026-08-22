@@ -56,6 +56,16 @@ class TestInstallBleConnectionManager:
         module = types.ModuleType("bleak_connection_manager")
         module.install_bleak_catcher = install_bleak_catcher
         monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
+
+        validators = types.ModuleType("bleak_connection_manager.validators")
+
+        def validate_gatt_services(client):
+            raise NotImplementedError
+
+        validators.validate_gatt_services = validate_gatt_services
+        validators.tolerate_late_gatt = lambda v: ("late-gatt-wrapped", v)
+        module.validators = validators
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager.validators", validators)
         return calls
 
     def test_disabled_by_default_installs_nothing(self, monkeypatch, catcher_stub):
@@ -80,6 +90,19 @@ class TestInstallBleConnectionManager:
         assert kwargs["adapters"] == ["C8:47:8C:00:00:00@hci1", "hci2"]
         assert kwargs["link_caps"] == {"hci1": 5}
         assert kwargs["wrap_scanner"] is True
+        # validation is its own opt-in; not requested here
+        assert kwargs["validate_connection"] is None
+
+    def test_validation_opt_in_passes_wrapped_gatt_validator(self, monkeypatch, catcher_stub):
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER", True)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_VALIDATION", True)
+
+        assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is True
+
+        _, kwargs = catcher_stub[0]
+        wrapped, inner = kwargs["validate_connection"]
+        assert wrapped == "late-gatt-wrapped"
+        assert inner.__name__ == "validate_gatt_services"
 
     def test_failed_install_is_swallowed(self, monkeypatch):
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER", True)

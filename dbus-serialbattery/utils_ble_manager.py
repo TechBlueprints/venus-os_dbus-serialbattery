@@ -59,11 +59,23 @@ def install_ble_connection_manager(address):
     try:
         from bleak_connection_manager import install_bleak_catcher
 
+        validator = None
+        if utils.BLUETOOTH_CONNECTION_MANAGER_VALIDATION:
+            # weakest built-in validator, wrapped for chips that register
+            # their vendor services after ServicesResolved: an empty GATT
+            # table is a phantom link, and rejecting it here makes
+            # bleak-retry-connector retry on the next radio instead of
+            # handing the driver a client that fails on first read
+            from bleak_connection_manager.validators import tolerate_late_gatt, validate_gatt_services
+
+            validator = tolerate_late_gatt(validate_gatt_services)
+
         install_bleak_catcher(
             f"dbus-serialbattery.{str(address).strip().lower().replace(':', '')}",
             adapters=utils.BLUETOOTH_ADAPTERS,
             link_caps=parse_link_caps(utils.BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS),
             wrap_scanner=utils.BLUETOOTH_CONNECTION_MANAGER_WRAP_SCANNER,
+            validate_connection=validator,
         )
         return True
     except Exception as e:
