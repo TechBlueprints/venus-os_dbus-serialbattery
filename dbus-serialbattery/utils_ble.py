@@ -201,6 +201,97 @@ def resolve_adapter(entry, adapters=None):
     return None
 
 
+def adapter_identities(adapters=None):
+    """
+    {configured hciN entry: its MAC} for every name that resolves right now.
+
+    Only names are reported: an entry already written as a MAC needs no
+    translation, and a card whose MAC cannot be read (an all-zeros address
+    is the kernel's answer for a dead or unserved controller) is left alone
+    rather than pinned to a value that means "unknown".
+    """
+    if adapters is None:
+        adapters = bluez_adapters()
+    configured = []
+    for pinned in BLUETOOTH_ADAPTER_PINS.values():
+        configured.extend(pinned)
+    configured.extend(BLUETOOTH_ADAPTER_POOL)
+    identities = {}
+    for entry in configured:
+        entry = str(entry).strip()
+        if not entry or is_adapter_mac(entry):
+            continue
+        mac = adapters.get(entry)
+        if mac and mac.upper() != UNKNOWN_ADAPTER_MAC:
+            identities[entry] = mac.upper()
+    return identities
+
+
+def pin_adapters_by_mac(path=None, adapters=None):
+    """
+    Rewrite hciN adapter names in the user config to the MACs they proved to
+    be, leaving a comment above each line recording what happened.
+
+    hciN numbering is assigned in probe order, so the name a battery was
+    configured for can come back pointing at a different radio after a
+    reboot or a USB reset - and because any radio in range can reach the
+    battery, it still connects and nothing looks wrong while the
+    per-battery separation the config exists to express is gone. Writing
+    the MAC back makes the intent durable.
+
+    Line oriented rather than parsed and re-emitted, so comments, spacing
+    and every unrelated setting survive untouched. Already-commented lines
+    are left alone. Best effort throughout: a config that cannot be read or
+    written is not worth failing a connection over, and selection resolves
+    the same either way.
+    """
+    identities = adapter_identities(adapters)
+    if not identities:
+        return False
+    if path is None:
+        from utils import custom_config_file_path
+
+        path = custom_config_file_path
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError as e:
+        logger.debug(f"adapter config rewrite: cannot read {path}: {repr(e)}")
+        return False
+    out = []
+    changed = False
+    for line in lines:
+        stripped = line.strip()
+        replaced = line
+        hits = []
+        if stripped and not stripped.startswith((";", "#")):
+            for entry, mac in identities.items():
+                # word boundary, so hci1 is never matched inside hci10
+                pattern = rf"(?<![0-9A-Za-z]){re.escape(entry)}(?![0-9A-Za-z])"
+                if re.search(pattern, replaced):
+                    replaced = re.sub(pattern, mac, replaced)
+                    hits.append((entry, mac))
+        if hits:
+            indent = line[: len(line) - len(line.lstrip())]
+            for entry, mac in hits:
+                out.append(f"{indent}; {entry} was detected as {mac} and written back - adapter numbers move, MACs do not\n")
+            changed = True
+        out.append(replaced)
+    if not changed:
+        return False
+    try:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            f.writelines(out)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning(f"Could not write adapter MACs back to {path}: {repr(e)}")
+        return False
+    for entry, mac in identities.items():
+        logger.info(f"Adapter {entry} was detected as {mac} and written back to the config")
+    return True
+
+
 def adapters_in_attempt_order(address, present=None):
     """
     Adapters to try for this battery, best first, as hciN names.
