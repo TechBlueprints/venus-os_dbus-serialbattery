@@ -426,3 +426,101 @@ def test_is_adapter_mac_distinguishes_the_two_forms():
     assert not utils_ble.is_adapter_mac("hci0")
     assert not utils_ble.is_adapter_mac("00:1A:7D:DA:71")
     assert not utils_ble.is_adapter_mac("")
+
+
+# --------- writing adapter MACs back to the config ---------
+
+
+def _write_config(tmp_path, body):
+    p = tmp_path / "config.ini"
+    p.write_text(body)
+    return str(p)
+
+
+def test_hci_names_are_rewritten_to_macs_with_a_comment(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci3"]}, [])
+    cfg = _write_config(tmp_path, "[DEFAULT]\nBLUETOOTH_ADAPTERS = C8:47:8C:00:00:00@hci3\n")
+    try:
+        assert utils_ble.pin_adapters_by_mac(cfg, adapters=ADAPTERS) is True
+        text = open(cfg).read()
+        assert "C8:47:8C:00:00:00@00:1A:7D:DA:71:13" in text
+        assert "hci3 was detected as 00:1A:7D:DA:71:13" in text
+        # the comment must be a comment, above the line it explains
+        lines = text.splitlines()
+        note = next(i for i, ln in enumerate(lines) if "was detected as" in ln)
+        assert lines[note].lstrip().startswith(";")
+        assert lines[note + 1].startswith("BLUETOOTH_ADAPTERS")
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_rewriting_leaves_every_other_line_alone(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["hci3"])
+    body = "[DEFAULT]\n; a comment about hci3 that must not change\nMAX_BATTERY_CHARGE_CURRENT = 50.0\nBLUETOOTH_ADAPTERS = hci3\n"
+    cfg = _write_config(tmp_path, body)
+    try:
+        utils_ble.pin_adapters_by_mac(cfg, adapters=ADAPTERS)
+        text = open(cfg).read()
+        assert "; a comment about hci3 that must not change" in text
+        assert "MAX_BATTERY_CHARGE_CURRENT = 50.0" in text
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_hci1_is_not_matched_inside_hci10(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["hci1"])
+    cfg = _write_config(tmp_path, "[DEFAULT]\nBLUETOOTH_ADAPTERS = hci10, hci1\n")
+    try:
+        utils_ble.pin_adapters_by_mac(cfg, adapters={"hci1": "00:1A:7D:DA:71:13", "hci10": "00:1A:7D:DA:71:99"})
+        text = open(cfg).read()
+        assert "hci10, 00:1A:7D:DA:71:13" in text
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_dead_controller_is_never_written_back(tmp_path):
+    """All-zeros is the kernel's answer for a card it cannot talk to. Pinning
+    a battery to that would be worse than leaving the name in place."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["hci9"])
+    cfg = _write_config(tmp_path, "[DEFAULT]\nBLUETOOTH_ADAPTERS = hci9\n")
+    try:
+        assert utils_ble.pin_adapters_by_mac(cfg, adapters={"hci9": "00:00:00:00:00:00"}) is False
+        assert "hci9" in open(cfg).read()
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_entries_already_written_as_macs_are_left_alone(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["00:1A:7D:DA:71:13"])
+    cfg = _write_config(tmp_path, "[DEFAULT]\nBLUETOOTH_ADAPTERS = 00:1A:7D:DA:71:13\n")
+    try:
+        assert utils_ble.pin_adapters_by_mac(cfg, adapters=ADAPTERS) is False
+        assert "was detected as" not in open(cfg).read()
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_commented_out_line_is_not_rewritten(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["hci3"])
+    cfg = _write_config(tmp_path, "[DEFAULT]\n; BLUETOOTH_ADAPTERS = hci3\nBLUETOOTH_ADAPTERS = hci3\n")
+    try:
+        utils_ble.pin_adapters_by_mac(cfg, adapters=ADAPTERS)
+        lines = open(cfg).read().splitlines()
+        assert "; BLUETOOTH_ADAPTERS = hci3" in lines
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_an_unwritable_config_is_not_worth_failing_over(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["hci3"])
+    try:
+        assert utils_ble.pin_adapters_by_mac(str(tmp_path / "nope.ini"), adapters=ADAPTERS) is False
+    finally:
+        _configure(original_pins, original_pool)
