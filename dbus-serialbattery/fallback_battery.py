@@ -1142,10 +1142,23 @@ class FallbackBattery:
                 "The driver keeps trying to reach the BMS in the background. <<<"
             )
             # Resolve the sensor and serve one cycle BEFORE the service is
-            # registered, so the values are real the instant the paths exist.
-            # Consumers that recompute on change sample the leading edge by
-            # construction, and would otherwise read None off a brand-new
-            # service for a full poll interval.
+            # registered, so this battery object holds real values by the time
+            # DbusHelper reads it.
+            #
+            # That buys two distinct things, and it is worth being exact about
+            # which, because the paths do not all behave alike. Registration
+            # seeds a handful of them straight out of battery state -
+            # /Mgmt/Connection, /ProductName, /Manufacturer, /DeviceName,
+            # /HardwareVersion, /Family, /State, /ErrorCode,
+            # /System/NrOfCellsPerBattery, /History/Clear - and those come up
+            # correct rather than as placeholders only because this ran first.
+            # The measurement paths do not: setup_vedbus registers them holding
+            # None and the value arrives solely through publish_dbus, so no
+            # amount of populating this object can make them real at
+            # registration. What it does mean is that the first publish_dbus,
+            # whenever it lands, sends real data instead of another round of
+            # None - which matters most here, on the path where the BMS never
+            # answered and there is no successful poll coming to fill them in.
             self.refresh_data()
             return True
         return False
