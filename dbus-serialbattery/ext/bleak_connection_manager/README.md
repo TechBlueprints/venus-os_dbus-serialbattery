@@ -1,63 +1,62 @@
 # bleak_connection_manager (vendored)
 
-Managed BLE connection lifecycle for Linux/BlueZ. Used by the optional
-`BCMBackend` connection backend in `dbus-serialbattery/utils_ble.py`, selected
-with `BLUETOOTH_CONNECTION_BACKEND = BCMBackend`. Not imported at all when the
-default `BleakBackend` is used.
+The "bleak catcher": a per-process BLE connection layer injected underneath
+every `from bleak import BleakClient` via module rebinding — the same
+mechanism habluetooth uses to sit underneath every Home Assistant BLE
+integration. Installed (opt-in) by `utils_ble_manager.py` when
+`BLUETOOTH_CONNECTION_MANAGER = True`; not imported at all otherwise.
 
 ## Provenance
 
 | | |
 |---|---|
 | Upstream project | <https://github.com/TechBlueprints/bleak-connection-manager> |
-| Upstream version | 0.1.0 |
-| Vendored commit | `8723b82fab95e06bcece21990782ec8cd5fc7fea` (2026-08-13) |
+| Upstream version | 2.0.0.dev0 |
+| Vendored commit | `482ff7f` (2026-08-22, `main`) |
 | Upstream path | `src/bleak_connection_manager/` |
 | Licence | Apache License 2.0 — see `LICENSE` |
 
-The library wraps
-[bleak-retry-connector](https://github.com/Bluetooth-Devices/bleak-retry-connector)
-(MIT, Bluetooth Devices Authors), which is itself vendored in this repository at
-`dbus-serialbattery/ext/bleak_retry_connector/`. It adds BlueZ workarounds
-around `bleak_retry_connector.establish_connection(max_attempts=1)`: cache-first
-device resolution, phantom/inactive connection cleanup, adapter rotation,
-stuck-state diagnosis and a failure escalation chain.
+This is the v2 rewrite of the library. The v1 codebase (the BlueZ
+connection-lifecycle manager wrapped around `establish_connection`, briefly
+proposed for this driver as `BCMBackend` in upstream PR #512 and withdrawn)
+lives on the upstream `v1-main` branch; the two share no code.
 
-Both licences are permissive and compatible with this repository's licence.
-The Apache-2.0 text above covers the vendored files; the MIT notice for the
-bleak-retry-connector lineage is carried with that package's own vendored copy.
+Not vendored from upstream: its test suite, its own `ext/` (`bt_claims.py`,
+the bt-claims reference library that `claims.py` reimplements, and a copy of
+dbus-fast for consumers whose system copy is too old for current bleak -
+this repository vendors its own BLE dependency chain under `ext/` already).
 
-## Changes made when vendoring
+## Contents
 
-This is a **subset** of the upstream package, not a verbatim copy. Nothing was
-added; the following was removed because it has no consumer in this driver and
-no configuration path that could give it one:
+The complete `src/bleak_connection_manager/` package, unmodified:
 
-* **`validators.py`** (222 lines) — post-connect GATT validators. Never passed
-  to `establish_connection(validate_connection=...)` from this driver.
-* **`watchdog.py`** (305 lines) — `ConnectionWatchdog` notification-silence
-  monitor. `Syncron_Ble` already supervises liveness through its own reconnect
-  loop, so the watchdog was never instantiated.
-* **The scan-lock subsystem** — `scan_lock.py` (154 lines), `ScanLockConfig` in
-  `const.py`, and its call sites in `scanner.py`. Every lock path was gated on
-  `scan_lock_config is not None and scan_lock_config.enabled`, and the
-  `scan_lock_config` argument was never passed by any caller, so the code was
-  unreachable. The `scan_lock_config` parameter was removed from
-  `find_device()` and `discover()`; `_poll_cache_while_locked()` was renamed to
-  `_poll_bluez_cache()`, since its remaining caller is the external-scan
-  fallback rather than a lock-busy wait.
-* **The `RESET_ADAPTER` escalation rung** — the enum member, the
-  `reset_adapter` / `reset_after` / `reset_cooldown` config fields, the
-  `reset_adapter()` and `invalidate_dbus_state()` functions, and the branch in
-  `connection.py`. The rung delegates to `bluetooth-auto-recovery`, which is not
-  vendored here, so it could only ever return failure. With it gone the ladder
-  tops out at `ROTATE_ADAPTER`, which the driver can actually perform.
-  `PROFILE_SENSOR` was dropped along with it — without the reset rung it was an
-  exact duplicate of the default `EscalationConfig()`.
+* **`claims.py`** — the bt-claims file convention under `/run/bt-claims`
+  (stdlib only, no bleak): heartbeated claim files coordinating adapter use
+  across processes. Kinds: `hciN.scan` (hard, exclusive),
+  `hciN.use.<owner>[.<qualifier>]` (soft, ranks placement),
+  `hciN.link.<k>` (numbered exclusive link slots).
+* **`catcher.py`** — the process-wide rebinding layer: `BLEConnection`
+  (drop-in `BleakClient` that picks its adapter and takes claims at
+  `connect()`), `BLEScanner` (adapter-bound, hard-claiming, with
+  habluetooth's silence watchdog; opt-in), habluetooth-parity connect
+  scoring for unpinned devices, per-adapter link slots and
+  `OutOfConnectionSlotsError`.
+* **`validators.py`** — v1's post-connect validators, stdlib-only and
+  duck-typed (imports without bleak): `validate_gatt_services`,
+  `validate_char_exists(uuid)`, `validate_read_char(uuid)`, and
+  `tolerate_late_gatt(...)` for chips that register vendor services after
+  ServicesResolved. Used with the catcher's optional `validate_connection`
+  hook; with no validator configured, connects behave exactly as before.
+* **`mgmt.py`** — habluetooth's fast-then-medium connection parameters
+  loaded over the BlueZ management socket; degrades to a no-op without
+  `AF_BLUETOOTH`/NET_ADMIN.
+* **`recovery.py`** — claims-gated adapter hardware reset. Depends on the
+  optional `bluetooth-auto-recovery` package, which is **not** vendored
+  here, so a reset degrades to a logged no-op; the gating and the scanner
+  watchdog's restart tier still work.
 
-The tree is otherwise untouched: files carry the upstream formatting, and
-`dbus-serialbattery/ext/` is excluded from this repository's flake8 and black
-configuration, so no reformatting was applied.
-
-To re-vendor a newer upstream release, copy `src/bleak_connection_manager/*.py`
-over this directory and re-apply the removals above.
+The library wraps whoever drives the client — it routes, it never retries.
+Retry semantics stay with
+[bleak-retry-connector](https://github.com/Bluetooth-Devices/bleak-retry-connector),
+vendored separately at `ext/bleak_retry_connector/` and already used by the
+aiobmsble drivers and the `BleakRetryBackend` connection backend.

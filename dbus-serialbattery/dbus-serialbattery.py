@@ -435,6 +435,14 @@ def main():
         else:
             ble_address = sys.argv[2]
 
+            # Must run before the BMS modules below are imported: they (and
+            # utils_ble) capture `from bleak import BleakClient` at import
+            # time, and only pick up the connection manager's routed client
+            # if it is already installed.
+            from utils_ble_manager import install_ble_connection_manager
+
+            install_ble_connection_manager(ble_address)
+
             if port == "HumsiENK_Ble":
                 # noqa: F401 --> ignore flake "imported but unused" error
                 from bms.humsienk_ble import HumsiENK_Ble  # noqa: F401
@@ -486,9 +494,14 @@ def main():
             logger.error(">>> Bluetooth address is missing in the command line arguments")
             exit_driver(None, None, 1)
         else:
-            from bms.generic_aiobmsble import Generic_AioBmsBle  # noqa: F401
-
             ble_address = sys.argv[2]
+
+            # Before the aiobmsble import chain, for the same reason as above.
+            from utils_ble_manager import install_ble_connection_manager
+
+            install_ble_connection_manager(ble_address)
+
+            from bms.generic_aiobmsble import Generic_AioBmsBle  # noqa: F401
 
             # do not remove ble_ prefix, since the dbus service cannot be only numbers
             testbms = with_fallback(Generic_AioBmsBle(port.replace("aiobmsble_", ""), None, ble_address))
