@@ -12,9 +12,15 @@ from utils import (
     logger,
     BLUETOOTH_ADAPTERS,
     BLUETOOTH_CONNECTION_BACKEND,
+    BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS,
     BLUETOOTH_FORCE_RESET_BLE_STACK,
     capture_raw_data,
 )
+
+# What the kernel reports for a controller it cannot talk to - a dead onboard
+# UART radio answers with this forever, and it must never be written back to
+# the config as if it were an identity.
+UNKNOWN_ADAPTER_MAC = "00:00:00:00:00:00"
 
 
 def parse_adapter_entries(entries):
@@ -144,6 +150,98 @@ def resolve_adapter(entry, adapters=None):
     return None
 
 
+def adapter_identities(adapters=None):
+    """
+    {configured hciN entry: its MAC} for every name that resolves right now.
+
+    Only names are reported: an entry already written as a MAC needs no
+    translation, and a card whose MAC cannot be read (an all-zeros address
+    is the kernel's answer for a dead or unserved controller) is left alone
+    rather than pinned to a value that means "unknown".
+    """
+    if adapters is None:
+        adapters = bluez_adapters()
+    configured = []
+    for pinned in BLUETOOTH_ADAPTER_PINS.values():
+        configured.extend(pinned)
+    configured.extend(BLUETOOTH_ADAPTER_POOL)
+    configured.extend(entry.rpartition(":")[0] for entry in BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS)
+    identities = {}
+    for entry in configured:
+        entry = str(entry).strip()
+        if not entry or is_adapter_mac(entry):
+            continue
+        mac = adapters.get(entry)
+        if mac and mac.upper() != UNKNOWN_ADAPTER_MAC:
+            identities[entry] = mac.upper()
+    return identities
+
+
+def pin_adapters_by_mac(path=None, adapters=None):
+    """
+    Rewrite hciN adapter names in the user config to the MACs they proved to
+    be, leaving a comment above each line recording what happened.
+
+    hciN numbering is assigned in probe order, so the name a battery was
+    configured for can come back pointing at a different radio after a
+    reboot or a USB reset - and because any radio in range can reach the
+    battery, it still connects and nothing looks wrong while the
+    per-battery separation the config exists to express is gone. Writing
+    the MAC back makes the intent durable.
+
+    Line oriented rather than parsed and re-emitted, so comments, spacing
+    and every unrelated setting survive untouched. Already-commented lines
+    are left alone. Best effort throughout: a config that cannot be read or
+    written is not worth failing a connection over, and selection resolves
+    the same either way.
+    """
+    identities = adapter_identities(adapters)
+    if not identities:
+        return False
+    if path is None:
+        from utils import custom_config_file_path
+
+        path = custom_config_file_path
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError as e:
+        logger.debug(f"adapter config rewrite: cannot read {path}: {repr(e)}")
+        return False
+    out = []
+    changed = False
+    for line in lines:
+        stripped = line.strip()
+        replaced = line
+        hits = []
+        if stripped and not stripped.startswith((";", "#")):
+            for entry, mac in identities.items():
+                # word boundary, so hci1 is never matched inside hci10
+                pattern = rf"(?<![0-9A-Za-z]){re.escape(entry)}(?![0-9A-Za-z])"
+                if re.search(pattern, replaced):
+                    replaced = re.sub(pattern, mac, replaced)
+                    hits.append((entry, mac))
+        if hits:
+            indent = line[: len(line) - len(line.lstrip())]
+            for entry, mac in hits:
+                out.append(f"{indent}; {entry} was detected as {mac} and written back - adapter numbers move, MACs do not\n")
+            changed = True
+        out.append(replaced)
+    if not changed:
+        return False
+    try:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            f.writelines(out)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning(f"Could not write adapter MACs back to {path}: {repr(e)}")
+        return False
+    for entry, mac in identities.items():
+        logger.info(f"Adapter {entry} was detected as {mac} and written back to the config")
+    return True
+
+
 def adapters_in_attempt_order(address, present=None):
     """
     Adapters to try for this battery, best first, as hciN names.
@@ -204,6 +302,14 @@ def ble_hold_flag_path(address):
 
 # Outer deadlines for the connection backend. Generous on purpose: they are a
 # last resort against a permanently parked await, not a connection timeout.
+# How often the supervision wait re-checks the things that have no callback
+# (the main thread going away, and a disconnect whose callback never fired).
+# The link itself is awaited on an event, so this is a safety net rather than
+# a poll: it used to be 0.1s, which cost ten timer wakeups a second per
+# battery for the whole life of every connection and showed up as run-queue
+# churn on a loaded GX device.
+BLE_SUPERVISION_RECHECK = 5.0
+
 BLE_ESTABLISH_TIMEOUT = 300.0
 BLE_RELEASE_TIMEOUT = 30.0
 
@@ -438,6 +544,9 @@ class Syncron_Ble:
         # Only the BLE thread of the current generation keeps running; see
         # rebuild_ble_thread()
         self._ble_thread_generation = 0
+        # set when the link drops, so supervision waits instead of polling
+        self._disconnected = None
+        self._disconnected_loop = None
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
@@ -532,8 +641,50 @@ class Syncron_Ble:
 
     def client_disconnected(self, client):
         logger.error(f"bluetooh device with address: {self.address} disconnected")
+        self.signal_disconnected()
+
+    def signal_disconnected(self):
+        """Wake the supervision wait from wherever the callback reaches us.
+
+        call_soon_threadsafe rather than a bare set(): bleak invokes the
+        callback on the loop that owns the client, but the backends wrap it
+        and a wrapped callback is not guaranteed to keep that property.
+        Scheduling onto the captured loop is correct from either side.
+        """
+        event, loop = self._disconnected, self._disconnected_loop
+        if event is None or loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            # loop already closed - the connection is over either way
+            pass
+
+    async def supervise_connection(self):
+        """Wait for the link to end, without polling for it.
+
+        Two things end it and only one has a callback. The disconnect does,
+        so it is awaited on an event. The main thread going away does not,
+        and neither does a disconnect whose callback never fires - a real
+        failure mode here, which is why is_connected is still consulted - so
+        both are re-checked on a coarse timeout rather than at 10 Hz.
+        """
+        while True:
+            try:
+                await asyncio.wait_for(self._disconnected.wait(), timeout=BLE_SUPERVISION_RECHECK)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if not self.main_thread.is_alive():
+                return
+            if not self.client.is_connected:
+                return
 
     async def connect_to_bms(self, address):
+        # one event per connection: a stale set() from the previous link must
+        # not end this one's supervision immediately
+        self._disconnected = asyncio.Event()
+        self._disconnected_loop = asyncio.get_running_loop()
         self.client = self.backend.create_client(address, self.client_disconnected)
         try:
             # Belt-and-braces deadline: a backend's own timeouts should always
@@ -551,8 +702,7 @@ class Syncron_Ble:
         finally:
             self.ble_connection_ready.set()
             if self.client:
-                while self.client.is_connected and self.main_thread.is_alive():
-                    await asyncio.sleep(0.1)
+                await self.supervise_connection()
                 try:
                     await asyncio.wait_for(self.backend.release(self.client), timeout=BLE_RELEASE_TIMEOUT)
                 except Exception as e:
