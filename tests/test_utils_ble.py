@@ -524,3 +524,87 @@ def test_an_unwritable_config_is_not_worth_failing_over(tmp_path):
         assert utils_ble.pin_adapters_by_mac(str(tmp_path / "nope.ini"), adapters=ADAPTERS) is False
     finally:
         _configure(original_pins, original_pool)
+# --------- supervision waits instead of polling ---------
+#
+# The link used to be watched with `while is_connected: await sleep(0.1)`,
+# which cost ten timer wakeups a second per battery for the whole life of
+# every connection. On a GX device already short of headroom that is pure
+# run-queue churn: no work is done per iteration.
+
+
+class _FakeClient:
+    def __init__(self, connected=True):
+        self.is_connected = connected
+
+
+def _supervisor(connected=True, main_alive=True):
+    """A Syncron_Ble-shaped object with only what supervise_connection uses."""
+    import types
+
+    s = types.SimpleNamespace()
+    s.client = _FakeClient(connected)
+    s.main_thread = types.SimpleNamespace(is_alive=lambda: main_alive)
+    s._disconnected = None
+    s._disconnected_loop = None
+    s.supervise_connection = utils_ble.Syncron_Ble.supervise_connection.__get__(s)
+    s.signal_disconnected = utils_ble.Syncron_Ble.signal_disconnected.__get__(s)
+    return s
+
+
+def test_supervision_returns_as_soon_as_the_link_drops():
+    """The whole point: the event wakes it, not the timeout."""
+    import asyncio as aio
+
+    async def run():
+        s = _supervisor()
+        s._disconnected = aio.Event()
+        s._disconnected_loop = aio.get_running_loop()
+        loop = aio.get_running_loop()
+        started = loop.time()
+        loop.call_later(0.05, s.signal_disconnected)
+        await aio.wait_for(s.supervise_connection(), timeout=2.0)
+        # returned on the event, far inside the recheck interval
+        assert loop.time() - started < utils_ble.BLE_SUPERVISION_RECHECK
+
+    aio.run(run())
+
+
+def test_supervision_still_notices_a_disconnect_whose_callback_never_fired():
+    """Missed callbacks are a real failure mode, so is_connected stays a
+    backstop - it is just consulted on the recheck, not at 10 Hz."""
+    import asyncio as aio
+
+    async def run():
+        s = _supervisor(connected=False)
+        s._disconnected = aio.Event()
+        s._disconnected_loop = aio.get_running_loop()
+        await aio.wait_for(s.supervise_connection(), timeout=2.0)
+
+    original = utils_ble.BLE_SUPERVISION_RECHECK
+    utils_ble.BLE_SUPERVISION_RECHECK = 0.02
+    try:
+        aio.run(run())
+    finally:
+        utils_ble.BLE_SUPERVISION_RECHECK = original
+
+
+def test_supervision_returns_when_the_main_thread_is_gone():
+    import asyncio as aio
+
+    async def run():
+        s = _supervisor(main_alive=False)
+        s._disconnected = aio.Event()
+        s._disconnected_loop = aio.get_running_loop()
+        await aio.wait_for(s.supervise_connection(), timeout=2.0)
+
+    original = utils_ble.BLE_SUPERVISION_RECHECK
+    utils_ble.BLE_SUPERVISION_RECHECK = 0.02
+    try:
+        aio.run(run())
+    finally:
+        utils_ble.BLE_SUPERVISION_RECHECK = original
+
+
+def test_signalling_without_a_connection_is_harmless():
+    s = _supervisor()
+    s.signal_disconnected()  # no event yet - must not raise
