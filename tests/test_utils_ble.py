@@ -20,7 +20,11 @@ sys.path.insert(0, DRIVER_DIR)
 if "bleak" not in sys.modules:
     sys.modules["bleak"] = types.SimpleNamespace(BleakClient=type("BleakClient", (), {"__init__": lambda self, *a, **kw: None}))
     sys.modules["bleak"].BleakScanner = object
-    sys.modules["bleak"].exc = types.SimpleNamespace(BleakError=type("BleakError", (Exception,), {}))
+    _bleak_error = type("BleakError", (Exception,), {})
+    sys.modules["bleak"].exc = types.SimpleNamespace(
+        BleakError=_bleak_error,
+        BleakCharacteristicNotFoundError=type("BleakCharacteristicNotFoundError", (_bleak_error,), {}),
+    )
     sys.modules["bleak.exc"] = sys.modules["bleak"].exc
 if "bleak_retry_connector" not in sys.modules:
     # utils_ble only needs these four names; stubbing keeps BleakRetryBackend
@@ -333,6 +337,124 @@ def test_the_retry_connector_establish_is_aliased_against_shadowing():
     backend calling the right one, and no other test reaches the connect path.
     """
     assert utils_ble.retry_establish_connection is sys.modules["bleak_retry_connector"].establish_connection
+
+
+# --------- subscribing before BlueZ has the whole GATT tree ---------
+#
+# BlueZ can report a device's services as resolved while its own view of the
+# tree is still incomplete, so start_notify raises for a characteristic the
+# battery genuinely has and the driver reconnects forever against working
+# hardware. Observed on a Cerbo GX with the same vendored bleak this branch
+# ships, so reading the connect path as safe is not enough.
+
+
+class _GattClient:
+    """A client whose characteristic only appears after N tree rebuilds."""
+
+    def __init__(self, appears_after=0, backend=None):
+        self.appears_after = appears_after
+        self.rebuilds = 0
+        self.subscribed = None
+        self.dropped_before_rebuild = None
+        if backend is not None:
+            self._backend = backend
+        else:
+            self._backend = types.SimpleNamespace(services=object(), _get_services=self._rebuild)
+
+    async def _rebuild(self):
+        self.dropped_before_rebuild = self._backend.services is None
+        self.rebuilds += 1
+        self._backend.services = object()
+
+    async def start_notify(self, char, callback):
+        if self.rebuilds < self.appears_after:
+            raise _CharacteristicNotFound(char)
+        self.subscribed = (char, callback)
+
+
+_CharacteristicNotFound = sys.modules["bleak.exc"].BleakCharacteristicNotFoundError
+
+
+def test_a_resolved_characteristic_is_subscribed_without_rebuilding_anything():
+    """The common case must not pay for the recovery: no rebuild, no sleep."""
+    import asyncio
+
+    client = _GattClient(appears_after=0)
+    asyncio.run(utils_ble.start_notify_when_resolved(client, "char", "callback"))
+    assert client.subscribed == ("char", "callback")
+    assert client.rebuilds == 0
+
+
+def test_a_missing_characteristic_rebuilds_the_tree_and_subscribes():
+    import asyncio
+
+    original = utils_ble.GATT_REDISCOVERY_SETTLE
+    utils_ble.GATT_REDISCOVERY_SETTLE = 0
+    try:
+        client = _GattClient(appears_after=1)
+        asyncio.run(utils_ble.start_notify_when_resolved(client, "char", "callback"))
+    finally:
+        utils_ble.GATT_REDISCOVERY_SETTLE = original
+    assert client.subscribed == ("char", "callback")
+    assert client.rebuilds == 1
+
+
+def test_the_rebuild_drops_the_stale_tree_first():
+    """
+    _get_services returns the collection it already holds, so a rebuild that
+    does not drop it first is a no-op that looks like a retry.
+    """
+    import asyncio
+
+    client = _GattClient()
+    asyncio.run(utils_ble.rediscover_services(client, "char"))
+    assert client.dropped_before_rebuild is True
+
+
+def test_a_characteristic_that_never_appears_gives_up_instead_of_looping():
+    import asyncio
+
+    original = utils_ble.GATT_REDISCOVERY_SETTLE
+    utils_ble.GATT_REDISCOVERY_SETTLE = 0
+    try:
+        client = _GattClient(appears_after=99)
+        try:
+            asyncio.run(utils_ble.start_notify_when_resolved(client, "char", "callback"))
+            raise AssertionError("a characteristic that is really absent must surface")
+        except _CharacteristicNotFound:
+            pass
+    finally:
+        utils_ble.GATT_REDISCOVERY_SETTLE = original
+    assert client.rebuilds == utils_ble.GATT_REDISCOVERY_ATTEMPTS - 1
+
+
+def test_a_bleak_that_moves_the_rebuild_call_fails_loudly():
+    """
+    The rebuild reaches into bleak's backend because bleak exposes no public
+    way to discard a resolved tree. A bleak that renames it must raise here,
+    not quietly stop rediscovering and restore the endless reconnect.
+    """
+    import asyncio
+
+    client = _GattClient(appears_after=99, backend=types.SimpleNamespace())
+    try:
+        asyncio.run(utils_ble.rediscover_services(client, "char"))
+        raise AssertionError("a missing backend call must be reported, not ignored")
+    except utils_ble.BleakError as e:
+        assert "_get_services" in str(e)
+
+
+def test_neither_backend_subscribes_without_the_rebuild_guard():
+    """
+    Both backends reach start_notify by the same route, so a fix applied to
+    one of them ships a half fix that looks repaired and fails on the other.
+    """
+    import inspect
+
+    for backend in (utils_ble.BleakBackend, utils_ble.BleakRetryBackend):
+        source = inspect.getsource(backend._establish)
+        assert "start_notify_when_resolved(" in source
+        assert "client.start_notify(" not in source
 
 
 # --------- adapter pinning by MAC ---------

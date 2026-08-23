@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 from bleak import BleakClient, BleakScanner
-from bleak.exc import BleakError
+from bleak.exc import BleakCharacteristicNotFoundError, BleakError
 from time import sleep
 from utils import (
     logger,
@@ -384,6 +384,66 @@ except ImportError:
     HAS_BLEAK_RETRY_CONNECTOR = False
 
 
+# BlueZ can report a device's services as resolved while its own view of the
+# GATT tree is still incomplete, and start_notify then raises for a
+# characteristic the battery genuinely has - after which the driver drops the
+# link and reconnects forever against hardware that is working. Observed on a
+# Cerbo GX. Rebuilding the tree from live BlueZ state and trying again clears
+# it, so a connection is only given up on once that has failed too.
+# Neither number is measured. The last attempt raises without sleeping, so
+# three attempts spend two settles: the budget is 1.0s and two rebuilds, not
+# 1.5s. The warning below names the attempt it is on, so the field settles
+# this without new instrumentation - only ever attempt 1 and the first settle
+# is always enough, attempt 2 and it is marginal, exhaustion and 1.0s is too
+# short. Raise it on that evidence rather than on argument.
+GATT_REDISCOVERY_ATTEMPTS = 3
+GATT_REDISCOVERY_SETTLE = 0.5
+
+
+async def rediscover_services(client, notify_char):
+    """
+    Rebuild a connected client's GATT tree from what BlueZ holds now.
+
+    bleak has no public call for this: services is read-only, clear_cache is
+    not implemented for the BlueZ backend, and the one public route - a
+    disconnect - is unusable here because it fires the driver's own
+    disconnected callback and tears down the session still being set up. So
+    this goes through the backend, and checks for the attributes first: a
+    bleak that moves them must fail loudly here rather than quietly stop
+    rediscovering and leave the endless reconnect this exists to prevent.
+    """
+    backend = getattr(client, "_backend", None)
+    get_services = getattr(backend, "_get_services", None)
+    if get_services is None or not hasattr(backend, "services"):
+        raise BleakError(
+            f"characteristic {notify_char} is missing from the resolved GATT tree, and this bleak "
+            "offers no way to rebuild it (expected _backend._get_services); connection unusable"
+        )
+    # _get_services returns the tree it already has, so it has to be dropped
+    # first for the rebuild to read BlueZ again. The rebuild goes to live
+    # BlueZ state rather than any cached collection, so a client that was
+    # connected against a cached tree recovers here the same way - which is
+    # why the connector's services cache can be left on.
+    backend.services = None
+    await get_services()
+
+
+async def start_notify_when_resolved(client, notify_char, notify_callback):
+    """Subscribe to notifications, rebuilding the GATT tree if the characteristic is missing."""
+    for attempt in range(GATT_REDISCOVERY_ATTEMPTS):
+        try:
+            await client.start_notify(notify_char, notify_callback)
+            return
+        except BleakCharacteristicNotFoundError:
+            if attempt == GATT_REDISCOVERY_ATTEMPTS - 1:
+                raise
+            logger.warning(f"characteristic {notify_char} not in the resolved GATT tree, rebuilding it (attempt {attempt + 1})")
+            await rediscover_services(client, notify_char)
+            # BlueZ fills the tree in asynchronously, so give it a moment
+            # before asking again
+            await asyncio.sleep(GATT_REDISCOVERY_SETTLE)
+
+
 class BleConnectionBackend:
     """
     Interface for establishing and releasing BLE connections.
@@ -467,7 +527,7 @@ class BleakBackend(BleConnectionBackend):
         logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
         await client.connect()
         logger.info("connected to bluetooh device" + address)
-        await client.start_notify(notify_char, notify_callback)
+        await start_notify_when_resolved(client, notify_char, notify_callback)
         return client
 
     async def release(self, client):
@@ -523,7 +583,7 @@ class BleakRetryBackend(BleConnectionBackend):
         kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
         client = await retry_establish_connection(BleakClient, device, address, disconnected_callback=self.disconnected_callback, **kwargs)
         logger.info("connected to bluetooth device " + address)
-        await client.start_notify(notify_char, notify_callback)
+        await start_notify_when_resolved(client, notify_char, notify_callback)
         return client
 
     async def _resolve_device(self, address):
