@@ -76,6 +76,10 @@ class Generic_AioBmsBle(Battery):
         self._cancel_timeout: int = 1
         # track the currently scheduled Future on the background loop
         self._current_future = None
+        # background-update bookkeeping: whether we hold _coro_lock on behalf
+        # of an in-flight refresh, and when it was scheduled
+        self._update_lock_held = False
+        self._update_started_at: float | None = None
         # staleness tracking
         self._last_successful_update: float | None = None
         self._max_data_age: int = 5  # seconds before stale cached data causes failure
@@ -186,6 +190,68 @@ class Generic_AioBmsBle(Battery):
             logger.warning("aiobmsble: background event loop did not signal readiness in time")
         else:
             logger.debug("aiobmsble: background event loop ready")
+
+    def _poll_update(self, coro):
+        """Harvest a finished background update and start the next one.
+
+        NEVER waits on the BMS. refresh_data runs on the GLib main thread,
+        which is also the thread that answers D-Bus, so blocking here for a
+        coroutine timeout stops the driver serving anything at all - the
+        battery's own service stops answering /Soc, /Connected and
+        /Mgmt/Connection while remaining registered, and the fallback it is
+        supposed to hand over to never gets a turn. Field failure on
+        dev-cerbo 2026-08-23, where an unreachable pack blocked the main
+        thread for 10 s out of every 10 s.
+
+        Returns True only when an update completed successfully since the
+        last poll; the caller's staleness logic decides what to serve.
+        """
+        self._ensure_event_loop()
+        completed_ok = False
+
+        future = self._current_future
+        if future is not None and future.done():
+            self._current_future = None
+            self._update_started_at = None
+            try:
+                completed_ok = bool(future.result(0))
+            except concurrent.futures.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug("aiobmsble: background update failed (addr=%s): %r", self.address, e)
+            self._release_update_lock()
+        elif future is not None and self._update_started_at is not None:
+            # a coroutine that never returns must not wedge every later poll
+            if time.monotonic() - self._update_started_at > self._run_timeout:
+                logger.error("aiobmsble coroutine timed out for %s (addr=%s)", getattr(coro, "__name__", repr(coro)), self.address)
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
+                self._current_future = None
+                self._update_started_at = None
+                self._release_update_lock()
+
+        if self._current_future is None:
+            # non-blocking: if something else holds the loop, skip this poll
+            if self._coro_lock.acquire(blocking=False):
+                self._update_lock_held = True
+                try:
+                    self._current_future = asyncio.run_coroutine_threadsafe(coro(), self._loop)
+                    self._update_started_at = time.monotonic()
+                except Exception as e:
+                    logger.debug("aiobmsble: could not schedule update (addr=%s): %r", self.address, e)
+                    self._release_update_lock()
+
+        return completed_ok
+
+    def _release_update_lock(self):
+        if self._update_lock_held:
+            self._update_lock_held = False
+            try:
+                self._coro_lock.release()
+            except RuntimeError:
+                pass
 
     def _run_coro(self, coro, timeout: float | None = None):
         try:
@@ -541,7 +607,7 @@ class Generic_AioBmsBle(Battery):
 
         try:
             # perform an async update (keeps connection open on success)
-            ok = self._run_coro(_update_async)
+            ok = self._poll_update(_update_async)
             if ok:
                 self._last_successful_update = time.monotonic()
             elif self._last_successful_update is not None:
