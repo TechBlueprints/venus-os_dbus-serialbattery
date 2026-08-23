@@ -81,45 +81,96 @@ def is_adapter_mac(entry):
     return bool(MAC_PATTERN.match(str(entry).strip()))
 
 
+# Adapter identity is read from the kernel, never over D-Bus, and cached for
+# this long. Short enough that a replugged or reset card is noticed, long
+# enough that a battery reconnecting in a tight loop does not spawn a
+# subprocess per attempt.
+ADAPTER_IDENTITY_TTL = 30.0
+_adapter_identity_cache = {"at": 0.0, "adapters": {}}
+
+
+def _adapters_from_sysfs():
+    """{hciN: MAC} from /sys/class/bluetooth, or {} if the kernel has no
+    address attribute there - which is the case on Venus OS."""
+    adapters = {}
+    try:
+        names = [n for n in os.listdir("/sys/class/bluetooth") if n.startswith("hci")]
+    except OSError:
+        return {}
+    for name in names:
+        try:
+            with open(f"/sys/class/bluetooth/{name}/address") as f:
+                mac = f.read().strip().upper()
+        except OSError:
+            continue
+        if mac:
+            adapters[name] = mac
+    return adapters
+
+
+def _adapters_from_hciconfig():
+    """{hciN: MAC} by parsing one bare hciconfig call.
+
+    One call returns the whole table, so this spawns a single subprocess
+    however many adapters the box has - the production GX device has seven.
+    """
+    try:
+        result = subprocess.run(["hciconfig"], capture_output=True, text=True, timeout=5)
+    except Exception as e:
+        logger.debug(f"hciconfig unavailable: {repr(e)}")
+        return {}
+    adapters = {}
+    name = None
+    for line in result.stdout.splitlines():
+        match = re.match(r"^(hci\d+):", line)
+        if match:
+            name = match.group(1)
+            continue
+        if name:
+            found = re.search(r"BD Address:\s*([0-9A-Fa-f:]{17})", line)
+            if found:
+                adapters[name] = found.group(1).upper()
+                name = None
+    return adapters
+
+
 def bluez_adapters():
     """
-    {hciN: MAC} for the adapters BlueZ currently exposes, or {} for "no answer".
+    {hciN: MAC} for the adapters the kernel currently exposes, or {} for
+    "no answer".
 
     hciN names are not stable identities: a USB reset or reboot renumbers
     them, and an adapter a battery is configured for can stop existing while
     its number lives on pointing at different hardware. The adapter's own MAC
-    is stable, so configuration can name that instead and be resolved against
-    live BlueZ state here.
+    is stable, so configuration can name that instead and be resolved here.
 
-    BlueZ is asked rather than sysfs because Venus OS kernels expose no
-    address attribute under /sys/class/bluetooth at all - the ObjectManager
-    reply carries Adapter1.Address for every adapter, in one round trip.
+    Read from the kernel and NOT over D-Bus, deliberately. This runs on the
+    BLE thread - resolve_adapter -> adapters_in_attempt_order ->
+    _select_adapter is the connect path - and asking BlueZ from here crashed
+    the driver. dbus-python's DBusGMainLoop supports only the DEFAULT GLib
+    main context, so a connection opened on this thread still registers its
+    watches and dispatch source on the MAIN thread's loop, and closing it
+    here frees the connection while that loop is still using it. Two core
+    dumps showed the main thread dying inside dbus_connection_dispatch, once
+    on a freed hash table and once on a freed mutex, and the same process
+    also aborted in malloc; one use-after-free with three presentations.
+    dbus-python belongs on the main thread, for velib.
 
-    A private connection, closed again before returning: dbus.SystemBus()
-    hands out a cached shared connection, and creating that before the driver
-    installs its main loop breaks every later signal receiver on it.
+    sysfs first because it is a plain file read; hciconfig as the fallback
+    because Venus OS kernels expose no address attribute under
+    /sys/class/bluetooth at all, so on the GX devices the fallback is what
+    actually runs. An all-zeros address is what a dead or unserved
+    controller reports and never identifies anything, so it is dropped
+    rather than cached as an identity.
     """
-    adapters = {}
-    bus = None
-    try:
-        import dbus
-
-        bus = dbus.SystemBus(private=True)
-        manager = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
-        for path, interfaces in manager.GetManagedObjects().items():
-            parts = str(path).split("/")
-            properties = interfaces.get("org.bluez.Adapter1")
-            if len(parts) >= 4 and properties is not None:
-                adapters[parts[3]] = str(properties.get("Address", "")).upper()
-    except Exception as e:
-        logger.debug(f"BlueZ adapter state unavailable, using configured order: {repr(e)}")
-        return {}
-    finally:
-        if bus is not None:
-            try:
-                bus.close()
-            except Exception:
-                pass
+    now = time.monotonic()
+    if _adapter_identity_cache["adapters"] and now - _adapter_identity_cache["at"] < ADAPTER_IDENTITY_TTL:
+        return dict(_adapter_identity_cache["adapters"])
+    adapters = _adapters_from_sysfs() or _adapters_from_hciconfig()
+    adapters = {name: mac for name, mac in adapters.items() if mac != UNKNOWN_ADAPTER_MAC}
+    if adapters:
+        _adapter_identity_cache["at"] = now
+        _adapter_identity_cache["adapters"] = dict(adapters)
     return adapters
 
 
