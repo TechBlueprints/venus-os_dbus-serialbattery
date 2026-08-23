@@ -255,3 +255,13 @@ def test_a_bleak_without_the_private_rebuild_hook_fails_loudly():
     # would have let through unchanged
     assert not isinstance(raised.value, sys.modules["bleak.exc"].BleakCharacteristicNotFoundError)
     assert "no way to rebuild it" in str(raised.value)
+
+
+def test_a_tree_that_is_already_complete_is_not_rebuilt():
+    """The common case pays nothing: no rebuild, no settle, one subscribe."""
+    client = _LateGattClient(missing_for=0)
+
+    _establish(client)
+
+    assert client.subscribe_attempts == 1
+    assert client.rebuilds == 0
