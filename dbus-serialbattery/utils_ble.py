@@ -86,36 +86,35 @@ def bluez_adapters():
     is stable, so configuration can name that instead and be resolved against
     live BlueZ state here.
 
-    BlueZ is asked rather than sysfs because Venus OS kernels expose no
-    address attribute under /sys/class/bluetooth at all - the ObjectManager
-    reply carries Adapter1.Address for every adapter, in one round trip.
+    Read WITHOUT D-Bus, deliberately. This function is called from the BLE
+    thread (resolve_adapter -> adapters_in_attempt_order -> _select_adapter),
+    and the previous implementation opened a dbus-python SystemBus there,
+    queried BlueZ's ObjectManager, and closed it again. That crashed the
+    driver: dbus-python's DBusGMainLoop supports only the DEFAULT GLib main
+    context ("Non-default main contexts are not currently supported"), so a
+    private=True connection created on this thread still registered its
+    watches and dispatch source on the MAIN thread's loop, and closing it
+    here freed the connection while that loop still held sources for it. The
+    main thread's next dispatch then ran on freed memory - SIGSEGV in
+    _dbus_hash_table_lookup_int, SIGBUS in pthread_mutex_lock, and glibc
+    "malloc_consolidate(): unaligned fastbin chunk detected" aborts, all
+    within about a second of "initiating BLE connection". Diagnosed from
+    core dumps 2026-08-23; see dbus-python issue #8 and Launchpad #1890753
+    for the same race reported upstream.
 
-    A private connection, closed again before returning: dbus.SystemBus()
-    hands out a cached shared connection, and creating that before the driver
-    installs its main loop breaks every later signal receiver on it.
+    bleak_connection_manager.claims is stdlib-only (no bleak, no asyncio, no
+    D-Bus), safe from any thread, and reads sysfs first, falling back to a
+    single hciconfig call for the whole table - which is what Venus needs,
+    since its kernels expose no address attribute under /sys/class/bluetooth.
+    dbus-python stays where it belongs: the main thread, for velib.
     """
-    adapters = {}
-    bus = None
     try:
-        import dbus
+        from bleak_connection_manager import claims
 
-        bus = dbus.SystemBus(private=True)
-        manager = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
-        for path, interfaces in manager.GetManagedObjects().items():
-            parts = str(path).split("/")
-            properties = interfaces.get("org.bluez.Adapter1")
-            if len(parts) >= 4 and properties is not None:
-                adapters[parts[3]] = str(properties.get("Address", "")).upper()
+        return {name: claims.adapter_mac(name).upper() for name in claims.present_hci_names()}
     except Exception as e:
-        logger.debug(f"BlueZ adapter state unavailable, using configured order: {repr(e)}")
+        logger.debug(f"Adapter state unavailable, using configured order: {repr(e)}")
         return {}
-    finally:
-        if bus is not None:
-            try:
-                bus.close()
-            except Exception:
-                pass
-    return adapters
 
 
 def bluez_present_adapters():
