@@ -352,6 +352,14 @@ def ble_hold_flag_path(address):
 
 # Outer deadlines for the connection backend. Generous on purpose: they are a
 # last resort against a permanently parked await, not a connection timeout.
+# How often the supervision wait re-checks the things that have no callback
+# (the main thread going away, and a disconnect whose callback never fired).
+# The link itself is awaited on an event, so this is a safety net rather than
+# a poll: it used to be 0.1s, which cost ten timer wakeups a second per
+# battery for the whole life of every connection and showed up as run-queue
+# churn on a loaded GX device.
+BLE_SUPERVISION_RECHECK = 5.0
+
 BLE_ESTABLISH_TIMEOUT = 300.0
 BLE_RELEASE_TIMEOUT = 30.0
 
@@ -586,6 +594,9 @@ class Syncron_Ble:
         # Only the BLE thread of the current generation keeps running; see
         # rebuild_ble_thread()
         self._ble_thread_generation = 0
+        # set when the link drops, so supervision waits instead of polling
+        self._disconnected = None
+        self._disconnected_loop = None
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
@@ -680,8 +691,50 @@ class Syncron_Ble:
 
     def client_disconnected(self, client):
         logger.error(f"bluetooh device with address: {self.address} disconnected")
+        self.signal_disconnected()
+
+    def signal_disconnected(self):
+        """Wake the supervision wait from wherever the callback reaches us.
+
+        call_soon_threadsafe rather than a bare set(): bleak invokes the
+        callback on the loop that owns the client, but the backends wrap it
+        and a wrapped callback is not guaranteed to keep that property.
+        Scheduling onto the captured loop is correct from either side.
+        """
+        event, loop = self._disconnected, self._disconnected_loop
+        if event is None or loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            # loop already closed - the connection is over either way
+            pass
+
+    async def supervise_connection(self):
+        """Wait for the link to end, without polling for it.
+
+        Two things end it and only one has a callback. The disconnect does,
+        so it is awaited on an event. The main thread going away does not,
+        and neither does a disconnect whose callback never fires - a real
+        failure mode here, which is why is_connected is still consulted - so
+        both are re-checked on a coarse timeout rather than at 10 Hz.
+        """
+        while True:
+            try:
+                await asyncio.wait_for(self._disconnected.wait(), timeout=BLE_SUPERVISION_RECHECK)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if not self.main_thread.is_alive():
+                return
+            if not self.client.is_connected:
+                return
 
     async def connect_to_bms(self, address):
+        # one event per connection: a stale set() from the previous link must
+        # not end this one's supervision immediately
+        self._disconnected = asyncio.Event()
+        self._disconnected_loop = asyncio.get_running_loop()
         self.client = self.backend.create_client(address, self.client_disconnected)
         try:
             # Belt-and-braces deadline: a backend's own timeouts should always
@@ -699,8 +752,7 @@ class Syncron_Ble:
         finally:
             self.ble_connection_ready.set()
             if self.client:
-                while self.client.is_connected and self.main_thread.is_alive():
-                    await asyncio.sleep(0.1)
+                await self.supervise_connection()
                 try:
                     await asyncio.wait_for(self.backend.release(self.client), timeout=BLE_RELEASE_TIMEOUT)
                 except Exception as e:
