@@ -509,7 +509,14 @@ class Generic_AioBmsBle(Battery):
         async def _update_async():
             # ensure we have a client, try to find device and connect if not
             if self._aiobmsble is None:
-                device: BLEDevice | None = await BleakScanner.find_device_by_address(self.address)
+                # Cache-first, like test_connection: a bare
+                # find_device_by_address here starts a fresh BlueZ discovery on
+                # EVERY poll of a battery whose client was lost, which on a GX
+                # device with another service already scanning fails outright
+                # with org.bluez.Error.InProgress - and then blocks the caller
+                # for the whole coroutine timeout while it does. Resolving from
+                # the BlueZ cache costs no scan at all in the common case.
+                device: BLEDevice | None = await self._resolve_device()
                 if device is None:
                     logger.debug(f"Could not find device {self.address} for refresh")
                     return False
