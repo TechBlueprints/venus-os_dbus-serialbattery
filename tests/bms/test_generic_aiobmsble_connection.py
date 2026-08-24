@@ -1,5 +1,3 @@
-
-
 # --------- the refresh path must not start a discovery ---------
 #
 # Field failure, dev-cerbo 2026-08-23: with the client lost and another
@@ -49,11 +47,7 @@ def test_refresh_never_blocks_the_main_thread_on_the_bms():
     tree = ast.parse(open(src).read())
 
     refresh = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "refresh_data")
-    called = {
-        n.func.attr
-        for n in ast.walk(refresh)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-    }
+    called = {n.func.attr for n in ast.walk(refresh) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
     assert "_poll_update" in called, "refresh_data must drive the update through the non-blocking poller"
     assert "_run_coro" not in called, "refresh_data must not call the blocking runner"
 
