@@ -38,6 +38,11 @@ def get_hciattach_cmdline() -> Optional[str]:
     Reads /proc directly instead of running "ps -ww | grep hciattach | grep -v grep", which
     forks a shell from this multithreaded process, twice per call.
 
+    The process is identified by /proc/PID/comm, which is the name of the executable and
+    cannot be set by the process itself. Matching on the command line instead would also
+    match anything that merely mentions hciattach, such as a monitoring script or a shell
+    running a command with that name in it.
+
     :return: the full command line of hciattach or None, if it is not running
     """
     try:
@@ -50,13 +55,17 @@ def get_hciattach_cmdline() -> Optional[str]:
             continue
 
         try:
+            with open(f"/proc/{entry}/comm", encoding="utf-8") as comm_file:
+                if comm_file.read().strip() != "hciattach":
+                    continue
+
             with open(f"/proc/{entry}/cmdline", "rb") as cmdline_file:
                 arguments = [argument.decode("utf-8", "replace") for argument in cmdline_file.read().split(b"\0") if argument]
         except OSError:
             # the process exited between listing /proc and reading it
             continue
 
-        if arguments and "hciattach" in arguments[0]:
+        if arguments:
             return " ".join(arguments)
 
     return None
