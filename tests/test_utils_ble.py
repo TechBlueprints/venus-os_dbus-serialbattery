@@ -646,6 +646,8 @@ def test_an_unwritable_config_is_not_worth_failing_over(tmp_path):
         assert utils_ble.pin_adapters_by_mac(str(tmp_path / "nope.ini"), adapters=ADAPTERS) is False
     finally:
         _configure(original_pins, original_pool)
+
+
 # --------- supervision waits instead of polling ---------
 #
 # The link used to be watched with `while is_connected: await sleep(0.1)`,
