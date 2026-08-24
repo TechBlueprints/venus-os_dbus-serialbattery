@@ -100,3 +100,26 @@ intermediates did not reconcile. Measured value: **703 B/s = 57 MiB/day**.
 The method error is instructive: a two-sample stat of `current` misses everything
 written into rotated files, and a larger second sample does not rule out a rotation,
 because `current` restarts at zero.
+
+## Correction — no reboot inside the attribution window (added 2026-08-24)
+
+`running monitor` described the churn collapse as arriving "alongside three other
+changes **plus a reboot**". The reboot is real but falls ~2h45m *outside* the window,
+and the record's own data proves it:
+
+- Incident 8, "UNATTRIBUTED HARD RESET at 22:34:21 UTC"
+- the monitor's health check at 22:32:11 recorded `UPTIME_S=94234` (~26 h)
+
+The before/after measurements were at **79,200 s** and **84,513 s** uptime — the same
+counter, increasing monotonically across the interval, which is only possible if the box
+did not restart between them. 94,234 s at 22:32 continues the same unbroken count. So:
+before 18:45–19:10, after 19:50, hard reset at 22:34, well after both.
+
+**Why this matters.** A reboot inside the window would be the most likely single
+explanation for a churn collapse and would swamp the other three candidates — a reader
+would reasonably conclude the recovery was just a restart and that none of the fixes
+earned anything. The caveat above stays **three-way**. It does not become four-way.
+
+The uptime counter is a good instrument here precisely because it is independent of
+everything else being measured — the same property that made the cumulative-connection
+cross-check the right way to rule out a sampling artifact on the churn figure.
