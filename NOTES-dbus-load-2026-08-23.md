@@ -160,3 +160,72 @@ for 3c32d1e and for the supervision-spin removal, which nobody has, and settling
 a driver restart is a real effect nobody has bounded. It is a lead with the arithmetic
 attached, recorded while the window is still reconstructible. The caveat above stays
 **three-way**, with an open question about whether one of the three was already spent.
+
+## Deploy log findings (running monitor, 2026-08-24)
+
+Process starts recovered from prod's pre-reboot blebattery startup banners.
+
+    pack .0 (RS)  17:18:57  17:32:21  17:49:09  18:04:20  19:40:40  21:13:22
+    pack .1 (CS)  16:43:59  17:25:33  17:29:00  17:39:12  18:04:46  19:40:42  21:13:45
+
+### The lead above holds for BOTH packs — not staggered
+
+The deploy restart is 18:04:20 / 18:04:46, **26 seconds apart**. One event. Both processes
+were live 17 minutes before the cross-check window opens (18:21:37) and ~40 minutes before
+the load/CPU before-sample. So the "before" state contained the use-after-free fix on both
+packs; the argument does not fall back to a single pack.
+
+**Figure correction:** the fix landed at 18:01:35 but the drivers did not come up until
+18:04:20/18:04:46. The 18:45 sample is **40m 40s** post-restart, not 43m 25s. Use the
+process starts, not the deploy timestamp.
+
+### CONFOUND: both drivers restarted 9.5 minutes before the after-sample
+
+19:40:40 and 19:40:42 are **9m 30s / 9m 28s** before the after-sample at 19:50:10.
+
+- **The cumulative cross-check is UNAFFECTED.** 19,166 → 22,929 is a system-wide D-Bus
+  counter that does not reset when a client restarts. The 0.708/sec window average stands.
+  This is precisely why that was the right instrument.
+- **The instantaneous rows ARE confounded.** "0.13/sec instantaneous", dbus-daemon 10.6 %
+  and bluetoothd 5.2 % were all sampled 9.5 minutes after both drivers restarted. Not
+  necessarily wrong — but they have an alternative explanation the cumulative figure does
+  not, and the table above presents them side by side as if equally robust. They are not.
+
+### Rates, not counts — and they invert the obvious reading
+
+Raw counts suggested a large win (RS 345 → 53 reconnects). The windows are 32.79 h and
+4.56 h, so per hour: 345/32.79 = **10.5/h** before, 53/4.56 = **11.6/h** after.
+
+|  | recon/h | no-data-180s/h | fallback-entries/h |
+| --- | --- | --- | --- |
+| RS before | 10.5 | 4.0 | 2.6 |
+| RS after | 11.6 | 0.2 | 5.9 |
+| CS before | 4.8 | 0.5 | 1.1 |
+| CS after | 11.2 | 0.2 | 5.3 |
+
+Reconnection rate did **not** improve — CS more than doubled. What improved is
+"no data for 180 s on an open link" (20x on RS) and fallback entries (2–4x on both).
+
+Two readings, neither chosen: the link got worse, **or** the driver stopped sitting on dead
+links for 180 s and now hands off to fallback quickly — which produces exactly this
+signature (fewer long stalls, more fallback transitions, unchanged reconnects) and is more
+consistent with what the fix did.
+
+Either way it corroborates the lead from an independent instrument: **the use-after-free fix
+did not reduce BLE churn** — which load 7.39 at 18:45 already said.
+
+### The 22:34 reboot did something much larger, on a different metric
+
+15 h post-reboot, both packs: **1 reconnect, 0 no-data-180s**, against ~11/h per pack
+before. Confirmed not a rotation artifact — newest rotated file is the 22:35:09 reboot
+rotation and `current` has not rotated since.
+
+This does **not** resurrect the reboot as a candidate in the 18:21–19:50 window; the uptime
+counter rules that out and the correction above stands. But any future load comparison
+spanning 22:34 is comparing two different machines.
+
+**Arithmetic query, raised not resolved:** the reduction was reported as ~165x. Using the
+per-pack after-rates (11.6 + 11.2 = 22.8/h combined) the 15 h expectation is ~342 reconnects
+against 1 observed, i.e. **~340x**. 165x is what you get applying an ~11/h *per-pack* rate to
+a *both-packs* count. The order of magnitude is unaffected; the factor of two is not
+resolved here.
