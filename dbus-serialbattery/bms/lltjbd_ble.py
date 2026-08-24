@@ -8,7 +8,6 @@ import atexit
 import os
 import threading
 import sys
-import re
 from asyncio import CancelledError
 from time import sleep
 from typing import Union, Optional
@@ -30,6 +29,37 @@ BLE_CHARACTERISTICS_RX_UUID_ALT = "0000fff1-0000-1000-8000-00805f9b34fb"
 
 MIN_RESPONSE_SIZE = 6
 MAX_RESPONSE_SIZE = 256
+
+
+def get_hciattach_cmdline() -> Optional[str]:
+    """
+    Get the command line of the running hciattach process.
+
+    Reads /proc directly instead of running "ps -ww | grep hciattach | grep -v grep", which
+    forks a shell from this multithreaded process, twice per call.
+
+    :return: the full command line of hciattach or None, if it is not running
+    """
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as cmdline_file:
+                arguments = [argument.decode("utf-8", "replace") for argument in cmdline_file.read().split(b"\0") if argument]
+        except OSError:
+            # the process exited between listing /proc and reading it
+            continue
+
+        if arguments and "hciattach" in arguments[0]:
+            return " ".join(arguments)
+
+    return None
 
 
 class LltJbd_Ble(LltJbd):
@@ -59,17 +89,15 @@ class LltJbd_Ble(LltJbd):
 
         self.hci_uart_ok = True
         if not os.path.isfile("/tmp/dbus-blebattery-hciattach"):
-            execfile = open("/tmp/dbus-blebattery-hciattach", "w")
-            execpath = os.popen("ps -ww | grep hciattach | grep -v grep").read()
-            execpath = re.search("/usr/bin/hciattach.+", execpath)
-            execfile.write(execpath.group())
-            execfile.close()
-        else:
-            execpath = os.popen("ps -ww | grep hciattach | grep -v grep").read()
-            if not execpath:
-                execfile = open("/tmp/dbus-blebattery-hciattach", "r")
-                os.system(execfile.readline())
+            execpath = get_hciattach_cmdline()
+            if execpath:
+                execfile = open("/tmp/dbus-blebattery-hciattach", "w")
+                execfile.write(execpath)
                 execfile.close()
+        elif get_hciattach_cmdline() is None:
+            execfile = open("/tmp/dbus-blebattery-hciattach", "r")
+            os.system(execfile.readline())
+            execfile.close()
 
         logger.info("Init of LltJbd_Ble at " + address)
 

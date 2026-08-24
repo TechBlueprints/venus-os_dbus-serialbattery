@@ -91,6 +91,7 @@
 * Changed: Improved BMS Cable Alarm Logic. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/309 by @mr-manuel
 * Changed: JK Inverter BMS - Fixed serial number length by @mr-manuel
 * Changed: JKBMS BLE - Fixed negative temperature display. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/369 by @mr-manuel
+* Changed: JKBMS BLE - Replaced the `os.popen()` call that logs the Bluetooth signal strength during a stalled connection with a `subprocess.run()` call without a shell, so the multithreaded driver process no longer forks a shell every 15 s while the BMS is unreachable by @cgoudie
 * Changed: JKBMS CAN - Correct calculation of arbitration_id for device_address > 0. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/288 with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/306 by @Hooorny
 * Changed: JKBMS PB - Auto-recover the shared RS485 port when the driver gets stuck after a USB re-plug or a persistent dead-bus: after 8 consecutive failed reads the fd is closed and reopened on next access by @hsteinhaus
 * Changed: JKBMS PB - Older hardware versions support dedicated heating values with latest firmware with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/459 by @phreaker0
@@ -99,6 +100,7 @@
 * Changed: LiTime BLE BMS - Fixed unbounded cell-array growth in `parse_status` that flooded the log with `KeyError('/Voltages/CellN')` exceptions because `dbushelper` only registers paths for the initial cell count. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/440
 * Changed: LLT/JBD BLE BMS - Fixed wrong charge/discharge fet assignment @mr-manuel
 * CHanged: LLT/JBD BMS - Fixed issue with checksum missing bytes by @TheRealSbs
+* Changed: LLT/JBD BLE BMS - Replaced the two `os.popen("ps -ww | grep hciattach | grep -v grep")` calls with a direct `/proc` scan, removing two shell forks per driver start. This also fixes an `AttributeError` in `LltJbd_Ble.__init__()` on systems where `hciattach` is not running, for example when a USB Bluetooth dongle is used by @cgoudie
 * Changed: LLT/JBD UP16S BMS - Fixed reading 4 fault/alarm values @dmitrych5
 * Changed: Made some dbus settings silent to not flood the localsettings service log by @mr-manuel
 * Changed: Mechanism to reset SOC via GUI, since it was not possible to set the same SOC twice by @mr-manuel
