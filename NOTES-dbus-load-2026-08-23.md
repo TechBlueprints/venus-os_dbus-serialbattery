@@ -216,16 +216,26 @@ did not reduce BLE churn** — which load 7.39 at 18:45 already said.
 
 ### The 22:34 reboot did something much larger, on a different metric
 
-15 h post-reboot, both packs: **1 reconnect, 0 no-data-180s**, against ~11/h per pack
-before. Confirmed not a rotation artifact — newest rotated file is the 22:35:09 reboot
+15 h post-reboot: **2 reconnects** (1 per pack), **0 no-data-180s**. Confirmed not a rotation artifact — newest rotated file is the 22:35:09 reboot
 rotation and `current` has not rotated since.
 
 This does **not** resurrect the reboot as a candidate in the 18:21–19:50 window; the uptime
 counter rules that out and the correction above stands. But any future load comparison
 spanning 22:34 is comparing two different machines.
 
-**Arithmetic query, raised not resolved:** the reduction was reported as ~165x. Using the
-per-pack after-rates (11.6 + 11.2 = 22.8/h combined) the 15 h expectation is ~342 reconnects
-against 1 observed, i.e. **~340x**. 165x is what you get applying an ~11/h *per-pack* rate to
-a *both-packs* count. The order of magnitude is unaffected; the factor of two is not
-resolved here.
+**RESOLVED — the true figure is 171x.** Both the originally reported ~165x and the ~340x
+derived from it here were wrong, from the same mixed-denominator error. The source count
+was `reconnects=1` *per pack* and was written up as "1 across BOTH packs", which is 2.
+Recomputed with both packs combined throughout:
+
+| | window | reconnects | rate |
+| --- | --- | --- | --- |
+| pre-reboot | 18:04 → 22:35, 4.56 h | 53 + 51 = 104 | 22.81/h |
+| post-reboot | 22:35:45 → 13:36:34, 15.01 h | 1 + 1 = 2 | 0.1332/h |
+
+Ratio **171x**. Verified here: 104/4.56 = 22.807, 2/15.01 = 0.13324, 22.807/0.13324 = 171.2.
+
+Worth keeping the trail: 165x was wrong by construction but landed within 4 % of the right
+answer, so comparing the *number* would never have exposed it — only re-deriving it from the
+stated rates did, and that produced 340x, wrong in the other direction because it inherited
+the bad count. Two wrong figures bracketing the right one.
