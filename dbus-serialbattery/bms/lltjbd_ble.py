@@ -31,7 +31,7 @@ MIN_RESPONSE_SIZE = 6
 MAX_RESPONSE_SIZE = 256
 
 
-def get_hciattach_cmdline() -> Optional[str]:
+def get_hciattach_cmdline(proc_path: str = "/proc") -> Optional[str]:
     """
     Get the command line of the running hciattach process.
 
@@ -43,10 +43,11 @@ def get_hciattach_cmdline() -> Optional[str]:
     match anything that merely mentions hciattach, such as a monitoring script or a shell
     running a command with that name in it.
 
+    :param proc_path: path of the proc filesystem, only overridden by the tests
     :return: the full command line of hciattach or None, if it is not running
     """
     try:
-        entries = os.listdir("/proc")
+        entries = os.listdir(proc_path)
     except OSError:
         return None
 
@@ -55,11 +56,11 @@ def get_hciattach_cmdline() -> Optional[str]:
             continue
 
         try:
-            with open(f"/proc/{entry}/comm", encoding="utf-8") as comm_file:
+            with open(os.path.join(proc_path, entry, "comm"), encoding="utf-8") as comm_file:
                 if comm_file.read().strip() != "hciattach":
                     continue
 
-            with open(f"/proc/{entry}/cmdline", "rb") as cmdline_file:
+            with open(os.path.join(proc_path, entry, "cmdline"), "rb") as cmdline_file:
                 arguments = [argument.decode("utf-8", "replace") for argument in cmdline_file.read().split(b"\0") if argument]
         except OSError:
             # the process exited between listing /proc and reading it
