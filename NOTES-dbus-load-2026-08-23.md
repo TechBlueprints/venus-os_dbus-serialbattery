@@ -123,3 +123,40 @@ earned anything. The caveat above stays **three-way**. It does not become four-w
 The uptime counter is a good instrument here precisely because it is independent of
 everything else being measured — the same property that made the cumulative-connection
 cross-check the right way to rule out a sampling artifact on the churn figure.
+
+## Refinement — the "before" state already contained one of the three fixes
+
+From `running monitor`, 2026-08-24, with the arithmetic re-checked here independently.
+
+**Two different windows are conflated by the labels above.** "18:45–19:10" belongs to the
+load/CPU rows. The cumulative-connection cross-check — the evidence that churn genuinely
+decayed rather than being a sampling artifact — spans a different interval, recovered from
+the uptime counter:
+
+| Sample | uptime | wall clock |
+| --- | --- | --- |
+| cross-check start | 79,200 s | 2026-08-23 18:21:37 UTC |
+| cross-check end / after | 84,513 s | 19:50:10 UTC |
+| health check | 94,234 s | 22:32:11 UTC |
+| hard reset (Incident 8) | — | 22:34:21 UTC, **2.74 h after** the after-sample |
+
+Differences check out: 84,513 − 79,200 = 5,313 s = 1h 28m 33s, and 94,234 − 84,513 =
+9,721 s = 2h 42m 1s. The chain self-validates — the after-sample reconstructs to 19:50:10
+against a recorded 19:50, which is only possible on an unbroken counter.
+
+**The consequence.** The dbus-off-the-BLE-thread use-after-free fix deployed at **18:01:35**,
+with the old process confirmed dead at 18:02:24. So:
+
+- the cross-check window opens at 18:21:37 — **20 minutes after** that fix went live
+- the load/CPU before-sample at 18:45 is **43m 25s** post-restart
+
+Every "before" number in this file was therefore measured with the use-after-free fix
+already running, and the box was still at load 7.39 with churn ~1.40/sec at that point.
+**A change already in effect during the "before" state cannot explain the before/after
+delta.**
+
+**This does NOT narrow attribution to two.** Establishing that would need deploy timestamps
+for 3c32d1e and for the supervision-spin removal, which nobody has, and settling time after
+a driver restart is a real effect nobody has bounded. It is a lead with the arithmetic
+attached, recorded while the window is still reconstructible. The caveat above stays
+**three-way**, with an open question about whether one of the three was already spent.
