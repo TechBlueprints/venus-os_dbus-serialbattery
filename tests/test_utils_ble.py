@@ -10,6 +10,7 @@ Everything that actually talks to a radio is left untested here.
 import configparser
 import importlib.util
 import os
+import pytest
 import sys
 import types
 
@@ -732,3 +733,134 @@ def test_supervision_returns_when_the_main_thread_is_gone():
 def test_signalling_without_a_connection_is_harmless():
     s = _supervisor()
     s.signal_disconnected()  # no event yet - must not raise
+
+
+# ---------------------------------------------------------------------------
+# The abandoned-generation reaper.
+#
+# rebuild_ble_thread() abandons an event loop whose BlueZ manager bus stays
+# pinned in bleak's module-level dict with live match rules; dbus-daemon then
+# queues every BlueZ signal to a socket nobody reads (measured at ~44 MB/h of
+# daemon growth on a Cerbo GX). These tests assert the reaper's side effects
+# — the dict entry removed, the socket actually closed, the sibling entry
+# untouched — rather than exception types, per the recovery-helper standard:
+# a reaper that does nothing raises nothing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bluez_manager_stub():
+    """Install bleak.backends.bluezdbus.manager as a stub carrying the dict.
+
+    Guarded and restored: other test files stub bleak differently and
+    collection order decides who wins (see the module docstring), so this
+    fixture saves whatever is there and puts it back.
+    """
+    saved = {name: sys.modules.get(name) for name in ("bleak.backends", "bleak.backends.bluezdbus", "bleak.backends.bluezdbus.manager")}
+    backends = sys.modules.get("bleak.backends") or types.ModuleType("bleak.backends")
+    bluezdbus = sys.modules.get("bleak.backends.bluezdbus") or types.ModuleType("bleak.backends.bluezdbus")
+    manager = types.ModuleType("bleak.backends.bluezdbus.manager")
+    manager._global_instances = {}
+    bluezdbus.manager = manager
+    backends.bluezdbus = bluezdbus
+    sys.modules["bleak"].backends = backends
+    sys.modules["bleak.backends"] = backends
+    sys.modules["bleak.backends.bluezdbus"] = bluezdbus
+    sys.modules["bleak.backends.bluezdbus.manager"] = manager
+    yield manager
+    for name, mod in saved.items():
+        if mod is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = mod
+
+
+def _fake_manager_with_socket():
+    import socket as socket_module
+
+    left, right = socket_module.socketpair()
+    manager = types.SimpleNamespace(_bus=types.SimpleNamespace(_sock=left))
+    return manager, left, right
+
+
+def test_a_reaped_generation_loses_its_manager_and_its_socket_is_closed(bluez_manager_stub):
+    abandoned_loop = object()
+    live_loop = object()
+    abandoned_mgr, abandoned_sock, _peer_a = _fake_manager_with_socket()
+    live_mgr, live_sock, _peer_b = _fake_manager_with_socket()
+    bluez_manager_stub._global_instances[abandoned_loop] = abandoned_mgr
+    bluez_manager_stub._global_instances[live_loop] = live_mgr
+
+    utils_ble._reap_abandoned_ble_generation(None, abandoned_loop, "AA:BB:CC:DD:EE:FF", 0)
+
+    # the abandoned entry is gone and ONLY that entry: a reaper degenerated
+    # into dict.clear() fails on the count and on the sibling
+    assert abandoned_loop not in bluez_manager_stub._global_instances
+    assert len(bluez_manager_stub._global_instances) == 1
+    assert bluez_manager_stub._global_instances[live_loop] is live_mgr
+    # the socket is actually closed, not merely dereferenced — fileno() is -1
+    # after close(); a reaper that only pops the dict fails here
+    assert abandoned_sock.fileno() == -1
+    assert live_sock.fileno() != -1
+    live_sock.close()
+    _peer_a.close()
+    _peer_b.close()
+
+
+def test_the_reaper_tolerates_an_already_reaped_generation(bluez_manager_stub):
+    live_loop = object()
+    live_mgr, live_sock, _peer = _fake_manager_with_socket()
+    bluez_manager_stub._global_instances[live_loop] = live_mgr
+
+    # bleak's own closed-loop sweep may win the race; reaping a loop with no
+    # entry must be a no-op, not an error, and must not touch the survivor
+    utils_ble._reap_abandoned_ble_generation(None, object(), "AA:BB:CC:DD:EE:FF", 1)
+
+    assert bluez_manager_stub._global_instances == {live_loop: live_mgr}
+    assert live_sock.fileno() != -1
+    live_sock.close()
+    _peer.close()
+
+
+def test_the_reaper_waits_for_the_old_thread_before_touching_its_state(bluez_manager_stub):
+    joins = []
+    old_thread = types.SimpleNamespace(join=lambda timeout: joins.append(timeout))
+    abandoned_loop = object()
+    mgr, sock, _peer = _fake_manager_with_socket()
+    bluez_manager_stub._global_instances[abandoned_loop] = mgr
+
+    utils_ble._reap_abandoned_ble_generation(old_thread, abandoned_loop, "AA:BB:CC:DD:EE:FF", 0)
+
+    # joined exactly once, with the bounded timeout — an unbounded join would
+    # hang the reaper forever on a truly wedged generation
+    assert joins == [utils_ble.BLE_GENERATION_REAP_TIMEOUT]
+    assert sock.fileno() == -1
+    _peer.close()
+
+
+def test_a_rebuild_hands_the_reaper_the_abandoned_generation_not_the_new_one(monkeypatch):
+    reaped = []
+    monkeypatch.setattr(utils_ble, "_reap_abandoned_ble_generation", lambda *args: reaped.append(args))
+
+    sb = object.__new__(utils_ble.Syncron_Ble)
+    sb.address = "AA:BB:CC:DD:EE:FF"
+    sb._ble_thread_generation = 0
+    old_thread = object()
+    old_loop = object()
+    sb._ble_async_thread = old_thread
+    sb.ble_async_thread_event_loop = old_loop
+
+    def fake_thread_main(generation=0):
+        sb.ble_async_thread_ready.set()
+
+    sb.initiate_ble_thread_main = fake_thread_main
+
+    assert sb.rebuild_ble_thread() is True
+
+    # the reaper got the OLD generation's thread and loop, captured before
+    # the rebuild overwrote them — capturing after the reset hands it False
+    # and reaps nothing, which is exactly the defect this wiring fixes
+    assert reaped == [(old_thread, old_loop, "AA:BB:CC:DD:EE:FF", 0)]
+    # and the NEW thread handle was stored for the next generation's reaper
+    assert sb._ble_async_thread is not old_thread
+    assert sb._ble_async_thread.name == "BMS_bluetooth_async_thread_gen1"

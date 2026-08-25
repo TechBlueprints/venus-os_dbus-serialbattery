@@ -363,6 +363,14 @@ BLE_SUPERVISION_RECHECK = 5.0
 BLE_ESTABLISH_TIMEOUT = 300.0
 BLE_RELEASE_TIMEOUT = 30.0
 
+# How long the reaper waits for an abandoned BLE generation's thread to finish
+# on its own before freeing its D-Bus resources out from under it. Slightly
+# above BLE_ESTABLISH_TIMEOUT because an abandoned generation is most often
+# parked inside one in-flight establish; a generation still alive after that
+# is the truly-hung case, and closing its bus socket makes its pending await
+# raise, which helps it exit rather than hurting it.
+BLE_GENERATION_REAP_TIMEOUT = 330.0
+
 
 # bleak-retry-connector lives in the ext folder, which dbus-serialbattery.py
 # adds to sys.path; it is already vendored for the aiobmsble drivers, so this
@@ -623,6 +631,56 @@ def get_ble_backend(name=None):
     return BleakBackend()
 
 
+def _reap_abandoned_ble_generation(old_thread, old_loop, address, generation):
+    """Free the D-Bus resources of an abandoned BLE thread generation.
+
+    rebuild_ble_thread() abandons the old generation's event loop, but bleak's
+    global BlueZ manager for that loop stays pinned in
+    bleak.backends.bluezdbus.manager._global_instances: bleak's own sweep only
+    runs inside get_global_bluez_manager(), only pops loops that are already
+    closed, and the new generation calls it exactly once — within seconds of
+    the rebuild, while the old loop is still parked inside an in-flight await
+    and not yet closed. Missed once, the entry is never revisited.
+
+    The abandoned manager holds an open system-bus socket with three BlueZ
+    match rules (InterfacesAdded/InterfacesRemoved/PropertiesChanged under
+    /org/bluez) that nothing will ever read again, so dbus-daemon queues every
+    BlueZ signal to it without bound — measured on a Cerbo GX at ~44 MB/h of
+    daemon growth, OOM in hours. The daemon's own max_outgoing_bytes eviction
+    (127 MB) is sized above the box's free RAM, so nothing upstream saves us.
+
+    Closing the raw socket makes dbus-daemon drop the connection, its match
+    rules and its queued messages immediately. Per-client buses need no
+    reaping: nothing module-level pins them, so GC closes them once the old
+    thread's stack unwinds.
+    """
+    try:
+        if old_thread is not None:
+            old_thread.join(BLE_GENERATION_REAP_TIMEOUT)
+        if not old_loop:
+            return
+        from bleak.backends.bluezdbus import manager as bluez_manager
+
+        instances = getattr(bluez_manager, "_global_instances", None)
+        if not isinstance(instances, dict):
+            logger.warning(f"BLE generation {generation} reaper for {address}: bleak has no _global_instances dict; bleak changed, reaper needs updating")
+            return
+        abandoned = instances.pop(old_loop, None)
+        if abandoned is None:
+            # bleak's own closed-loop sweep got there first, or the old
+            # generation never created a manager (e.g. it failed to connect)
+            return
+        sock = getattr(getattr(abandoned, "_bus", None), "_sock", None)
+        if sock is not None:
+            sock.close()
+        logger.warning(
+            f"BLE generation reaper for {address}: freed generation {generation}'s abandoned BlueZ manager bus; "
+            "its match rules would otherwise make dbus-daemon queue signals to it without bound"
+        )
+    except Exception as e:
+        logger.warning(f"BLE generation {generation} reaper for {address} failed: {repr(e)}")
+
+
 # Class that enables synchronous writing and reading to a bluetooh device
 class Syncron_Ble:
 
@@ -660,8 +718,11 @@ class Syncron_Ble:
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
+        # kept so rebuild_ble_thread's reaper can join the generation it abandons
+        self._ble_async_thread = None
         ble_async_thread = threading.Thread(name="BMS_bluetooth_async_thread", target=self.initiate_ble_thread_main, daemon=True)
         ble_async_thread.start()
+        self._ble_async_thread = ble_async_thread
 
         thread_start_ok = self.ble_async_thread_ready.wait(2)
         connected_ok = self.ble_connection_ready.wait(10)
@@ -689,6 +750,19 @@ class Syncron_Ble:
         try:
             self._ble_thread_generation += 1
             generation = self._ble_thread_generation
+            # Capture the generation being abandoned BEFORE its state is
+            # overwritten, and hand it to a reaper: the old loop's BlueZ
+            # manager bus stays pinned in bleak's module-level dict with
+            # live match rules, and nothing else ever frees it (see
+            # _reap_abandoned_ble_generation).
+            old_thread = self._ble_async_thread
+            old_loop = self.ble_async_thread_event_loop
+            threading.Thread(
+                name=f"BMS_ble_gen{generation - 1}_reaper",
+                target=_reap_abandoned_ble_generation,
+                args=(old_thread, old_loop, self.address, generation - 1),
+                daemon=True,
+            ).start()
             self.ble_async_thread_ready = threading.Event()
             self.ble_connection_ready = threading.Event()
             self.ble_async_thread_event_loop = False
@@ -701,6 +775,7 @@ class Syncron_Ble:
                 daemon=True,
             )
             ble_async_thread.start()
+            self._ble_async_thread = ble_async_thread
             started = self.ble_async_thread_ready.wait(5)
             logger.error(f"BLE thread rebuild for {self.address}: generation {generation} {'started' if started else 'FAILED TO START'}")
             return started
