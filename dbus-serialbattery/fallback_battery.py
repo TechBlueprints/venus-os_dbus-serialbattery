@@ -1352,6 +1352,23 @@ class FallbackBattery:
                     ceiling = utils.MAX_CELL_VOLTAGE * self.battery.cell_count
                 if ceiling is not None:
                     self.battery.control_voltage = round(ceiling, 2)
+            # Same reason the sibling limiter sets its allow flags: skipping a
+            # state machine must not also skip the state it was going to
+            # establish. charge_mode starts as None and is only ever assigned
+            # inside the machine being skipped here, so a wrapper that serves
+            # for hours hands the base class a None it never sees in stock
+            # operation - where the machine runs every cycle. The base guards
+            # one branch for that (battery.py:917) and not the next
+            # (battery.py:941, ``charge_mode.startswith("Float Transition")``),
+            # so the crash lands on the way BACK, the instant the BMS returns
+            # and delegation resumes. Field-observed on dev-cerbo 2026-08-28
+            # 05:30:25Z. Seed a string that matches no branch test: the base
+            # machine then evaluates its conditions normally and overwrites
+            # this on the same cycle. The wrapper's own charge_mode property
+            # shows the fallback text meanwhile, so this is not user-visible
+            # while serving.
+            if self.battery.charge_mode is None:
+                self.battery.charge_mode = "Waiting for BMS data"
             return
         self.battery.manage_charge_voltage()
 

@@ -479,6 +479,32 @@ class TestUnreadFetStates:
         assert wrapper.get_allow_to_charge() is True
         assert wrapper.get_allow_to_discharge() is True
 
+    def test_the_wrapped_battery_never_holds_a_none_charge_mode_while_serving(self, monkeypatch):
+        # Field-observed on dev-cerbo 2026-08-28 05:30:25Z: the BMS returned,
+        # the wrapper left fallback and delegated to the base state machine,
+        # which dereferenced charge_mode at battery.py:941 and killed the
+        # driver. The base guards that variable at :917 and not at :941, so a
+        # None arriving from a long serving window crashes on the way BACK.
+        # The wrapper's own property shows the fallback text throughout, which
+        # is why this stayed invisible: the GUI looked correct while the
+        # wrapped object held None.
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MIN", 2.70)
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MAX", 3.55)
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.cells = []
+        assert wrapper.battery.charge_mode is None
+        _serve(wrapper)
+
+        for _ in range(5):
+            wrapper.manage_charge_voltage()
+
+        assert wrapper.battery.charge_mode is not None
+        # every branch test the base machine runs against it must be safe and False
+        for prefix in ("Float", "Float Transition", "Bulk", "Absorption"):
+            assert wrapper.battery.charge_mode.startswith(prefix) is False
+        # and the user-visible mode is still the fallback text, not the seed
+        assert wrapper.charge_mode.startswith("Fallback")
+
     def test_a_cold_start_mid_outage_does_not_publish_limits_with_both_directions_blocked(self, monkeypatch):
         # Field-observed on dev-cerbo 2026-08-28 03:26Z: the box was rebooted
         # while the fallback was already serving and the BMS radio was
