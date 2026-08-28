@@ -479,6 +479,50 @@ class TestUnreadFetStates:
         assert wrapper.get_allow_to_charge() is True
         assert wrapper.get_allow_to_discharge() is True
 
+    def test_a_cold_start_mid_outage_does_not_publish_limits_with_both_directions_blocked(self, monkeypatch):
+        # Field-observed on dev-cerbo 2026-08-28 03:26Z: the box was rebooted
+        # while the fallback was already serving and the BMS radio was
+        # physically absent, so the driver came up having NEVER reached the
+        # BMS. Nothing is hand-set here on purpose - control_allow_* are left
+        # at the None they get in Battery.__init__, which is what a process
+        # with no BMS contact actually holds. The warm path had dis=1; the
+        # cold path published dis=0 alongside full configured limits.
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MIN", 2.70)
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MAX", 3.55)
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.charge_fet = None
+        wrapper.battery.discharge_fet = None
+        wrapper.battery.cells = []
+        assert wrapper.battery.control_allow_charge is None
+        assert wrapper.battery.control_allow_discharge is None
+        _serve(wrapper)
+
+        wrapper.manage_charge_and_discharge_current()
+
+        # the limiters are skipped, but their conclusion is not
+        assert wrapper.battery.control_charge_current != 0
+        assert wrapper.battery.control_discharge_current != 0
+        assert wrapper.get_allow_to_charge() is True
+        assert wrapper.get_allow_to_discharge() is True
+
+    def test_a_zero_configured_limit_still_reports_the_direction_blocked(self, monkeypatch):
+        # the flags follow the limits rather than being pinned true: a limit
+        # the installation genuinely sets to zero must still read as blocked
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MIN", 2.70)
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MAX", 3.55)
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper.battery.charge_fet = None
+        wrapper.battery.discharge_fet = None
+        wrapper.battery.cells = []
+        wrapper.battery.max_battery_charge_current = 0
+        wrapper.battery.max_battery_discharge_current = 50
+        _serve(wrapper)
+
+        wrapper.manage_charge_and_discharge_current()
+
+        assert wrapper.get_allow_to_charge() is False
+        assert wrapper.get_allow_to_discharge() is True
+
     def test_a_fet_the_bms_reported_open_is_still_honoured(self, monkeypatch):
         # unknown is not the same as known-open: a real report must win
         monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MIN", 2.70)

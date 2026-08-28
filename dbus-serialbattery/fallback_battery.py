@@ -1380,6 +1380,16 @@ class FallbackBattery:
             discharge_limit = self.battery.max_battery_discharge_current
             self.battery.control_charge_current = charge_limit if charge_limit is not None else utils.MAX_BATTERY_CHARGE_CURRENT
             self.battery.control_discharge_current = discharge_limit if discharge_limit is not None else utils.MAX_BATTERY_DISCHARGE_CURRENT
+            # Derive the allow flags from the limits just set, exactly as the
+            # base class does at the end of each limiter it would otherwise
+            # have run. Skipping the limiters must not also skip their
+            # conclusion: control_allow_* start life as None, and an unread
+            # FET falls back to them, so leaving them unset publishes full
+            # configured limits alongside "discharge not allowed" - the very
+            # contradiction _fet_never_read exists to prevent. Field-observed
+            # on a mid-outage restart before this was set.
+            self.battery.control_allow_charge = self.battery.control_charge_current != 0
+            self.battery.control_allow_discharge = self.battery.control_discharge_current != 0
             return
         self.battery.manage_charge_and_discharge_current()
 
