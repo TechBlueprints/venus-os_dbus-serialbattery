@@ -328,13 +328,32 @@ async def invalidate_dbus_state():
 
 
 async def _drain_and_wait(adapter, claims_manager, drain_timeout):
-    """Take the drain claim and wait for the card to empty.
+    """Take the drain claim and wait for the card to empty, completely.
 
     Returns (drain-claim-or-None, ok). ok False means back off entirely:
-    either another process is already draining the card, or holders that
-    cannot move are still on it at the deadline. Foreign claims are the
-    veto; our own remaining claims are only waited on (our own links get
-    killed by our own choice - the wait gives them time to migrate)."""
+    either another process is already draining the card, or claims are still
+    live on it at the deadline.
+
+    EXISTING WORK ALWAYS BEATS MAINTENANCE, and there is no exception for our
+    own. The version this replaces waited on our own claims but proceeded
+    past them at the deadline, on the reasoning that our own links are ours
+    to kill and an uncoordinated reset always did. Both halves of that were
+    wrong in the same way. A reset is not a local act - cycling a card makes
+    every device on it disappear at once, in every process, and on BlueZ 5.72
+    that mass disappearance is the detonation path of the gatt-client
+    use-after-free. And "our own straggler" is exactly the claim of a
+    consumer that COULD NOT MOVE: its only working card, an operator pin.
+    Blowing up the one link a device still had, to fix a card the link
+    proves is working, was never a trade worth making.
+
+    So: zero foreign AND zero own, or the reset refuses. That is what lets
+    the reset be safe by construction rather than by care - it can only ever
+    fire on a card that emptied voluntarily. A genuinely dead card's claims
+    fail their own validity checks and self-release within a heartbeat or
+    two, so this veto does not protect a corpse; it protects a card that is
+    still carrying somebody's traffic, which is precisely the card that must
+    not be cycled.
+    """
     drain = claims_manager.claim_drain(adapter)
     if drain is None:
         logger.warning(f"bt-recovery: not resetting {adapter}: another process is already draining it")
@@ -347,20 +366,14 @@ async def _drain_and_wait(adapter, claims_manager, drain_timeout):
         if foreign == 0 and own == 0:
             return drain, True
         if time.monotonic() >= deadline:
-            if foreign:
-                holders = (claims_manager.claims().get(adapter) or {}).get("soft_owners", [])
-                logger.warning(
-                    f"bt-recovery: not resetting {adapter}: {foreign} live foreign claim(s) "
-                    f"remain after {drain_timeout:.0f}s drain ({holders or 'unnamed'})"
-                )
-                claims_manager.release(drain)
-                return None, False
-            # only our own remain: they could not migrate, and we are the
-            # one asking - proceed, as an uncoordinated reset always did
+            holders = (claims_manager.claims().get(claims.adapter_key(adapter)) or {}).get("soft_owners", [])
             logger.warning(
-                f"bt-recovery: {own} of our own claim(s) on {adapter} could not migrate, resetting anyway"
+                f"bt-recovery: not resetting {adapter}: {foreign} foreign and {own} own live "
+                f"claim(s) remain after a {drain_timeout:.0f}s drain ({holders or 'unnamed'}) - "
+                "work that could not move keeps its card"
             )
-            return drain, True
+            claims_manager.release(drain)
+            return None, False
         if not logged:
             logger.warning(
                 f"bt-recovery: draining {adapter} before reset "
@@ -370,46 +383,87 @@ async def _drain_and_wait(adapter, claims_manager, drain_timeout):
         await asyncio.sleep(_DRAIN_POLL)
 
 
-async def reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False, drain_timeout=DRAIN_TIMEOUT):
+async def reset_adapter(adapter, claims_manager=None, force=False, gone_silent=False, drain_timeout=DRAIN_TIMEOUT, probe=None):
     """Hardware-reset an adapter, coordinated through the claims convention.
 
-    With a claims_manager, a drain claim is taken first: placement steers
-    new work away, claimants that can move migrate off the card, and the
-    reset waits (up to drain_timeout) for the card to empty. Foreign claims
-    still on it at the deadline veto the reset - a holder that cannot move
-    keeps its card. drain_timeout=0 restores the old semantics: an
-    immediate foreign-claims gate with no waiting. force skips every gate -
-    for an operator who knows the card is dead.
+    With a claims_manager, a drain claim is taken first: placement refuses to
+    put new work on the card, claimants that can move migrate off it, and the
+    reset waits (up to drain_timeout) for the card to empty COMPLETELY. Any
+    live claim at the deadline - foreign or our own - vetoes the reset, so a
+    holder that cannot move keeps its card. drain_timeout=0 makes that an
+    immediate gate with no waiting.
+
+    force bypasses the EVIDENCE gates only - it is for an operator who knows
+    the card is dead and does not want to argue about strike counts. Those
+    gates live in the caller (catcher._schedule_recovery: strike count,
+    strike span, attempt budget, daemon grace), so inside this function force
+    now bypasses nothing at all, and the parameter is kept for the callers
+    that pass it. It deliberately does not bypass the in-use veto, and must
+    not: the veto is the property that makes a reset safe by construction,
+    and an override that reintroduces "cycle a card someone is using" would
+    make the one path an operator reaches for in a crisis the one path that
+    can detonate the fleet. It costs a genuinely dead card nothing - claims
+    on a dead card fail their own validity checks and self-release within a
+    heartbeat or two, so the veto never protects a corpse.
 
     gone_silent escalates the recovery (power cycle, then USB reset for USB
     adapters), matching habluetooth's watchdog flag. The reset itself
     prefers bluetooth-auto-recovery when installed and falls back to the
     stdlib-native sequence; after a success, bluetoothd is restarted if the
     reset killed it and bleak's cached D-Bus state is invalidated.
-    Returns True when a reset was performed and reported success.
+    probe, when given, is `async (adapter) -> bool`, run after the card has
+    emptied and before it is touched: probation. Emptying the card may
+    itself release what was wedged, so the card gets one real use first;
+    a truthy result means it came back on its own and the reset is
+    skipped. A card that fills up again during the probe is not reset
+    either - the in-use veto applies at the moment of reset, not just at
+    the drain deadline.
+    Returns True when a reset was performed and reported success, or when
+    the probe showed no reset was needed.
     """
     match = re.match(r"hci(\d+)$", str(adapter))
     if not match:
         logger.warning(f"bt-recovery: cannot reset '{adapter}': not an hciN adapter name")
         return False
     drain = None
-    if claims_manager is not None and not force:
-        if drain_timeout > 0:
-            drain, ok = await _drain_and_wait(adapter, claims_manager, drain_timeout)
-            if not ok:
-                return False
-        else:
-            foreign = claims_manager.foreign_use(adapter)
-            if foreign:
-                logger.warning(
-                    f"bt-recovery: not resetting {adapter}: {foreign} live claim(s) held by other processes"
-                )
-                return False
-    elif claims_manager is not None:
-        # forced: the drain claim is still worth holding while we reset so
-        # other processes do not place new work onto a card mid-reset
-        drain = claims_manager.claim_drain(adapter)
+    if claims_manager is not None:
+        # force does NOT skip this. The drain claim and the empty-card veto
+        # are what make a reset safe by construction; skipping them for a
+        # forced reset would mean the one path an operator reaches for in a
+        # crisis is the one path that can cycle a card carrying live links.
+        drain, ok = await _drain_and_wait(adapter, claims_manager, drain_timeout)
+        if not ok:
+            return False
+    else:
+        # No manager means no coordination at all: this reset cannot see
+        # other processes' claims, cannot ask them to move, and cannot be
+        # vetoed by them. Callers should pass one; say so at WARNING rather
+        # than doing it silently, because the resulting mass device removal
+        # in another process is otherwise unattributable.
+        logger.warning(
+            f"bt-recovery: resetting {adapter} UNCOORDINATED - no claims manager was passed, so "
+            "other processes' links on this card cannot be seen, drained or honoured"
+        )
     try:
+        if probe is not None:
+            try:
+                revived = bool(await probe(adapter))
+            except Exception as e:
+                logger.warning(f"bt-recovery: probe of {adapter} raised, treated as failed: {repr(e)}")
+                revived = False
+            if revived:
+                logger.warning(f"bt-recovery: {adapter} came back after draining alone - not reset")
+                try:
+                    from .catcher import forget_adapter_failures
+                    forget_adapter_failures(adapter)
+                except Exception:
+                    pass
+                return True
+            if claims_manager is not None and (
+                claims_manager.foreign_use(adapter) or claims_manager.own_use(adapter)
+            ):
+                logger.warning(f"bt-recovery: not resetting {adapter}: it filled up again during the probe")
+                return False
         logger.warning(f"bt-recovery: resetting {adapter}" + (" (gone silent)" if gone_silent else ""))
         try:
             if HAS_AUTO_RECOVERY:

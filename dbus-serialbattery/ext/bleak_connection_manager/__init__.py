@@ -23,6 +23,7 @@ _CATCHER_EXPORTS = (
     "BLEConnectionWithServiceCache",
     "BLEScanner",
     "OutOfConnectionSlotsError",
+    "DeviceNotPermitted",
     "ConnectionValidationError",
     "parse_adapter_entries",
     "rewrite_adapter_config",
