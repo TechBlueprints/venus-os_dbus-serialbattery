@@ -390,7 +390,7 @@ class FallbackBattery:
             if self._dbus_connection is None:
                 self._dbus_connection = dbus.SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ else dbus.SystemBus()
 
-            if self._device not in self._dbus_connection.list_names():
+            if not self._dbus_connection.name_has_owner(self._device):
                 return
 
             dbus_objects = {}
@@ -423,7 +423,13 @@ class FallbackBattery:
             if self._dbus_connection is None:
                 self.setup_fallback_sensor()
                 return
-            present = self._device in self._dbus_connection.list_names()
+            # NameHasOwner, not ListNames: this runs every poll cycle, and
+            # ListNames returns every name on the bus (~110 on a Cerbo) to
+            # answer a question about ONE of them. Measured at 1/s per pack
+            # driver on prod - with two packs configured, ~6% of all method
+            # calls on the box and effectively the whole recurring
+            # first-party share. Same semantics, one small reply.
+            present = bool(self._dbus_connection.name_has_owner(self._device))
             if self.dbus_fallback_objects is not None and not present:
                 logger.error("Fallback sensor was disconnected, fallback not available")
                 self.dbus_fallback_objects = None
