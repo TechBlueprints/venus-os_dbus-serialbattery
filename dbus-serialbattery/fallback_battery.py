@@ -125,6 +125,14 @@ class FallbackBattery:
     #: for a driver restart.
     STALL_MAX_REBUILDS = 2
 
+    #: How long the fallback may serve before the log says so at WARNING.
+    #: Log-only and deliberately separate from FALLBACK_BMS_CABLE_WARN_MINUTES,
+    #: which governs the D-Bus alarm: a characterised BMS mute is 10-15 s and
+    #: happens 2-8 times an hour per pack, so an ordinary mute must not print a
+    #: WARNING. Past this, the outage is no longer an ordinary mute and the log
+    #: should say so exactly once.
+    LONG_OUTAGE_LOG_SECONDS = 60
+
     #: The fallback sensor paths this wrapper can read, in probe order.
     #: The first configured one answers the "is the shunt alive?" question.
     SENSOR_KEYS = ("Voltage", "Current", "Temperature", "Soc")
@@ -162,6 +170,7 @@ class FallbackBattery:
             "_stall_rebuilds",
             "_stall_action_time",
             "_last_stall_log",
+            "_long_outage_logged",
         )
     )
 
@@ -268,6 +277,7 @@ class FallbackBattery:
         self._stall_rebuilds: int = 0
         self._stall_action_time: float = 0.0
         self._last_stall_log: float = 0.0
+        self._long_outage_logged: bool = False
 
         self._load_stash()
 
@@ -637,7 +647,14 @@ class FallbackBattery:
         """
         if fresh and not self._serving:
             if self._fallback_mode:
-                logger.info(">>> Battery responds again, leaving fallback mode <<<")
+                covered = time() - self._fallback_since if self._fallback_since is not None else 0.0
+                # The original line is preserved COMPLETE, terminator included, and
+                # the duration appended after it. The fleet watch pairs this with
+                # the entering line to measure the outage window; inserting the
+                # duration before "<<<" would have broken any matcher anchored on
+                # the full line rather than the bare substring.
+                logger.info(f">>> Battery responds again, leaving fallback mode <<< (fallback covered {covered:.1f}s, BMS mute)")
+                self._long_outage_logged = False
                 # Data provably resumed: clear the stale-data escalation
                 # before the next publish, or the cycle between leaving
                 # fallback and the next BMS read publishes a spurious
@@ -676,10 +693,19 @@ class FallbackBattery:
             self._discharge_blocked = False
             self._take_soc_anchor()
             self._take_cell_snapshot()
-            logger.warning(
-                "    Entering fallback mode: voltage/current/temperature/SoC live from the fallback sensor, "
-                "cell voltages projected from the last live reading"
-            )
+            self._long_outage_logged = False
+            # INFO, not warning: entering fallback is the expected response to a
+            # routine mute, and a WARNING would fire 2-8 times an hour per pack
+            # for the event this feature exists to absorb. Not DEBUG either:
+            # "Entering fallback mode" is a load-bearing substring for the fleet
+            # watch, which pairs it with the leaving line to measure the outage
+            # window. Prod runs at INFO, so demoting this to DEBUG does not make
+            # it quieter - it deletes the window's start from the log entirely.
+            logger.info("Entering fallback mode (BMS mute)")
+        elif self._serving and self._fallback_mode and not self._long_outage_logged and self._fallback_since is not None:
+            if time() - self._fallback_since >= self.LONG_OUTAGE_LOG_SECONDS:
+                self._long_outage_logged = True
+                logger.warning(f"Fallback still serving after {self.LONG_OUTAGE_LOG_SECONDS}s - longer than a BMS mute")
 
     def _take_soc_anchor(self) -> None:
         """
