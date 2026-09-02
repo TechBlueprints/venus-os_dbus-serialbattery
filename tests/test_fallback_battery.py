@@ -1403,6 +1403,100 @@ class TestTestConnection:
 # ── end to end through DbusHelper ────────────────────────────────────────
 
 
+class _CountingBus:
+    """Bus stub that records how many presence queries it is asked for.
+
+    The count is the point: this check runs on every poll cycle forever, so a
+    regression from NameHasOwner back to ListNames is a cost regression that no
+    behavioural assertion would notice.
+    """
+
+    def __init__(self, owned=()):
+        self.owned = set(owned)
+        self.name_has_owner_calls = 0
+        self.list_names_calls = 0
+
+    def name_has_owner(self, name):
+        self.name_has_owner_calls += 1
+        return name in self.owned
+
+    def list_names(self):  # pragma: no cover - present so a regression is visible
+        self.list_names_calls += 1
+        return list(self.owned)
+
+
+class TestFallbackSensorPresenceWatch:
+    """The shunt coming and going. Field-exercised on dev-cerbo 2026-08-28
+    05:30:14Z when the USB shunt was unplugged mid-outage; until then this
+    method had no coverage at all."""
+
+    def _wrapper_with_bus(self, monkeypatch, bus, device="com.victronenergy.battery.ttyS5"):
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT)
+        wrapper._device = device
+        wrapper._dbus_connection = bus
+        return wrapper
+
+    def test_a_vanished_sensor_is_dropped_and_says_so(self, monkeypatch, caplog):
+        bus = _CountingBus(owned=[])
+        wrapper = self._wrapper_with_bus(monkeypatch, bus)
+        wrapper.dbus_fallback_objects = {"Voltage": _FakeDbusItem(25.5)}
+
+        wrapper._watch_fallback_sensor()
+
+        assert wrapper.dbus_fallback_objects is None
+        assert "disconnected" in caplog.text
+
+    def test_a_returning_sensor_is_set_up_again(self, monkeypatch):
+        bus = _CountingBus(owned=["com.victronenergy.battery.ttyS5"])
+        wrapper = self._wrapper_with_bus(monkeypatch, bus)
+        wrapper.dbus_fallback_objects = None
+        calls = []
+        monkeypatch.setattr(FallbackBattery, "setup_fallback_sensor", lambda self: calls.append(1))
+
+        wrapper._watch_fallback_sensor()
+
+        assert calls == [1]
+
+    def test_a_present_sensor_that_was_already_set_up_is_left_alone(self, monkeypatch):
+        bus = _CountingBus(owned=["com.victronenergy.battery.ttyS5"])
+        wrapper = self._wrapper_with_bus(monkeypatch, bus)
+        objects = {"Voltage": _FakeDbusItem(25.5)}
+        wrapper.dbus_fallback_objects = objects
+        monkeypatch.setattr(FallbackBattery, "setup_fallback_sensor", lambda self: pytest.fail("re-setup a live sensor"))
+
+        wrapper._watch_fallback_sensor()
+
+        assert wrapper.dbus_fallback_objects is objects
+
+    def test_presence_costs_one_targeted_query_per_cycle_and_never_lists_the_bus(self, monkeypatch):
+        # the cost assertion. ListNames returns every name on the bus (~110 on
+        # a Cerbo) to answer a question about one of them, once per poll,
+        # per pack driver, forever.
+        bus = _CountingBus(owned=["com.victronenergy.battery.ttyS5"])
+        wrapper = self._wrapper_with_bus(monkeypatch, bus)
+        wrapper.dbus_fallback_objects = {"Voltage": _FakeDbusItem(25.5)}
+
+        for _ in range(10):
+            wrapper._watch_fallback_sensor()
+
+        assert bus.name_has_owner_calls == 10
+        assert bus.list_names_calls == 0
+
+    def test_a_bus_that_raises_does_not_take_the_driver_down(self, monkeypatch):
+        class _AngryBus:
+            def name_has_owner(self, name):
+                raise RuntimeError("bus went away")
+
+        wrapper = self._wrapper_with_bus(monkeypatch, _AngryBus())
+        objects = {"Voltage": _FakeDbusItem(25.5)}
+        wrapper.dbus_fallback_objects = objects
+
+        wrapper._watch_fallback_sensor()
+
+        # a failed probe is not evidence the sensor left
+        assert wrapper.dbus_fallback_objects is objects
+
+
 class _FakeDbusService(dict):
     """Stand-in for the VeDbusService proxy: a dict that can be entered."""
 
