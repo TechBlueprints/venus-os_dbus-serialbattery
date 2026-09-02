@@ -3,6 +3,7 @@
 entirely in FallbackBattery — a wrapper around any configured Battery."""
 
 import json
+import logging
 import os
 import sys
 
@@ -1401,6 +1402,88 @@ class TestTestConnection:
 
 
 # ── end to end through DbusHelper ────────────────────────────────────────
+
+
+class TestFallbackLoggingVolume:
+    """A characterised BMS mute is 10-15 s and happens 2-8 times an hour per
+    pack. The log must not treat the thing the feature exists to absorb as an
+    event worth a WARNING - but a genuinely long outage must still stand out."""
+
+    def test_an_ordinary_mute_prints_no_warning(self, monkeypatch, caplog):
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        caplog.set_level(logging.DEBUG)
+        _serve(wrapper)
+
+        assert wrapper._fallback_mode is True
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_the_watched_substrings_are_emitted_at_info_or_above(self, monkeypatch, caplog):
+        # These two strings are load-bearing OUTSIDE this repo: the fleet watch
+        # pairs them to measure the outage window, matching level-agnostic
+        # substrings. Prod runs at INFO, so a demotion to DEBUG does not make a
+        # line quieter - it deletes it. Renaming either string, or lowering
+        # either below INFO, silently breaks the metric with every test still
+        # green, which is why this asserts on the emitted record and not on
+        # behaviour.
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        caplog.set_level(logging.DEBUG)
+        _serve(wrapper)
+        wrapper._serving = False
+        wrapper._update_fallback_mode(fresh=True)
+
+        # the leaving line is asserted COMPLETE, terminator included: a matcher
+        # anchored on the whole line breaks if anything is inserted before "<<<",
+        # which a bare-substring assertion would not notice.
+        for substring in ("Entering fallback mode", ">>> Battery responds again, leaving fallback mode <<<"):
+            emitted = [r for r in caplog.records if substring in r.getMessage() and r.levelno >= logging.INFO]
+            assert emitted, f"{substring!r} must be emitted verbatim at INFO or above"
+
+        # and one event per line - an embedded newline splits one episode into two
+        for record in caplog.records:
+            assert "\n" not in record.getMessage()
+
+    def test_an_outage_past_the_threshold_warns_exactly_once(self, monkeypatch, caplog):
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        _serve(wrapper)
+        caplog.clear()
+        # age the episode past the log threshold
+        wrapper._fallback_since = _now() - (FallbackBattery.LONG_OUTAGE_LOG_SECONDS + 5)
+
+        for _ in range(10):
+            wrapper._update_fallback_mode(fresh=False)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, "the long-outage warning must latch, not repeat per cycle"
+        assert "longer than a BMS mute" in warnings[0].getMessage()
+
+    def test_the_recovery_line_carries_the_episode_duration(self, monkeypatch, caplog):
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        _serve(wrapper)
+        wrapper._fallback_since = _now() - 12.5
+        caplog.clear()
+
+        wrapper._serving = False
+        wrapper._update_fallback_mode(fresh=True)
+
+        line = [r.getMessage() for r in caplog.records if "leaving fallback mode" in r.getMessage()]
+        assert len(line) == 1
+        assert "12.5s" in line[0]
+
+    def test_a_second_episode_can_warn_again(self, monkeypatch, caplog):
+        # the latch is per-episode, not for the life of the process
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        _serve(wrapper)
+        wrapper._fallback_since = _now() - (FallbackBattery.LONG_OUTAGE_LOG_SECONDS + 5)
+        wrapper._update_fallback_mode(fresh=False)
+        wrapper._serving = False
+        wrapper._update_fallback_mode(fresh=True)
+        caplog.clear()
+
+        _serve(wrapper)
+        wrapper._fallback_since = _now() - (FallbackBattery.LONG_OUTAGE_LOG_SECONDS + 5)
+        wrapper._update_fallback_mode(fresh=False)
+
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 
 class _CountingBus:
