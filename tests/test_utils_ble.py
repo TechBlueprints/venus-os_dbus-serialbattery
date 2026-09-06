@@ -7,50 +7,41 @@ registered before the import so the non-BLE logic can be exercised for real.
 Everything that actually talks to a radio is left untested here.
 """
 
-import asyncio
 import configparser
 import importlib.util
+import logging
 import os
+import pytest
+import re
 import sys
 import time
 import types
 
-import pytest
-
 DRIVER_DIR = os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery")
 CONFIG_DEFAULT = os.path.join(DRIVER_DIR, "config.default.ini")
 sys.path.insert(0, DRIVER_DIR)
-# The driver puts ext on sys.path before it imports utils_ble, which is what
-# makes the vendored habluetooth discoverable there. Do the same here, so the
-# backend registry under test is the one the driver builds. Only find_spec()
-# runs against it; habluetooth itself is never imported by this suite.
-sys.path.insert(1, os.path.join(DRIVER_DIR, "ext"))
 
 if "bleak" not in sys.modules:
-    _bleak_exc = types.ModuleType("bleak.exc")
-    _bleak_exc.BleakCharacteristicNotFoundError = type("BleakCharacteristicNotFoundError", (Exception,), {})
-    _bleak_exc.BleakError = type("BleakError", (Exception,), {})
-    _bleak = types.ModuleType("bleak")
-    _bleak.BleakClient = type("BleakClient", (), {"__init__": lambda self, *a, **kw: None})
-    _bleak.BleakScanner = object
-    _bleak.exc = _bleak_exc
-    sys.modules["bleak"] = _bleak
-    sys.modules["bleak.exc"] = _bleak_exc
-
-
+    sys.modules["bleak"] = types.SimpleNamespace(BleakClient=type("BleakClient", (), {"__init__": lambda self, *a, **kw: None}))
+    sys.modules["bleak"].BleakScanner = object
+    _bleak_error = type("BleakError", (Exception,), {})
+    sys.modules["bleak"].exc = types.SimpleNamespace(
+        BleakError=_bleak_error,
+        BleakCharacteristicNotFoundError=type("BleakCharacteristicNotFoundError", (_bleak_error,), {}),
+    )
+    sys.modules["bleak.exc"] = sys.modules["bleak"].exc
 if "bleak_retry_connector" not in sys.modules:
-    # utils_ble only needs these four names; stubbing the module keeps
-    # BleakRetryBackend in supported_ble_backends so the generic backend
-    # tests below cover it as well.
+    # utils_ble only needs these four names; stubbing keeps BleakRetryBackend
+    # in supported_ble_backends so the generic backend tests cover it too.
     async def _not_under_test(*args, **kwargs):
         raise NotImplementedError
 
-    _brc = types.ModuleType("bleak_retry_connector")
-    _brc.close_stale_connections = _not_under_test
-    _brc.establish_connection = _not_under_test
-    _brc.get_device = _not_under_test
-    _brc.get_device_by_adapter = _not_under_test
-    sys.modules["bleak_retry_connector"] = _brc
+    sys.modules["bleak_retry_connector"] = types.SimpleNamespace(
+        close_stale_connections=_not_under_test,
+        establish_connection=_not_under_test,
+        get_device=_not_under_test,
+        get_device_by_adapter=_not_under_test,
+    )
 
 
 def _load_utils_ble():
@@ -88,50 +79,9 @@ def test_backend_lookup_falls_back_to_bleak_for_unknown_name():
 
 
 def test_every_supported_backend_is_selectable_by_its_class_name():
-    """The registry is keyed by class name, so every entry must resolve to itself.
-
-    A backend whose optional dependencies are missing on this machine degrades
-    to BleakBackend rather than raising - see the fallback test below. That is
-    the case for BCMBackend here, which needs a real bleak and BlueZ.
-    """
+    """The registry is keyed by class name, so every entry must resolve to itself."""
     for cls in utils_ble.supported_ble_backends:
-        resolved = utils_ble.get_ble_backend(cls.__name__)
-        assert type(resolved) is cls or type(resolved) is utils_ble.BleakBackend
-
-
-def test_bcm_backend_is_registered_and_reachable_by_name():
-    """BCMBackend must be selectable by config, whether or not it loads here."""
-    assert utils_ble.BCMBackend in utils_ble.supported_ble_backends
-    assert issubclass(utils_ble.BCMBackend, utils_ble.BleConnectionBackend)
-
-
-def test_an_unloadable_backend_degrades_to_bleak_instead_of_killing_the_driver():
-    """A backend whose dependency is missing must not take the driver down.
-
-    BCMBackend raises ImportError when bleak_connection_manager is not
-    importable; the selector has to survive that, because it runs inside
-    Syncron_Ble.__init__ on a GX device where a raised ImportError means no
-    dbus service at all.
-    """
-
-    class UnloadableBackend(utils_ble.BleConnectionBackend):
-        def __init__(self):
-            raise ImportError("dependency missing")
-
-    utils_ble.supported_ble_backends.append(UnloadableBackend)
-    try:
-        assert type(utils_ble.get_ble_backend("UnloadableBackend")) is utils_ble.BleakBackend
-    finally:
-        utils_ble.supported_ble_backends.remove(UnloadableBackend)
-
-
-def test_bcm_backend_constructs_when_its_dependency_is_importable():
-    """Where bleak_connection_manager does import, selection must return it."""
-    if not utils_ble._HAS_BCM:
-        import pytest
-
-        pytest.skip("bleak_connection_manager not importable in this environment")
-    assert type(utils_ble.get_ble_backend("BCMBackend")) is utils_ble.BCMBackend
+        assert type(utils_ble.get_ble_backend(cls.__name__)) is cls
 
 
 def test_config_default_backend_name_resolves_without_falling_back():
@@ -153,14 +103,14 @@ def test_pool_order_is_preserved():
     assert pool == ["hci2", "hci0", "hci1"]
 
 
-def test_mac_at_adapter_entries_stay_out_of_the_default_pool():
+def test_mac_at_adapter_entries_pin_and_stay_out_of_the_pool():
     pins, pool = utils_ble.parse_adapter_entries(["C8:47:8C:00:00:00@hci1", "C8:47:8C:00:00:11@hci2"])
     assert pins == {"C8:47:8C:00:00:00": ["hci1"], "C8:47:8C:00:00:11": ["hci2"]}
     # a pinned MAC is not an adapter name and must never be handed to bleak
     assert pool == []
 
 
-def test_per_battery_adapters_and_the_pool_can_be_mixed():
+def test_pins_and_pool_can_be_mixed():
     pins, pool = utils_ble.parse_adapter_entries(["hci0", "C8:47:8C:00:00:00@hci1"])
     assert pins == {"C8:47:8C:00:00:00": ["hci1"]}
     assert pool == ["hci0"]
@@ -191,15 +141,15 @@ def test_config_default_adapters_is_empty_so_the_default_adapter_is_used():
 
 
 def test_adapters_for_matches_a_pinned_device_regardless_of_case():
-    original = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1"]}
+    original = utils_ble.BLUETOOTH_ADAPTER_PINS
+    utils_ble.BLUETOOTH_ADAPTER_PINS = {"C8:47:8C:00:00:00": ["hci1"]}
     try:
         assert utils_ble.adapters_for("c8:47:8c:00:00:00") == ["hci1"]
         assert utils_ble.adapters_for("C8:47:8C:00:00:00") == ["hci1"]
         # an unpinned device falls through to the shared pool
         assert utils_ble.adapters_for("C8:47:8C:00:00:11") is None
     finally:
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original
+        utils_ble.BLUETOOTH_ADAPTER_PINS = original
 
 
 def test_hold_flag_path_normalizes_the_mac_address():
@@ -215,180 +165,6 @@ def test_hold_flag_paths_differ_per_device():
     assert utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00") != utils_ble.ble_hold_flag_path("C8:47:8C:00:00:11")
 
 
-def _bcm():
-    """A BCMBackend with its dependency check bypassed.
-
-    Only the pure adapter-selection logic is exercised through it; nothing
-    here touches bleak_connection_manager or a radio.
-    """
-    return object.__new__(utils_ble.BCMBackend)
-
-
-def test_bcm_adapter_selection_honors_a_pin_and_ignores_the_pool():
-    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1"]}
-    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci0", "hci2"]
-    try:
-        # a pinned battery may use exactly one adapter, never the pool
-        assert _bcm()._adapters("C8:47:8C:00:00:00") == ["hci1"]
-    finally:
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
-        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
-
-
-def test_bcm_adapter_selection_spreads_unpinned_devices_across_the_pool():
-    """Preference order is rotated per device, but stays a permutation of the pool."""
-    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {}
-    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci0", "hci1", "hci2"]
-    try:
-        backend = _bcm()
-        orders = {addr: backend._adapters(addr) for addr in ("C8:47:8C:00:00:00", "C8:47:8C:00:00:01", "C8:47:8C:00:00:02")}
-        for order in orders.values():
-            # every allowed adapter is still tried, only the preference moves
-            assert sorted(order) == ["hci0", "hci1", "hci2"]
-        # the rotation is by address, so different devices lead with different adapters
-        assert len({tuple(order) for order in orders.values()}) == 3
-        # and it is stable: the same address always yields the same order
-        assert backend._adapters("C8:47:8C:00:00:00") == orders["C8:47:8C:00:00:00"]
-    finally:
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
-        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
-
-
-def test_bluez_device_path_is_built_the_way_bluez_names_objects():
-    assert utils_ble._bluez_device_path("hci1", "c8:47:8c:00:00:00") == "/org/bluez/hci1/dev_C8_47_8C_00_00_00"
-
-
-def test_adapter_of_recovers_the_adapter_a_resolved_device_lives_under():
-    """The allow-list check depends on this, so a wrong answer connects via a banned adapter."""
-
-    class FakeDevice:
-        details = {"path": "/org/bluez/hci2/dev_C8_47_8C_00_00_00"}
-
-    assert utils_ble._adapter_of(FakeDevice()) == "hci2"
-
-
-def test_adapter_of_returns_none_when_the_path_is_not_a_bluez_device_path():
-    class NoPath:
-        details = {}
-
-    assert utils_ble._adapter_of(NoPath()) is None
-    assert utils_ble._adapter_of(object()) is None
-
-
-def test_breaker_only_trips_after_consecutive_half_connects():
-    backend = _bcm()
-    backend._handoff_fails = 0
-    for _ in range(utils_ble.BLE_HANDOFF_BREAKER_THRESHOLD - 1):
-        assert not backend._breaker_tripped()
-        backend._handoff_fails += 1
-    assert not backend._breaker_tripped()
-    backend._handoff_fails += 1
-    assert backend._breaker_tripped()
-
-
-def test_a_successful_handoff_clears_the_breaker_count():
-    """The count is of *consecutive* failures - one good session resets it."""
-    backend = _bcm()
-    backend._handoff_fails = utils_ble.BLE_HANDOFF_BREAKER_THRESHOLD + 2
-    assert backend._breaker_tripped()
-    backend._handoff_fails = 0
-    assert not backend._breaker_tripped()
-
-
-def _hold_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(utils_ble, "BLE_HOLD_FLAG_DIR", str(tmp_path / "tmp"))
-    return utils_ble
-
-
-def test_auto_hold_is_written_only_once_the_engagement_threshold_is_reached(tmp_path, monkeypatch):
-    _hold_dir(tmp_path, monkeypatch)
-    backend = _bcm()
-    backend._breaker_times = []
-    address = "C8:47:8C:00:00:00"
-    flag = utils_ble.ble_hold_flag_path(address)
-
-    for engagement in range(1, utils_ble.BLE_AUTO_HOLD_THRESHOLD):
-        assert backend._engage_breaker(address, now=1000.0 + engagement) is False
-        assert not os.path.exists(flag), f"held after only {engagement} engagements"
-
-    assert backend._engage_breaker(address, now=1000.0 + utils_ble.BLE_AUTO_HOLD_THRESHOLD) is True
-    assert os.path.exists(flag)
-
-
-def test_engagements_older_than_the_window_do_not_count_towards_a_storm(tmp_path, monkeypatch):
-    """A slow trickle of engagements is not the failure this is meant to catch."""
-    _hold_dir(tmp_path, monkeypatch)
-    backend = _bcm()
-    backend._breaker_times = []
-    address = "C8:47:8C:00:00:00"
-    spacing = utils_ble.BLE_AUTO_HOLD_WINDOW  # each engagement ages the previous one out
-    for engagement in range(utils_ble.BLE_AUTO_HOLD_THRESHOLD * 2):
-        assert backend._engage_breaker(address, now=1000.0 + engagement * spacing) is False
-    assert not os.path.exists(utils_ble.ble_hold_flag_path(address))
-
-
-def test_a_written_hold_starts_a_fresh_window(tmp_path, monkeypatch):
-    """Once held, earlier engagements must not immediately re-trigger a hold."""
-    _hold_dir(tmp_path, monkeypatch)
-    backend = _bcm()
-    backend._breaker_times = []
-    address = "C8:47:8C:00:00:00"
-    for engagement in range(1, utils_ble.BLE_AUTO_HOLD_THRESHOLD + 1):
-        held = backend._engage_breaker(address, now=1000.0 + engagement)
-    assert held is True
-    assert backend._breaker_times == []
-    assert backend._engage_breaker(address, now=1000.0 + utils_ble.BLE_AUTO_HOLD_THRESHOLD + 1) is False
-
-
-def test_auto_hold_writes_a_self_expiring_flag_the_reconnect_loop_recognizes(tmp_path, monkeypatch):
-    _hold_dir(tmp_path, monkeypatch)
-    address = "C8:47:8C:00:00:00"
-    assert utils_ble.write_ble_auto_hold(address) is True
-
-    flag = utils_ble.ble_hold_flag_path(address)
-    assert os.path.dirname(flag) == utils_ble.BLE_HOLD_FLAG_DIR
-    with open(flag) as f:
-        assert f.read().strip() == utils_ble.BLE_HOLD_AUTO_MARKER
-
-    # a hold that has just been written must hold, not expire immediately
-    assert utils_ble.ble_hold_expired(flag) is False
-    # and it must release itself once it has aged past the expiry
-    assert utils_ble.ble_hold_expired(flag, now=time.time() + utils_ble.BLE_HOLD_AUTO_EXPIRY + 1) is True
-
-
-def test_an_operator_hold_never_expires_by_itself(tmp_path, monkeypatch):
-    """Only automatic holds self-release; a hand-written one persists until removed."""
-    _hold_dir(tmp_path, monkeypatch)
-    address = "C8:47:8C:00:00:00"
-    flag = utils_ble.ble_hold_flag_path(address)
-    os.makedirs(utils_ble.BLE_HOLD_FLAG_DIR, exist_ok=True)
-    with open(flag, "w") as f:
-        f.write("held by clint, radio is sick")
-
-    assert utils_ble.ble_hold_expired(flag) is False
-    assert utils_ble.ble_hold_expired(flag, now=time.time() + utils_ble.BLE_HOLD_AUTO_EXPIRY * 100) is False
-
-
-def test_an_empty_hold_flag_is_treated_as_an_operator_hold(tmp_path, monkeypatch):
-    _hold_dir(tmp_path, monkeypatch)
-    flag = utils_ble.ble_hold_flag_path("C8:47:8C:00:00:00")
-    os.makedirs(utils_ble.BLE_HOLD_FLAG_DIR, exist_ok=True)
-    open(flag, "w").close()
-    assert utils_ble.ble_hold_expired(flag, now=time.time() + utils_ble.BLE_HOLD_AUTO_EXPIRY * 100) is False
-
-
-def test_an_unwritable_hold_directory_is_reported_rather_than_raised(tmp_path, monkeypatch):
-    """The auto-hold is a best effort; failing to write it must not kill the attempt."""
-    blocker = tmp_path / "not-a-dir"
-    blocker.write_text("")
-    monkeypatch.setattr(utils_ble, "BLE_HOLD_FLAG_DIR", str(blocker / "tmp"))
-    assert utils_ble.write_ble_auto_hold("C8:47:8C:00:00:00") is False
-
-
 def test_backends_implement_the_connection_interface():
     """Every backend must be usable through the seam Syncron_Ble drives."""
     for cls in utils_ble.supported_ble_backends:
@@ -397,7 +173,7 @@ def test_backends_implement_the_connection_interface():
             assert getattr(cls, method) is not getattr(utils_ble.BleConnectionBackend, method)
 
 
-def test_a_mac_repeated_gives_a_battery_several_adapters_in_order():
+def test_a_mac_repeated_pins_several_adapters_in_priority_order():
     # first entry is the primary, the rest are only tried if it cannot resolve
     pins, pool = utils_ble.parse_adapter_entries(["AA:BB@hci4", "CC:DD@hci5", "AA:BB@hci2"])
 
@@ -405,103 +181,131 @@ def test_a_mac_repeated_gives_a_battery_several_adapters_in_order():
     assert pool == []
 
 
-def test_a_repeated_adapter_for_one_battery_is_not_duplicated():
+def test_a_repeated_pin_to_the_same_adapter_is_not_duplicated():
     pins, _ = utils_ble.parse_adapter_entries(["AA:BB@hci4", "AA:BB@hci4"])
 
     assert pins == {"AA:BB": ["hci4"]}
 
 
-# ── post-connect validation ──────────────────────────────────────────────
-#
-# The manager calls this after connecting and re-reads GATT services when it
-# answers False, so what it reports decides whether a half-resolved client is
-# used or torn down. The manager's own retry ladder needs a real radio and is
-# not exercised here.
+def _configure(devices, pool):
+    utils_ble.BLUETOOTH_ADAPTER_PINS = devices
+    utils_ble.BLUETOOTH_ADAPTER_POOL = pool
 
 
-class _FakeServices:
-    def __init__(self, characteristics):
-        self._characteristics = characteristics
-
-    def get_characteristic(self, uuid):
-        return self._characteristics.get(uuid)
-
-
-class _FakeClient:
-    def __init__(self, services):
-        self.services = services
-
-
-NOTIFY_UUID = "00000003-0000-1000-8000-00805f9b34fb"
-
-
-def test_a_resolved_notify_characteristic_validates():
-    client = _FakeClient(_FakeServices({NOTIFY_UUID: object()}))
-
-    assert utils_ble.notify_characteristic_present(client, NOTIFY_UUID) is True
-
-
-def test_an_unresolved_notify_characteristic_does_not_validate():
-    # GATT discovery finished for other characteristics but not this one
-    client = _FakeClient(_FakeServices({"0000ffff-0000-1000-8000-00805f9b34fb": object()}))
-
-    assert utils_ble.notify_characteristic_present(client, NOTIFY_UUID) is False
-
-
-def test_services_not_populated_at_all_does_not_validate():
-    # connect() returned before any service discovery completed
-    assert utils_ble.notify_characteristic_present(_FakeClient(None), NOTIFY_UUID) is False
-
-
-def test_a_client_that_raises_on_lookup_does_not_validate():
-    class _Raising:
-        def get_characteristic(self, uuid):
-            raise RuntimeError("not connected")
-
-    assert utils_ble.notify_characteristic_present(_FakeClient(_Raising()), NOTIFY_UUID) is False
-
-
-def test_habluetooth_backend_is_available_from_the_vendored_copy():
-    """ext/habluetooth is what makes the backend selectable at all."""
-    assert utils_ble.HAS_HABLUETOOTH
-    assert utils_ble.HaBluetoothBackend in utils_ble.supported_ble_backends
-
-
-def test_habluetooth_backend_defers_client_creation_to_establish():
-    backend = utils_ble.get_ble_backend("HaBluetoothBackend")
-    sentinel = object()
-    assert backend.create_client("C8:47:8C:00:00:00", sentinel) is None
-    assert backend.disconnected_callback is sentinel
-
-
-def test_habluetooth_backend_scans_only_the_batterys_own_adapters():
-    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1", "hci3"]}
-    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci2"]
+def test_an_adapter_bluez_does_not_expose_is_skipped():
+    """
+    The failure this exists for: a USB reset renumbers the radios, the adapter
+    a battery is configured for stops existing, and asking BlueZ for it by
+    name fails forever. The battery has to reach its next adapter instead.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
     try:
-        backend = utils_ble.get_ble_backend("HaBluetoothBackend")
-        available = {"hci0": {}, "hci1": {}, "hci2": {}, "hci3": {}}
-        # a pinned battery never scans on anything but its own adapters
-        assert backend._adapters_to_scan("c8:47:8c:00:00:00", available) == ["hci1", "hci3"]
-        # an unpinned one uses the pool, not every adapter present
-        assert backend._adapters_to_scan("C8:47:8C:00:00:11", available) == ["hci2"]
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci6"}) == ["hci6"]
     finally:
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
-        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+        _configure(original_pins, original_pool)
 
 
-def test_habluetooth_backend_scans_every_adapter_when_unconfigured():
-    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {}
-    utils_ble.BLUETOOTH_ADAPTER_POOL = []
+def test_a_battery_is_never_stranded_when_bluez_knows_none_of_its_adapters():
+    """
+    An empty or odd answer from BlueZ must degrade to the configured order,
+    not to an empty list - refusing to attempt a connection is worse than
+    trying an adapter that may not be there.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
     try:
-        backend = utils_ble.get_ble_backend("HaBluetoothBackend")
-        assert backend._adapters_to_scan("C8:47:8C:00:00:11", {"hci0": {}, "hci1": {}}) == ["hci0", "hci1"]
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=set()) == ["hci5", "hci6"]
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci9"}) == ["hci5", "hci6"]
     finally:
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
-        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+        _configure(original_pins, original_pool)
+
+
+def test_a_battery_advances_to_its_next_adapter_after_a_failed_attempt():
+    """
+    Why multi-adapter entries exist: the preferred radio can vanish, and the
+    battery has to reach its second one or the driver blocks charging for a
+    bank that is perfectly healthy.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+    try:
+        backend = utils_ble.get_ble_backend("BleakBackend")
+        monkey = lambda address, present=None: ["hci5", "hci6"]  # noqa: E731
+        original = utils_ble.adapters_in_attempt_order
+        utils_ble.adapters_in_attempt_order = monkey
+        try:
+            assert backend._select_adapter("C8:47:8C:00:00:00") == "hci5"
+            backend.adapter_index += 1
+            assert backend._select_adapter("C8:47:8C:00:00:00") == "hci6"
+            # and round again, so a radio that comes back is reachable
+            backend.adapter_index += 1
+            assert backend._select_adapter("C8:47:8C:00:00:00") == "hci5"
+        finally:
+            utils_ble.adapters_in_attempt_order = original
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_failed_connect_is_what_advances_the_adapter():
+    import asyncio
+
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+    original = utils_ble.adapters_in_attempt_order
+    utils_ble.adapters_in_attempt_order = lambda address, present=None: ["hci5", "hci6"]
+    try:
+        backend = utils_ble.get_ble_backend("BleakBackend")
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci5"
+        try:
+            asyncio.run(backend.establish(None, "C8:47:8C:00:00:00", "char", None))
+        except Exception:
+            pass
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci6"
+    finally:
+        utils_ble.adapters_in_attempt_order = original
+        _configure(original_pins, original_pool)
+
+
+def test_a_dropped_link_reconnects_on_the_same_adapter():
+    """
+    A disconnect is not a failed attempt: the reconnect loop calls
+    create_client again without establish() having raised, and that must not
+    move the battery off a radio that is working.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+    original = utils_ble.adapters_in_attempt_order
+    utils_ble.adapters_in_attempt_order = lambda address, present=None: ["hci5", "hci6"]
+    try:
+        backend = utils_ble.get_ble_backend("BleakBackend")
+        for _ in range(5):
+            backend.create_client("C8:47:8C:00:00:00", None)
+            assert backend.current_adapter == "hci5"
+    finally:
+        utils_ble.adapters_in_attempt_order = original
+        _configure(original_pins, original_pool)
+
+
+def test_a_battery_with_its_own_adapters_never_uses_the_default_pool():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci5"]}, ["hci0", "hci1"])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci5", "hci0", "hci1"}) == ["hci5"]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_bluez_state_is_unavailable_rather_than_raising_without_dbus():
+    """utils_ble must stay importable and usable where python-dbus is absent."""
+    assert utils_ble.bluez_present_adapters() == set()
+
+
+def test_bleak_retry_backend_registers_when_the_connector_is_importable():
+    assert utils_ble.HAS_BLEAK_RETRY_CONNECTOR
+    assert utils_ble.BleakRetryBackend in utils_ble.supported_ble_backends
 
 
 def test_bleak_retry_backend_defers_client_creation_to_establish():
@@ -511,402 +315,778 @@ def test_bleak_retry_backend_defers_client_creation_to_establish():
     assert backend.disconnected_callback is sentinel
 
 
-def test_bleak_retry_backend_selects_the_batterys_first_adapter():
-    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1", "hci4"]}
-    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci2", "hci3"]
+def test_bleak_retry_backend_rotates_after_a_failed_attempt():
+    import asyncio
+
+    original = utils_ble.adapters_in_attempt_order
+    utils_ble.adapters_in_attempt_order = lambda address, present=None: ["hci5", "hci6"]
     try:
         backend = utils_ble.get_ble_backend("BleakRetryBackend")
-        backend.create_client("c8:47:8c:00:00:00", None)
-        # the first pin is the one connections go out on
-        assert backend.current_adapter == "hci1"
-
-        backend = utils_ble.get_ble_backend("BleakRetryBackend")
-        backend.create_client("C8:47:8C:00:00:11", None)
-        assert backend.current_adapter == "hci2"
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci5"
+        try:
+            asyncio.run(backend.establish(None, "C8:47:8C:00:00:00", "char", None))
+        except Exception:
+            pass
+        backend.create_client("C8:47:8C:00:00:00", None)
+        assert backend.current_adapter == "hci6"
     finally:
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
-        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
+        utils_ble.adapters_in_attempt_order = original
 
 
-def test_bleak_retry_backend_rotates_the_pool_after_a_failed_attempt():
-    original_pins = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    original_pool = utils_ble.BLUETOOTH_ADAPTER_POOL
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {}
-    utils_ble.BLUETOOTH_ADAPTER_POOL = ["hci2", "hci3"]
-    try:
-        backend = utils_ble.get_ble_backend("BleakRetryBackend")
-        backend.create_client("C8:47:8C:00:00:11", None)
-        assert backend.current_adapter == "hci2"
-        # the stubbed bleak_retry_connector raises NotImplementedError, which
-        # counts as a failed attempt and must advance the pool index
-        with pytest.raises(NotImplementedError):
-            asyncio.run(backend.establish(None, "C8:47:8C:00:00:11", "char", None))
-        backend.create_client("C8:47:8C:00:00:11", None)
-        assert backend.current_adapter == "hci3"
-    finally:
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_pins
-        utils_ble.BLUETOOTH_ADAPTER_POOL = original_pool
-
-
-def test_the_retry_connector_establish_is_not_shadowed_by_the_managers():
+def test_the_retry_connector_establish_is_aliased_against_shadowing():
     """
-    bleak_connection_manager and habluetooth both bring an establish_connection
-    of their own, and bleak_connection_manager's is imported later in the module
-    than the retry connector's. An unaliased import would leave BleakRetryBackend
-    silently calling BCM's function with the wrong signature, which no other test
-    here would catch because none of them reach the connect path.
+    Managed backends stacked on this branch import establish_connection from
+    their own library later in the module; the alias is what keeps this
+    backend calling the right one, and no other test reaches the connect path.
     """
     assert utils_ble.retry_establish_connection is sys.modules["bleak_retry_connector"].establish_connection
 
 
-def _configure(devices, pool):
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = devices
-    utils_ble.BLUETOOTH_ADAPTER_POOL = pool
+# --------- subscribing before BlueZ has the whole GATT tree ---------
+#
+# BlueZ can report a device's services as resolved while its own view of the
+# tree is still incomplete, so start_notify raises for a characteristic the
+# battery genuinely has and the driver reconnects forever against working
+# hardware. Observed on a Cerbo GX with the same vendored bleak this branch
+# ships, so reading the connect path as safe is not enough.
 
 
-@pytest.mark.parametrize("backend_name", ["BleakBackend", "BleakRetryBackend"])
-def test_a_battery_advances_to_its_next_adapter_after_a_failed_attempt(backend_name):
-    """
-    The reason multi-pin exists: the preferred radio can vanish (USB renumbering
-    after a reset), and the battery has to reach its second pin or the driver
-    blocks charging for a bank that is perfectly healthy.
-    """
-    original_pins, original_pool = utils_ble.BLUETOOTH_DEVICE_ADAPTERS, utils_ble.BLUETOOTH_ADAPTER_POOL
-    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+class _GattClient:
+    """A client whose characteristic only appears after N tree rebuilds."""
+
+    def __init__(self, appears_after=0, backend=None):
+        self.appears_after = appears_after
+        self.rebuilds = 0
+        self.subscribed = None
+        self.dropped_before_rebuild = None
+        if backend is not None:
+            self._backend = backend
+        else:
+            self._backend = types.SimpleNamespace(services=object(), _get_services=self._rebuild)
+
+    async def _rebuild(self):
+        self.dropped_before_rebuild = self._backend.services is None
+        self.rebuilds += 1
+        self._backend.services = object()
+
+    async def start_notify(self, char, callback):
+        if self.rebuilds < self.appears_after:
+            raise _CharacteristicNotFound(char)
+        self.subscribed = (char, callback)
+
+
+_CharacteristicNotFound = sys.modules["bleak.exc"].BleakCharacteristicNotFoundError
+
+
+def test_a_resolved_characteristic_is_subscribed_without_rebuilding_anything():
+    """The common case must not pay for the recovery: no rebuild, no sleep."""
+    import asyncio
+
+    client = _GattClient(appears_after=0)
+    asyncio.run(utils_ble.start_notify_when_resolved(client, "char", "callback"))
+    assert client.subscribed == ("char", "callback")
+    assert client.rebuilds == 0
+
+
+def test_a_missing_characteristic_rebuilds_the_tree_and_subscribes():
+    import asyncio
+
+    original = utils_ble.GATT_REDISCOVERY_SETTLE
+    utils_ble.GATT_REDISCOVERY_SETTLE = 0
     try:
-        backend = utils_ble.get_ble_backend(backend_name)
-        assert backend._select_adapter("C8:47:8C:00:00:00") == "hci5"
-        backend.adapter_index += 1
-        assert backend._select_adapter("C8:47:8C:00:00:00") == "hci6"
-        # and round again, so a pin that comes back is reachable
-        backend.adapter_index += 1
-        assert backend._select_adapter("C8:47:8C:00:00:00") == "hci5"
+        client = _GattClient(appears_after=1)
+        asyncio.run(utils_ble.start_notify_when_resolved(client, "char", "callback"))
+    finally:
+        utils_ble.GATT_REDISCOVERY_SETTLE = original
+    assert client.subscribed == ("char", "callback")
+    assert client.rebuilds == 1
+
+
+def test_the_rebuild_drops_the_stale_tree_first():
+    """
+    _get_services returns the collection it already holds, so a rebuild that
+    does not drop it first is a no-op that looks like a retry.
+    """
+    import asyncio
+
+    client = _GattClient()
+    asyncio.run(utils_ble.rediscover_services(client, "char"))
+    assert client.dropped_before_rebuild is True
+
+
+def test_a_characteristic_that_never_appears_gives_up_instead_of_looping():
+    import asyncio
+
+    original = utils_ble.GATT_REDISCOVERY_SETTLE
+    utils_ble.GATT_REDISCOVERY_SETTLE = 0
+    try:
+        client = _GattClient(appears_after=99)
+        try:
+            asyncio.run(utils_ble.start_notify_when_resolved(client, "char", "callback"))
+            raise AssertionError("a characteristic that is really absent must surface")
+        except _CharacteristicNotFound:
+            pass
+    finally:
+        utils_ble.GATT_REDISCOVERY_SETTLE = original
+    assert client.rebuilds == utils_ble.GATT_REDISCOVERY_ATTEMPTS - 1
+
+
+def test_a_bleak_that_moves_the_rebuild_call_fails_loudly():
+    """
+    The rebuild reaches into bleak's backend because bleak exposes no public
+    way to discard a resolved tree. A bleak that renames it must raise here,
+    not quietly stop rediscovering and restore the endless reconnect.
+    """
+    import asyncio
+
+    client = _GattClient(appears_after=99, backend=types.SimpleNamespace())
+    try:
+        asyncio.run(utils_ble.rediscover_services(client, "char"))
+        raise AssertionError("a missing backend call must be reported, not ignored")
+    except utils_ble.BleakError as e:
+        assert "_get_services" in str(e)
+
+
+def test_neither_backend_subscribes_without_the_rebuild_guard():
+    """
+    Both backends reach start_notify by the same route, so a fix applied to
+    one of them ships a half fix that looks repaired and fails on the other.
+    """
+    import inspect
+
+    for backend in (utils_ble.BleakBackend, utils_ble.BleakRetryBackend):
+        source = inspect.getsource(backend._establish)
+        assert "start_notify_when_resolved(" in source
+        assert "client.start_notify(" not in source
+
+
+# --------- which adapter the link actually landed on ---------
+#
+# The adapter a backend asks for and the one the link comes up on are not the
+# same thing: bleak-retry-connector swaps in BlueZ's already-connected copy
+# when a link lingers on another card, so state keyed to the request then
+# describes the wrong radio.
+
+
+def _client_on(path):
+    return types.SimpleNamespace(_backend=types.SimpleNamespace(_device_path=path))
+
+
+def test_the_landed_adapter_comes_from_bluez_s_own_object_path():
+    assert utils_ble.landed_adapter(_client_on("/org/bluez/hci3/dev_C8_47_8C_00_00_00")) == "hci3"
+
+
+def test_a_two_digit_adapter_is_not_truncated():
+    """hci1 must never be read out of hci10 - the box has ten radios."""
+    assert utils_ble.landed_adapter(_client_on("/org/bluez/hci10/dev_C8_47_8C_00_00_00")) == "hci10"
+
+
+def test_an_unreadable_path_is_unknown_rather_than_the_requested_name():
+    """
+    A bleak that moves the attribute must degrade to "we cannot tell", never
+    to "it landed where we asked" - the second is a lie the log would repeat.
+    """
+    assert utils_ble.landed_adapter(_client_on(None)) is None
+    assert utils_ble.landed_adapter(types.SimpleNamespace()) is None
+    assert utils_ble.landed_adapter(_client_on("/org/bluez/dev_C8_47_8C_00_00_00")) is None
+
+
+def test_the_landed_adapter_replaces_the_requested_one_in_backend_state():
+    backend = utils_ble.get_ble_backend("BleakBackend")
+    backend.current_adapter = "hci5"
+    landed = backend._record_landed(_client_on("/org/bluez/hci3/dev_C8_47_8C_00_00_00"))
+    assert landed == "hci3"
+    assert backend.current_adapter == "hci3"
+    # the request is kept, because the two differing is the signal
+    assert backend.requested_adapter == "hci5"
+
+
+def test_an_unknown_landing_leaves_the_requested_adapter_alone():
+    backend = utils_ble.get_ble_backend("BleakBackend")
+    backend.current_adapter = "hci5"
+    assert backend._record_landed(types.SimpleNamespace()) is None
+    assert backend.current_adapter == "hci5"
+    assert backend.landed_adapter_name is None
+
+
+def test_only_the_scanning_backend_reports_that_it_scans():
+    """
+    A scan count of zero means "cache hit every time" on a backend that can
+    scan, and nothing at all on one that cannot; the two must be tellable
+    apart or the count is unreadable.
+    """
+    assert utils_ble.get_ble_backend("BleakRetryBackend").scans_devices is True
+    assert utils_ble.get_ble_backend("BleakBackend").scans_devices is False
+
+
+# --------- a pin that stops being honoured says so ---------
+#
+# Dropping unresolvable MAC entries is correct - a MAC is not a name bleak
+# can use - but the effect is that an explicit pin quietly stops applying and
+# the battery goes out on whatever radio is left. That is the failure the
+# option exists to prevent, arriving by a different route.
+
+PINNED = "C8:47:8C:00:00:00"
+
+
+def _pin(mac_entries, pool=None):
+    utils_ble._unpinned_devices.discard(PINNED)
+    _configure({PINNED: list(mac_entries)}, list(pool or []))
+
+
+def test_a_pin_that_resolves_to_nothing_is_warned_about(caplog):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            assert utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"}) == []
+        assert "adapter pins for C8:47:8C:00:00:00 are not being honoured" in caplog.messages[0]
+        assert "00:1A:7D:DA:71:13" in caplog.messages[0]
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_the_warning_is_not_repeated_on_every_attempt(caplog):
+    """A battery on the 6 s ramp would repeat it ten times a minute."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            for _ in range(10):
+                utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+        assert len(caplog.messages) == 1
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_a_pin_that_comes_back_is_warned_about_again_if_it_goes(caplog):
+    """The warning marks a transition, so a second loss must be reported."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+            # the card comes back
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci3": "00:1A:7D:DA:71:13"})
+            # and goes again
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+        assert len(caplog.messages) == 2
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_an_unresolvable_hci_name_is_not_a_dropped_pin(caplog):
+    """
+    hciN entries are returned unfiltered when nothing resolves - that is the
+    deliberate no-strand fallback, not a pin being lost, and warning about it
+    would fire on every box whose adapters are simply not enumerable.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["hci7"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            assert utils_ble.adapters_in_attempt_order(PINNED, present=set()) == ["hci7"]
+        assert caplog.messages == []
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+# --------- one line per episode, not three per attempt ---------
+#
+# A characterised BMS radio mute lasts 10-20 s, happens a few times an hour
+# per battery, and the fallback covers it. Narrating every attempt made those
+# three lines the bulk of the log and taught readers to skip the word ERROR.
+
+
+class _EpisodeBattery(utils_ble.Syncron_Ble):
+    """A Syncron_Ble with the threads left out, so the accounting can be driven directly."""
+
+    def __init__(self, backend):
+        self.address = "C8:47:8C:00:00:00"
+        self.backend = backend
+        self._reset_counters()
+
+
+def _scanning_backend(scans=0):
+    return types.SimpleNamespace(scans_devices=True, scans=scans, current_adapter="hci5", landed_adapter_name="hci3")
+
+
+def _plain_backend():
+    return types.SimpleNamespace(scans_devices=False, current_adapter="hci5", landed_adapter_name="hci5")
+
+
+def _adapters_named():
+    return {"hci3": "00:01:95:C9:B4:C6", "hci5": "00:01:95:C9:B2:EA"}
+
+
+def test_an_adapter_is_described_by_both_names_it_answers_to():
+    assert utils_ble.describe_adapter("hci3", _adapters_named()) == "hci3 (00:01:95:C9:B4:C6)"
+
+
+def test_an_adapter_whose_identity_cannot_be_read_says_so():
+    """
+    Silence here would mean pins are not being honoured and nothing said so;
+    the string is the signal, not a cosmetic fallback.
+    """
+    assert utils_ble.describe_adapter("hci7", _adapters_named()) == "hci7 (MAC unresolved)"
+
+
+def test_the_scans_token_is_absent_when_the_backend_cannot_scan():
+    """Absent means "not applicable"; a printed 0 would mean "never needed to"."""
+    assert "scans" not in _EpisodeBattery(_plain_backend())._counters()
+    assert "0 scans" in _EpisodeBattery(_scanning_backend())._counters()
+
+
+def test_the_counters_are_the_episode_s_not_the_process_s(monkeypatch):
+    backend = _scanning_backend(scans=40)
+    battery = _EpisodeBattery(backend)
+    battery._attempts = 7
+    battery._begin_episode()
+    backend.scans = 43
+    battery._attempts = 2
+    assert battery._counters() == "2 attempts, 3 scans"
+
+
+def test_a_recovered_link_reports_the_episode_once(monkeypatch, caplog):
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    backend = _scanning_backend(scans=5)
+    battery = _EpisodeBattery(backend)
+    battery._first_link_reported = True
+    battery._begin_episode()
+    battery._attempts = 3
+    backend.scans = 8
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery._report_link_up()
+    line = "\n".join(caplog.messages)
+    assert "BLE link recovered for C8:47:8C:00:00:00" in line
+    assert "on adapter hci3 (00:01:95:C9:B4:C6)" in line
+    # the link dropped from the adapter it was actually on, not the one requested
+    assert "dropped from adapter hci3 (00:01:95:C9:B4:C6)" in line
+    assert "3 attempts, 3 scans" in line
+    # and the episode is closed, so nothing repeats it
+    assert battery._episode_started is None
+
+
+def test_the_first_link_of_a_life_is_reported_and_is_not_a_recovery(caplog, monkeypatch):
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery._report_link_up()
+    assert "connected to bluetooth device C8:47:8C:00:00:00" in caplog.messages[0]
+    assert "recovered" not in caplog.messages[0]
+
+
+def test_an_episode_that_ends_without_recovery_still_reports(caplog, monkeypatch):
+    """
+    The reconnect loop never gives up, so these two are the only non-recovery
+    endings there are: a rebuild abandons the generation, or a hold stops it.
+    """
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    battery._begin_episode()
+    battery._attempts = 12
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery._end_episode("abandoned")
+    assert "BLE link abandoned for C8:47:8C:00:00:00" in caplog.messages[0]
+    assert "12 attempts" in caplog.messages[0]
+    assert battery._episode_started is None
+
+
+def test_a_short_outage_says_nothing_while_it_is_open(caplog, monkeypatch):
+    """Every ordinary mute must pass in silence, or the directive achieved nothing."""
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    battery._begin_episode()
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        for _ in range(50):
+            battery._report_episode_still_open()
+    assert caplog.messages == []
+
+
+def test_a_long_outage_reports_on_a_cadence(caplog, monkeypatch):
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    battery._begin_episode()
+    battery._attempts = 60
+    battery._episode_report_due = time.time() - 1
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery._report_episode_still_open()
+        # immediately again: the cadence must have re-armed, not re-fired
+        battery._report_episode_still_open()
+    assert len(caplog.messages) == 1
+    assert "still reconnecting to C8:47:8C:00:00:00" in caplog.messages[0]
+    assert "60 attempts" in caplog.messages[0]
+    assert "requested adapter hci5 (00:01:95:C9:B2:EA)" in caplog.messages[0]
+
+
+def test_bleak_s_bluez_gone_warning_is_filtered_and_nothing_else_is():
+    filt = utils_ble.silence_bluez_gone_warning()
+
+    def record(msg):
+        return logging.LogRecord("bleak.backends.bluezdbus.client", logging.WARNING, __file__, 1, msg, None, None)
+
+    assert filt.filter(record("Failed to cancel connection (/org/bluez/hci3/dev_X): ServiceUnknown")) is False
+    # a real teardown failure, and an unrelated warning, both survive
+    assert filt.filter(record("Failed to cancel connection (/org/bluez/hci3/dev_X): TimedOut")) is True
+    assert filt.filter(record("ServiceUnknown while connecting")) is True
+
+
+def test_installing_the_filter_twice_does_not_stack_it():
+    first = utils_ble.silence_bluez_gone_warning()
+    assert utils_ble.silence_bluez_gone_warning() is first
+
+
+# --------- log lines a watch depends on ---------
+#
+# These strings are matched by scripts outside this repo. A level demotion
+# deletes a line from a watch running at INFO just as surely as a reword
+# does, and it is invisible to every other test in this file - which is why
+# it needs one of its own.
+
+WATCHED_LINES = (
+    # the disconnect event: episode boundaries are counted from it. Upstream's
+    # spelling, deliberately unfixed - the watch matches this text.
+    "bluetooh device with address",
+    # the episode summary that replaced the per-attempt narration
+    "BLE link recovered for",
+    # the still-down report during a long outage
+    "still reconnecting to",
+    # the once-per-life line that says the link came up at all
+    "connected to bluetooth device",
+    # the once-per-generation line naming the backend, which is what makes an
+    # absent scan count readable
+    "BLE thread for",
+)
+
+
+def _utils_ble_source():
+    with open(os.path.join(DRIVER_DIR, "utils_ble.py"), encoding="utf-8") as f:
+        return f.read()
+
+
+def _emitting_methods(source, watched):
+    """The logger method enclosing every occurrence of a watched string.
+
+    Scans back from the string to the logger call that contains it, rather
+    than looking for both on one line: the formatter wraps a long call across
+    lines, and a line-by-line scan would find no logger call at all and pass
+    by finding nothing.
+    """
+    methods = []
+    start = 0
+    while True:
+        found = source.find(watched, start)
+        if found == -1:
+            return methods
+        start = found + 1
+        call = source.rfind("logger.", 0, found)
+        if call != -1:
+            methods.append(source[call:].split("(", 1)[0])
+
+
+def test_watched_lines_are_emitted_at_info_or_above():
+    source = _utils_ble_source()
+    for watched in WATCHED_LINES:
+        methods = _emitting_methods(source, watched)
+        assert methods, f"watched string {watched!r} is no longer logged anywhere"
+        for method in methods:
+            assert method != "logger.debug", (
+                f"{watched!r} is logged at DEBUG, which deletes it from a watch running at INFO. " "Re-key the watch before demoting it."
+            )
+
+
+def test_no_watched_line_spans_more_than_one_record():
+    """
+    The consumer treats one line as one event, so an embedded newline splits
+    a single event into two and corrupts every count derived from it.
+    """
+    source = _utils_ble_source()
+    for watched in WATCHED_LINES:
+        for match in re.finditer(re.escape(watched), source):
+            statement = source[source.rfind("logger.", 0, match.start()) : match.end()]
+            assert "\\n" not in statement, f"watched log line {watched!r} contains an embedded newline"
+
+
+# --------- adapter pinning by MAC ---------
+#
+# hciN numbering is assigned in probe order: a reboot or USB reset can renumber
+# the dongles, silently re-pointing every pin at different hardware while the
+# batteries still connect and nothing looks wrong. An adapter's MAC does not
+# move, so configuration may name that instead and be resolved against live
+# BlueZ state.
+
+ADAPTERS = {"hci3": "00:1A:7D:DA:71:13", "hci4": "00:1A:7D:DA:71:14"}
+
+
+def test_a_mac_entry_resolves_to_the_adapters_current_name():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:14"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci4"]
     finally:
         _configure(original_pins, original_pool)
 
 
-@pytest.mark.parametrize("backend_name", ["BleakBackend", "BleakRetryBackend"])
-def test_a_failed_connect_is_what_advances_the_adapter(backend_name):
-    original_pins, original_pool = utils_ble.BLUETOOTH_DEVICE_ADAPTERS, utils_ble.BLUETOOTH_ADAPTER_POOL
-    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+def test_a_mac_pin_follows_its_adapter_across_renumbering():
+    """The whole point: the same config resolves to whatever number the
+    dongle currently answers to."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:13"]}, [])
     try:
-        backend = utils_ble.get_ble_backend(backend_name)
-        backend.create_client("C8:47:8C:00:00:00", None)
-        assert backend.current_adapter == "hci5"
-        # the stubs raise, which is a failed attempt
-        with pytest.raises(Exception):
-            asyncio.run(backend.establish(None, "C8:47:8C:00:00:00", "char", None))
-        backend.create_client("C8:47:8C:00:00:00", None)
-        assert backend.current_adapter == "hci6"
+        before = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci3": "00:1A:7D:DA:71:13"})
+        after = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci0": "00:1A:7D:DA:71:13"})
+        assert before == ["hci3"]
+        assert after == ["hci0"]
     finally:
         _configure(original_pins, original_pool)
 
 
-@pytest.mark.parametrize("backend_name", ["BleakBackend", "BleakRetryBackend"])
-def test_a_dropped_link_reconnects_on_the_same_adapter(backend_name):
-    """
-    A disconnect is not a failed attempt. The reconnect loop calls create_client
-    again without establish() having raised, and that must not move the battery
-    off a radio that is working - only a failed connect does.
-    """
-    original_pins, original_pool = utils_ble.BLUETOOTH_DEVICE_ADAPTERS, utils_ble.BLUETOOTH_ADAPTER_POOL
-    _configure({"C8:47:8C:00:00:00": ["hci5", "hci6"]}, [])
+def test_mac_matching_ignores_case():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1a:7d:da:71:13"]}, [])
     try:
-        backend = utils_ble.get_ble_backend(backend_name)
-        backend.create_client("C8:47:8C:00:00:00", None)
-        assert backend.current_adapter == "hci5"
-        for _ in range(5):
-            backend.create_client("C8:47:8C:00:00:00", None)
-            assert backend.current_adapter == "hci5"
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci3"]
     finally:
         _configure(original_pins, original_pool)
 
 
-@pytest.mark.parametrize("backend_name", ["BleakBackend", "BleakRetryBackend"])
-def test_a_battery_with_its_own_adapters_never_uses_the_default_pool(backend_name):
-    original_pins, original_pool = utils_ble.BLUETOOTH_DEVICE_ADAPTERS, utils_ble.BLUETOOTH_ADAPTER_POOL
-    _configure({"C8:47:8C:00:00:00": ["hci5"]}, ["hci0", "hci1"])
+def test_hci_and_mac_entries_mix_and_keep_their_order():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:14", "hci3"]}, [])
     try:
-        backend = utils_ble.get_ble_backend(backend_name)
-        # exhausting the single pin wraps back onto itself, never onto the pool
-        for i in range(4):
-            backend.adapter_index = i
-            assert backend._select_adapter("C8:47:8C:00:00:00") == "hci5"
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci4", "hci3"]
     finally:
         _configure(original_pins, original_pool)
 
 
-# ---------------------------------------------------------------------------
-# /run/bt-claims adapter claims (bt_claims.py)
+def test_a_mac_whose_adapter_is_gone_is_dropped():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99", "hci3"]}, [])
+    try:
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == ["hci3"]
+    finally:
+        _configure(original_pins, original_pool)
 
 
-def _manager(tmp_path, owner="svc-a"):
-    from bt_claims import ClaimManager
-
-    return ClaimManager(owner=owner, claim_dir=str(tmp_path))
-
-
-def _age(path, seconds):
-    old = time.time() - seconds
-    os.utime(path, (old, old))
-
-
-def test_a_hard_claim_is_exclusive_and_a_racing_claimant_loses(tmp_path):
-    a = _manager(tmp_path, "scanner-a")
-    b = _manager(tmp_path, "scanner-b")
-    claim = a.claim_hard("hci4")
-    assert claim is not None
-    assert b.claim_hard("hci4") is None
-    a.release(claim)
-    reclaimed = b.claim_hard("hci4")
-    assert reclaimed is not None
-    b.release(reclaimed)
-
-
-def test_a_stale_hard_claim_is_reaped_and_taken(tmp_path):
-    """A dead scanner must not hold its card forever: dead pid + old mtime = free."""
-    a = _manager(tmp_path)
-    path = os.path.join(str(tmp_path), "hci4.scan")
-    with open(path, "w") as f:
-        f.write("99999999 dead-scanner 0\n")
-    _age(path, 3600)
-    claim = a.claim_hard("hci4")
-    assert claim is not None
-    a.release(claim)
-
-
-def test_a_crashed_holders_claim_is_dead_immediately_not_after_the_ttl(tmp_path):
+def test_only_unresolvable_macs_degrade_to_the_default_adapter_not_to_garbage():
     """
-    The pid check is what makes crash detection instant: a dead process with
-    a still-fresh heartbeat file must not hold its card for the TTL tail.
+    A MAC is not a name bleak can use. Where an unresolvable hciN list is
+    handed back unfiltered (better to try than to refuse), an unresolvable MAC
+    list must come back empty so the caller falls back to the system default
+    adapter instead of passing a MAC into the connect.
     """
-    b = _manager(tmp_path, "scanner-b")
-    path = os.path.join(str(tmp_path), "hci4.scan")
-    with open(path, "w") as f:
-        f.write("99999999 crashed-scanner 0\n")  # dead pid, fresh mtime
-    taken = b.claim_hard("hci4")
-    assert taken is not None
-    b.release(taken)
-
-
-def test_a_wedged_but_alive_holder_loses_its_claim_after_the_ttl(tmp_path):
-    """
-    Liveness needs BOTH a running pid and a fresh heartbeat. A hung scanner
-    that stops beating must not hold its card forever; the TTL is the bound
-    on how long a wedge can monopolize an adapter.
-    """
-    a = _manager(tmp_path, "scanner-a")
-    b = _manager(tmp_path, "scanner-b")
-    claim = a.claim_hard("hci4")
-    _age(claim.path, 3600)  # pid alive, heartbeat long overdue
-    taken = b.claim_hard("hci4")
-    assert taken is not None
-    b.release(taken)
-
-
-def test_placement_avoids_a_hard_claimed_adapter(tmp_path):
-    scanner = _manager(tmp_path, "scanner")
-    battery = _manager(tmp_path, "battery")
-    hard = scanner.claim_hard("hci1")
-    adapter, claim = battery.choose(["hci1", "hci2"])
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99"]}, [])
     try:
-        assert adapter == "hci2"
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == []
     finally:
-        battery.release(claim)
-        scanner.release(hard)
+        _configure(original_pins, original_pool)
 
 
-def test_placement_prefers_the_less_claimed_adapter(tmp_path):
-    other = _manager(tmp_path, "other-service")
-    battery = _manager(tmp_path, "battery")
-    theirs = other.claim_soft("hci1")
-    adapter, claim = battery.choose(["hci1", "hci2"])
+def test_the_pool_accepts_macs_too():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["00:1A:7D:DA:71:14"])
     try:
-        assert adapter == "hci2"
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:11", present=ADAPTERS) == ["hci4"]
     finally:
-        battery.release(claim)
-        other.release(theirs)
+        _configure(original_pins, original_pool)
 
 
-def test_soft_claims_share_when_there_is_no_alternative(tmp_path):
-    """Soft means soft: a fully-claimed world ranks, it never refuses."""
-    other = _manager(tmp_path, "other-service")
-    battery = _manager(tmp_path, "battery")
-    held = [other.claim_soft("hci1"), other.claim_soft("hci2")]
-    adapter, claim = battery.choose(["hci1", "hci2"])
+def test_is_adapter_mac_distinguishes_the_two_forms():
+    assert utils_ble.is_adapter_mac("00:1A:7D:DA:71:13")
+    assert utils_ble.is_adapter_mac(" 00:1a:7d:da:71:13 ")
+    assert not utils_ble.is_adapter_mac("hci0")
+    assert not utils_ble.is_adapter_mac("00:1A:7D:DA:71")
+    assert not utils_ble.is_adapter_mac("")
+
+
+# --------- writing adapter MACs back to the config ---------
+
+
+def _write_config(tmp_path, body):
+    p = tmp_path / "config.ini"
+    p.write_text(body)
+    return str(p)
+
+
+def test_hci_names_are_rewritten_to_macs_with_a_comment(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["hci3"]}, [])
+    cfg = _write_config(tmp_path, "[DEFAULT]\nBLUETOOTH_ADAPTERS = C8:47:8C:00:00:00@hci3\n")
     try:
-        assert adapter in ("hci1", "hci2")
-        assert claim is not None
+        assert utils_ble.pin_adapters_by_mac(cfg, adapters=ADAPTERS) is True
+        text = open(cfg).read()
+        assert "C8:47:8C:00:00:00@00:1A:7D:DA:71:13" in text
+        assert "hci3 was detected as 00:1A:7D:DA:71:13" in text
+        # the comment must be a comment, above the line it explains
+        lines = text.splitlines()
+        note = next(i for i, ln in enumerate(lines) if "was detected as" in ln)
+        assert lines[note].lstrip().startswith(";")
+        assert lines[note + 1].startswith("BLUETOOTH_ADAPTERS")
     finally:
-        battery.release(claim)
-        for h in held:
-            other.release(h)
+        _configure(original_pins, original_pool)
 
 
-def test_a_hard_claim_never_keeps_a_battery_off_the_air(tmp_path):
-    scanner = _manager(tmp_path, "scanner")
-    battery = _manager(tmp_path, "battery")
-    hard = scanner.claim_hard("hci1")
-    adapter, claim = battery.choose(["hci1"])
+def test_rewriting_leaves_every_other_line_alone(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["hci3"])
+    body = "[DEFAULT]\n; a comment about hci3 that must not change\nMAX_BATTERY_CHARGE_CURRENT = 50.0\nBLUETOOTH_ADAPTERS = hci3\n"
+    cfg = _write_config(tmp_path, body)
     try:
-        assert adapter == "hci1"
+        utils_ble.pin_adapters_by_mac(cfg, adapters=ADAPTERS)
+        text = open(cfg).read()
+        assert "; a comment about hci3 that must not change" in text
+        assert "MAX_BATTERY_CHARGE_CURRENT = 50.0" in text
     finally:
-        battery.release(claim)
-        scanner.release(hard)
+        _configure(original_pins, original_pool)
 
 
-def test_an_unusable_claim_directory_degrades_to_uncoordinated(tmp_path):
-    from bt_claims import ClaimManager
-
-    m = ClaimManager(owner="battery", claim_dir="/proc/definitely/not/writable")
-    adapter, claim = m.choose(["hci1", "hci2"])
-    assert adapter == "hci1"
-    assert claim is None
-
-
-def test_claim_files_carry_pid_service_and_since(tmp_path):
-    m = _manager(tmp_path, "svc")
-    claim = m.claim_soft("hci1")
+def test_hci1_is_not_matched_inside_hci10(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["hci1"])
+    cfg = _write_config(tmp_path, "[DEFAULT]\nBLUETOOTH_ADAPTERS = hci10, hci1\n")
     try:
-        with open(claim.path) as f:
-            pid, service, since = f.read().split()
-        assert int(pid) == os.getpid()
-        assert int(since) > 0
+        utils_ble.pin_adapters_by_mac(cfg, adapters={"hci1": "00:1A:7D:DA:71:13", "hci10": "00:1A:7D:DA:71:99"})
+        text = open(cfg).read()
+        assert "hci10, 00:1A:7D:DA:71:13" in text
     finally:
-        m.release(claim)
+        _configure(original_pins, original_pool)
 
 
-def test_backend_reuses_its_claim_so_a_drop_reconnects_on_the_same_adapter(tmp_path):
-    original_devs = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1", "hci2"]}
-    backend = utils_ble.get_ble_backend("BleakRetryBackend")
-    backend._claims = _manager(tmp_path, "battery")
+def test_a_dead_controller_is_never_written_back(tmp_path):
+    """All-zeros is the kernel's answer for a card it cannot talk to. Pinning
+    a battery to that would be worse than leaving the name in place."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["hci9"])
+    cfg = _write_config(tmp_path, "[DEFAULT]\nBLUETOOTH_ADAPTERS = hci9\n")
     try:
-        backend.create_client("C8:47:8C:00:00:00", None)
-        assert backend.current_adapter == "hci1"
-        assert backend._claim is not None and backend._claim.adapter == "hci1"
-        backend.create_client("C8:47:8C:00:00:00", None)
-        assert backend.current_adapter == "hci1"
+        assert utils_ble.pin_adapters_by_mac(cfg, adapters={"hci9": "00:00:00:00:00:00"}) is False
+        assert "hci9" in open(cfg).read()
     finally:
-        backend._release_claim()
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_devs
+        _configure(original_pins, original_pool)
 
 
-def test_backend_releases_its_claim_on_a_failed_connect_before_rotating(tmp_path):
-    original_devs = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1", "hci2"]}
-    backend = utils_ble.get_ble_backend("BleakRetryBackend")
-    backend._claims = _manager(tmp_path, "battery")
+def test_entries_already_written_as_macs_are_left_alone(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["00:1A:7D:DA:71:13"])
+    cfg = _write_config(tmp_path, "[DEFAULT]\nBLUETOOTH_ADAPTERS = 00:1A:7D:DA:71:13\n")
     try:
-        backend.create_client("C8:47:8C:00:00:00", None)
-        assert backend.current_adapter == "hci1"
-        with pytest.raises(Exception):
-            asyncio.run(backend.establish(None, "C8:47:8C:00:00:00", "char", None))
-        assert backend._claim is None
-        assert not os.path.exists(os.path.join(str(tmp_path), "hci1.use.battery"))
-        backend.create_client("C8:47:8C:00:00:00", None)
-        assert backend.current_adapter == "hci2"
+        assert utils_ble.pin_adapters_by_mac(cfg, adapters=ADAPTERS) is False
+        assert "was detected as" not in open(cfg).read()
     finally:
-        backend._release_claim()
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_devs
+        _configure(original_pins, original_pool)
 
 
-def _claiming_backend(tmp_path, adapters):
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": adapters}
-    backend = utils_ble.get_ble_backend("BleakRetryBackend")
-    backend._claims = _manager(tmp_path, "battery")
-    return backend
-
-
-def test_the_fallback_scan_holds_the_hard_claim_for_its_duration(tmp_path, monkeypatch):
-    """
-    A scan is a scan, however brief. The ten-second cache-miss fallback must be
-    visible to other services' placement while it runs, and gone the moment it
-    ends - and a hard claim someone else holds must not block the scan.
-    """
-    original_devs = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    backend = _claiming_backend(tmp_path, ["hci1"])
-    hard_path = os.path.join(str(tmp_path), "hci1.scan")
-    seen = {}
-
-    async def fake_get_device_by_adapter(address, adapter):
-        return None
-
-    class FakeScanner:
-        @staticmethod
-        async def find_device_by_address(address, timeout, **kwargs):
-            seen["held_during_scan"] = os.path.exists(hard_path)
-            return object()
-
-    monkeypatch.setattr(utils_ble, "get_device_by_adapter", fake_get_device_by_adapter)
-    monkeypatch.setattr(utils_ble, "BleakScanner", FakeScanner)
+def test_a_commented_out_line_is_not_rewritten(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["hci3"])
+    cfg = _write_config(tmp_path, "[DEFAULT]\n; BLUETOOTH_ADAPTERS = hci3\nBLUETOOTH_ADAPTERS = hci3\n")
     try:
-        backend.create_client("C8:47:8C:00:00:00", None)
-        asyncio.run(backend._resolve_device("C8:47:8C:00:00:00"))
-        assert seen["held_during_scan"] is True
-        assert not os.path.exists(hard_path)  # released with the scan
+        utils_ble.pin_adapters_by_mac(cfg, adapters=ADAPTERS)
+        lines = open(cfg).read().splitlines()
+        assert "; BLUETOOTH_ADAPTERS = hci3" in lines
     finally:
-        backend._release_claim()
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_devs
+        _configure(original_pins, original_pool)
 
 
-def test_a_foreign_hard_claim_does_not_block_the_fallback_scan(tmp_path, monkeypatch):
-    original_devs = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    backend = _claiming_backend(tmp_path, ["hci1"])
-    scanner = _manager(tmp_path, "someone-else")
-    foreign = scanner.claim_hard("hci1")
-    ran = {}
-
-    async def fake_get_device_by_adapter(address, adapter):
-        return None
-
-    class FakeScanner:
-        @staticmethod
-        async def find_device_by_address(address, timeout, **kwargs):
-            ran["scanned"] = True
-            return object()
-
-    monkeypatch.setattr(utils_ble, "get_device_by_adapter", fake_get_device_by_adapter)
-    monkeypatch.setattr(utils_ble, "BleakScanner", FakeScanner)
+def test_an_unwritable_config_is_not_worth_failing_over(tmp_path):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, ["hci3"])
     try:
-        backend.create_client("C8:47:8C:00:00:00", None)
-        asyncio.run(backend._resolve_device("C8:47:8C:00:00:00"))
-        assert ran.get("scanned") is True
-        # and their claim survived: not released, file still present
-        assert not foreign.released
-        assert os.path.exists(foreign.path)
+        assert utils_ble.pin_adapters_by_mac(str(tmp_path / "nope.ini"), adapters=ADAPTERS) is False
     finally:
-        backend._release_claim()
-        scanner.release(foreign)
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original_devs
+        _configure(original_pins, original_pool)
 
 
-def test_an_adapter_mid_scan_is_not_picked_while_a_quiet_one_exists():
-    """
-    Scanning is the single point of contention: BlueZ's Discovering flag is
-    the system's own record of it, and it covers services that follow no
-    convention of ours. A card mid-scan is placement's last resort, never its
-    first choice.
-    """
-    original = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1", "hci2"]}
+# --------- supervision waits instead of polling ---------
+#
+# The link used to be watched with `while is_connected: await sleep(0.1)`,
+# which cost ten timer wakeups a second per battery for the whole life of
+# every connection. On a GX device already short of headroom that is pure
+# run-queue churn: no work is done per iteration.
+
+
+class _FakeClient:
+    def __init__(self, connected=True):
+        self.is_connected = connected
+
+
+def _supervisor(connected=True, main_alive=True):
+    """A Syncron_Ble-shaped object with only what supervise_connection uses."""
+    import types
+
+    s = types.SimpleNamespace()
+    s.client = _FakeClient(connected)
+    s.main_thread = types.SimpleNamespace(is_alive=lambda: main_alive)
+    s._disconnected = None
+    s._disconnected_loop = None
+    s.supervise_connection = utils_ble.Syncron_Ble.supervise_connection.__get__(s)
+    s.signal_disconnected = utils_ble.Syncron_Ble.signal_disconnected.__get__(s)
+    return s
+
+
+def test_supervision_returns_as_soon_as_the_link_drops():
+    """The whole point: the event wakes it, not the timeout."""
+    import asyncio as aio
+
+    async def run():
+        s = _supervisor()
+        s._disconnected = aio.Event()
+        s._disconnected_loop = aio.get_running_loop()
+        loop = aio.get_running_loop()
+        started = loop.time()
+        loop.call_later(0.05, s.signal_disconnected)
+        await aio.wait_for(s.supervise_connection(), timeout=2.0)
+        # returned on the event, far inside the recheck interval
+        assert loop.time() - started < utils_ble.BLE_SUPERVISION_RECHECK
+
+    aio.run(run())
+
+
+def test_supervision_still_notices_a_disconnect_whose_callback_never_fired():
+    """Missed callbacks are a real failure mode, so is_connected stays a
+    backstop - it is just consulted on the recheck, not at 10 Hz."""
+    import asyncio as aio
+
+    async def run():
+        s = _supervisor(connected=False)
+        s._disconnected = aio.Event()
+        s._disconnected_loop = aio.get_running_loop()
+        await aio.wait_for(s.supervise_connection(), timeout=2.0)
+
+    original = utils_ble.BLE_SUPERVISION_RECHECK
+    utils_ble.BLE_SUPERVISION_RECHECK = 0.02
     try:
-        order = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci1", "hci2"}, discovering={"hci1"})
-        assert order == ["hci2"]
+        aio.run(run())
     finally:
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original
+        utils_ble.BLE_SUPERVISION_RECHECK = original
 
 
-def test_a_scan_on_every_adapter_gates_nothing():
-    original = utils_ble.BLUETOOTH_DEVICE_ADAPTERS
-    utils_ble.BLUETOOTH_DEVICE_ADAPTERS = {"C8:47:8C:00:00:00": ["hci1", "hci2"]}
+def test_supervision_returns_when_the_main_thread_is_gone():
+    import asyncio as aio
+
+    async def run():
+        s = _supervisor(main_alive=False)
+        s._disconnected = aio.Event()
+        s._disconnected_loop = aio.get_running_loop()
+        await aio.wait_for(s.supervise_connection(), timeout=2.0)
+
+    original = utils_ble.BLE_SUPERVISION_RECHECK
+    utils_ble.BLE_SUPERVISION_RECHECK = 0.02
     try:
-        order = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present={"hci1", "hci2"}, discovering={"hci1", "hci2"})
-        assert order == ["hci1", "hci2"]
+        aio.run(run())
     finally:
-        utils_ble.BLUETOOTH_DEVICE_ADAPTERS = original
+        utils_ble.BLE_SUPERVISION_RECHECK = original
+
+
+def test_signalling_without_a_connection_is_harmless():
+    s = _supervisor()
+    s.signal_disconnected()  # no event yet - must not raise
 
 
 # ---------------------------------------------------------------------------

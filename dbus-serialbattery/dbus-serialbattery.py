@@ -16,6 +16,7 @@ from dbushelper import DbusHelper
 from fallback_battery import FallbackBattery
 from utils import (
     BATTERY_ADDRESSES,
+    BLUETOOTH_CONNECTION_MANAGER_DIR,
     BMS_TYPE,
     bytearray_to_string,
     DRIVER_VERSION,
@@ -435,6 +436,15 @@ def main():
         else:
             ble_address = sys.argv[2]
 
+            # Unconditional: the BLE stack must be importable whether or not the
+            # connection manager is enabled. Sources the shared install from
+            # BLUETOOTH_CONNECTION_MANAGER_DIR when it exists, else the vendored
+            # ext/ble/ copies (no vendored connection manager exists: absent means
+            # plain bleak).
+            from ble_stack import ensure_ble_stack
+
+            ensure_ble_stack(BLUETOOTH_CONNECTION_MANAGER_DIR)
+
             # Must run before the BMS modules below are imported: they (and
             # utils_ble) capture `from bleak import BleakClient` at import
             # time, and only pick up the connection manager's routed client
@@ -501,6 +511,15 @@ def main():
             exit_driver(None, None, 1)
         else:
             ble_address = sys.argv[2]
+
+            # Unconditional: the BLE stack must be importable whether or not the
+            # connection manager is enabled. Sources the shared install from
+            # BLUETOOTH_CONNECTION_MANAGER_DIR when it exists, else the vendored
+            # ext/ble/ copies (no vendored connection manager exists: absent means
+            # plain bleak).
+            from ble_stack import ensure_ble_stack
+
+            ensure_ble_stack(BLUETOOTH_CONNECTION_MANAGER_DIR)
 
             # Before the aiobmsble import chain, for the same reason as above.
             from utils_ble_manager import install_ble_connection_manager

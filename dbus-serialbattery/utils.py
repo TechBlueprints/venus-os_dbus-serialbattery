@@ -271,6 +271,10 @@ BLUETOOTH_ADAPTER_CLAIMS: str = config["DEFAULT"]["BLUETOOTH_ADAPTER_CLAIMS"].st
 # bleak-connection-manager v2 (claim-aware adapter selection, link slots,
 # connection parameter tuning), coordinated across processes via /run/bt-claims
 BLUETOOTH_CONNECTION_MANAGER: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER")
+# Folder of the shared bleak-connection-manager install; empty = never look
+BLUETOOTH_CONNECTION_MANAGER_DIR: str = config["DEFAULT"]["BLUETOOTH_CONNECTION_MANAGER_DIR"].strip()
+# StartNotify instead of AcquireNotify for every subscription (BlueZ 5.72 UAF)
+BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY")
 # Established-link capacity per adapter, hciX:N entries; only used with
 # BLUETOOTH_CONNECTION_MANAGER = True, and an uncapped adapter is never gated
 BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS: List[str] = get_list_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS", str)

@@ -10,6 +10,8 @@ before importing any of them - which is why this module must not import
 bleak, utils_ble or a BMS module at module scope itself.
 """
 
+import inspect
+import os
 import utils
 from utils import logger
 
@@ -72,14 +74,56 @@ def install_ble_connection_manager(address):
 
             validator = tolerate_late_gatt(validate_gatt_services)
 
+        # fleet policy: BlueZ StartNotify, never AcquireNotify (the BlueZ 5.72
+        # notify_io double-free); a consumer-side key, default True, instead of
+        # the retired shim's BCM_FORCE_START_NOTIFY environment. The shared
+        # install is whatever the box has: one that predates the parameter
+        # would raise TypeError and lose the catcher entirely, so the policy
+        # is passed the way that install understands it.
+        policy = {}
+        params = inspect.signature(install_bleak_catcher).parameters
+        if "force_start_notify" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            policy["force_start_notify"] = utils.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY
+        else:
+            os.environ["BCM_FORCE_START_NOTIFY"] = "true" if utils.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY else "false"
+            logger.warning(
+                f"BLE coordination: shared install at {utils.BLUETOOTH_CONNECTION_MANAGER_DIR} predates the force_start_notify "
+                "parameter; StartNotify policy passed through the legacy BCM_FORCE_START_NOTIFY environment"
+            )
+
         install_bleak_catcher(
             f"dbus-serialbattery.{str(address).strip().lower().replace(':', '')}",
             adapters=utils.BLUETOOTH_ADAPTERS,
             link_caps=parse_link_caps(utils.BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS),
             wrap_scanner=utils.BLUETOOTH_CONNECTION_MANAGER_WRAP_SCANNER,
             validate_connection=validator,
+            **policy,
         )
+        import bleak_connection_manager as _bcm
+
+        logger.info(f"BLE coordination: bleak_connection_manager loaded from {os.path.dirname(getattr(_bcm, '__file__', '?'))}")
         return True
+    except ImportError:
+        import ble_stack
+
+        if ble_stack.shared_failure:
+            logger.error(
+                f"BLE coordination: shared install at {utils.BLUETOOTH_CONNECTION_MANAGER_DIR} is present but unusable, "
+                f"running uncoordinated: {ble_stack.shared_failure}"
+            )
+        elif not utils.BLUETOOTH_CONNECTION_MANAGER_DIR:
+            # Misconfiguration: the manager is wanted but told never to look for it.
+            logger.warning(
+                "BLE coordination: BLUETOOTH_CONNECTION_MANAGER is on but BLUETOOTH_CONNECTION_MANAGER_DIR is empty; "
+                "running uncoordinated, no claims, no adapter routing, no card recovery"
+            )
+        else:
+            # The normal state on any box without the shared install: not a fault.
+            logger.warning(
+                f"BLE coordination: no shared install at {utils.BLUETOOTH_CONNECTION_MANAGER_DIR}; "
+                "running uncoordinated, no claims, no adapter routing, no card recovery"
+            )
+        return False
     except Exception as e:
         logger.error(f"Failed to install the BLE connection manager, continuing without it: {repr(e)}")
         return False
