@@ -1082,8 +1082,18 @@ class Syncron_Ble:
         A drop before this life has ever had a link is not an episode: there
         was nothing to lose, and counting it would open one that the first
         connection then closes without ever having been an outage.
+
+        The FIRST callback of an outage is the one that counts. BlueZ
+        delivers two or three for a single outage - a re-drop during a
+        reconnect attempt, or the same drop more than once - and taking the
+        latest would date the outage from its last callback rather than its
+        start, under-reporting how long the link was down by the whole gap
+        between them. Measured on a production pack: up to about 5 s, on
+        exactly the outages someone is reading the number for.
         """
         if not self._first_link_reported:
+            return
+        if self._pending_drop is not None:
             return
         landed = getattr(self.backend, "landed_adapter_name", None) or getattr(self.backend, "current_adapter", None)
         self._pending_drop = (time.time(), landed)
