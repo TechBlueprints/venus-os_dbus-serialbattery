@@ -520,6 +520,82 @@ def test_only_the_scanning_backend_reports_that_it_scans():
     assert utils_ble.get_ble_backend("BleakBackend").scans_devices is False
 
 
+# --------- a pin that stops being honoured says so ---------
+#
+# Dropping unresolvable MAC entries is correct - a MAC is not a name bleak
+# can use - but the effect is that an explicit pin quietly stops applying and
+# the battery goes out on whatever radio is left. That is the failure the
+# option exists to prevent, arriving by a different route.
+
+PINNED = "C8:47:8C:00:00:00"
+
+
+def _pin(mac_entries, pool=None):
+    utils_ble._unpinned_devices.discard(PINNED)
+    _configure({PINNED: list(mac_entries)}, list(pool or []))
+
+
+def test_a_pin_that_resolves_to_nothing_is_warned_about(caplog):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            assert utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"}) == []
+        assert "adapter pins for C8:47:8C:00:00:00 are not being honoured" in caplog.messages[0]
+        assert "00:1A:7D:DA:71:13" in caplog.messages[0]
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_the_warning_is_not_repeated_on_every_attempt(caplog):
+    """A battery on the 6 s ramp would repeat it ten times a minute."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            for _ in range(10):
+                utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+        assert len(caplog.messages) == 1
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_a_pin_that_comes_back_is_warned_about_again_if_it_goes(caplog):
+    """The warning marks a transition, so a second loss must be reported."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+            # the card comes back
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci3": "00:1A:7D:DA:71:13"})
+            # and goes again
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+        assert len(caplog.messages) == 2
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_an_unresolvable_hci_name_is_not_a_dropped_pin(caplog):
+    """
+    hciN entries are returned unfiltered when nothing resolves - that is the
+    deliberate no-strand fallback, not a pin being lost, and warning about it
+    would fire on every box whose adapters are simply not enumerable.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["hci7"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            assert utils_ble.adapters_in_attempt_order(PINNED, present=set()) == ["hci7"]
+        assert caplog.messages == []
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
 # --------- one line per episode, not three per attempt ---------
 #
 # A characterised BMS radio mute lasts 10-20 s, happens a few times an hour

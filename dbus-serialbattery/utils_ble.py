@@ -349,6 +349,13 @@ def describe_adapter(name, adapters=None):
     return f"{name} ({mac})" if mac else f"{name} (MAC unresolved)"
 
 
+# Devices currently known to have lost their MAC pins, so the warning is
+# emitted on the transition into that state rather than on every attempt: a
+# battery reconnecting on the 6 s ramp would otherwise repeat it ten times a
+# minute, which is how a real warning stops being read.
+_unpinned_devices = set()
+
+
 def adapters_in_attempt_order(address, present=None):
     """
     Adapters to try for this battery, best first, as hciN names.
@@ -383,9 +390,44 @@ def adapters_in_attempt_order(address, present=None):
         if name and (not adapters or name in adapters) and name not in resolved:
             resolved.append(name)
     if resolved:
+        _note_pins_honoured(address)
         return resolved
     names = [entry for entry in configured if not is_adapter_mac(entry)]
+    if len(names) < len(configured):
+        _warn_pins_dropped(address, configured, names)
     return names
+
+
+def _warn_pins_dropped(address, configured, names):
+    """Say so when a battery stops being pinned to the adapters it names.
+
+    Reaching here means no configured entry resolved, and dropping the MAC
+    entries is what the caller does about it - correctly, since a MAC is not
+    a name bleak can use. But the effect is that an explicit pin silently
+    stops being honoured and the battery goes out on the default adapter or
+    on some other card, which is exactly the separation the option exists to
+    express. The likely cause is that adapter identity cannot be read at all
+    (on Venus that is one hciconfig call away from being the only source),
+    and until now the only trace of it was a single debug line.
+
+    Warned on the transition, not on the condition: this runs once per
+    connection attempt.
+    """
+    if address in _unpinned_devices:
+        return
+    _unpinned_devices.add(address)
+    dropped = [entry for entry in configured if is_adapter_mac(entry)]
+    logger.warning(
+        f"BLE adapter pins for {address} are not being honoured: {', '.join(dropped)} "
+        f"{'resolves' if len(dropped) == 1 else 'resolve'} to no adapter present. "
+        f"{'Falling back to ' + ', '.join(names) if names else 'Falling back to the default adapter'}. "
+        "Adapter identity may be unreadable - check that hciconfig works."
+    )
+
+
+def _note_pins_honoured(address):
+    """Clear the warned state so a later loss is reported again."""
+    _unpinned_devices.discard(address)
 
 
 # Hold flag: while the flag file for a device exists, the reconnect loop makes
