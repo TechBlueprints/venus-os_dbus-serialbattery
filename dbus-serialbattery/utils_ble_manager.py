@@ -10,6 +10,7 @@ before importing any of them - which is why this module must not import
 bleak, utils_ble or a BMS module at module scope itself.
 """
 
+import inspect
 import os
 import sys
 
@@ -44,6 +45,17 @@ def parse_link_caps(entries):
             continue
         caps[adapter] = cap_value
     return caps
+
+
+def _accepts_kwarg(func, name):
+    """Whether func takes `name` as a keyword, or takes **kwargs."""
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def install_ble_connection_manager(address):
@@ -104,13 +116,29 @@ def install_ble_connection_manager(address):
 
             validator = tolerate_late_gatt(validate_gatt_services)
 
-        install_bleak_catcher(
-            f"dbus-serialbattery.{str(address).strip().lower().replace(':', '')}",
+        kwargs = dict(
             adapters=utils.BLUETOOTH_ADAPTERS,
             link_caps=parse_link_caps(utils.BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS),
             wrap_scanner=utils.BLUETOOTH_CONNECTION_MANAGER_WRAP_SCANNER,
             validate_connection=validator,
         )
+
+        # StartNotify policy. The shared install is whatever is on the box, so
+        # check whether this one's install_bleak_catcher takes the parameter
+        # before sending it: an older install would raise TypeError and lose
+        # the catcher entirely. Older installs read the policy from the
+        # environment instead.
+        force = utils.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY
+        if _accepts_kwarg(install_bleak_catcher, "force_start_notify"):
+            kwargs["force_start_notify"] = force
+        else:
+            os.environ["BCM_FORCE_START_NOTIFY"] = "true" if force else "false"
+            logger.warning(
+                f"BLE coordination: shared install at {shared_dir} predates the force_start_notify parameter; "
+                "StartNotify policy passed through the legacy BCM_FORCE_START_NOTIFY environment"
+            )
+
+        install_bleak_catcher(f"dbus-serialbattery.{str(address).strip().lower().replace(':', '')}", **kwargs)
         return True
     except ImportError as e:
         # The shared tree could not give us the module or the validators:

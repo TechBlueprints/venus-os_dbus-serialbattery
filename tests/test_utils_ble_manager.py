@@ -219,7 +219,7 @@ class TestCoordinationReport:
         """The watch matches the class on this prefix, not on the sentence."""
         with open(os.path.join(DRIVER_DIR, "utils_ble_manager.py"), encoding="utf-8") as handle:
             source = handle.read()
-        assert source.count("BLE coordination: ") == 6  # 5 states + the ImportError variant
+        assert source.count("BLE coordination: ") == 7  # 5 states, the ImportError variant, the legacy-env notice
         assert "Failed to install the BLE connection manager" not in source
 
     def test_a_catcher_that_will_not_install_is_not_blamed_on_the_shared_tree(self, _stack, monkeypatch, caplog):
@@ -245,3 +245,45 @@ class TestCoordinationReport:
 
         assert "catcher would not install from /data/bcm" in caplog.text
         assert "is present but unusable" not in caplog.text
+
+    def test_a_current_install_receives_the_start_notify_policy_as_a_kwarg(self, _stack, monkeypatch, caplog):
+        calls = []
+        module = types.ModuleType("bleak_connection_manager")
+        module.__file__ = "/data/bcm/src/bleak_connection_manager/__init__.py"
+        module.install_bleak_catcher = lambda owner, force_start_notify=None, **kw: calls.append(force_start_notify)
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
+        monkeypatch.setattr(_stack, "_decided", "shared", raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_VALIDATION", False, raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY", True, raising=False)
+        monkeypatch.delenv("BCM_FORCE_START_NOTIFY", raising=False)
+        with caplog.at_level("DEBUG"):
+            assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is True
+        assert calls == [True]
+        assert "BCM_FORCE_START_NOTIFY" not in os.environ
+        assert "predates the force_start_notify parameter" not in caplog.text
+
+    def test_an_older_install_keeps_the_catcher_and_gets_the_policy_by_environment(self, _stack, monkeypatch, caplog):
+        """A shared install is whatever is on the box; an unknown kwarg must not cost the catcher."""
+        calls = []
+        module = types.ModuleType("bleak_connection_manager")
+        module.__file__ = "/data/bcm/src/bleak_connection_manager/__init__.py"
+
+        def install_bleak_catcher(owner, adapters, link_caps, wrap_scanner, validate_connection):
+            calls.append(owner)  # signature deliberately lacks force_start_notify and **kwargs
+
+        module.install_bleak_catcher = install_bleak_catcher
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
+        monkeypatch.setattr(_stack, "_decided", "shared", raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_VALIDATION", False, raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY", True, raising=False)
+        monkeypatch.delenv("BCM_FORCE_START_NOTIFY", raising=False)
+        with caplog.at_level("DEBUG"):
+            assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is True
+        assert len(calls) == 1, "the catcher must still install"
+        assert os.environ.get("BCM_FORCE_START_NOTIFY") == "true"
+        assert (
+            "BLE coordination: shared install at /data/bcm predates the force_start_notify parameter; "
+            "StartNotify policy passed through the legacy BCM_FORCE_START_NOTIFY environment"
+        ) in caplog.text
+        assert "catcher would not install" not in caplog.text
+        monkeypatch.delenv("BCM_FORCE_START_NOTIFY", raising=False)

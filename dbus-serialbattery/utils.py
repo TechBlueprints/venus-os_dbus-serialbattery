@@ -270,6 +270,9 @@ BLUETOOTH_ADAPTERS: List[str] = get_list_from_config("DEFAULT", "BLUETOOTH_ADAPT
 # ext/ are added to sys.path when present). Empty means never look, which
 # is the default: a box without a shared install runs plain vendored bleak.
 BLUETOOTH_CONNECTION_MANAGER_DIR: str = config["DEFAULT"]["BLUETOOTH_CONNECTION_MANAGER_DIR"].strip()
+# Fleet policy: force bleak's StartNotify path. AcquireNotify is the only path
+# that reaches the BlueZ 5.72 notify_io double-free, so it is never allowed.
+BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY")
 # Opt-in: route every bleak client in this process through the shared
 # bleak-connection-manager (claim-aware adapter selection, link slots,
 # connection parameter tuning), coordinated across processes via /run/bt-claims
