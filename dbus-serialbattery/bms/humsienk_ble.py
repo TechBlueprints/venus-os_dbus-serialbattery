@@ -161,9 +161,10 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
             # so an override of connect_to_bms gets both ends of an episode
             # without doing anything. Field 2026-09-06: against the earlier
             # utils_ble that reported from inside the base connect_to_bms this
-            # override needed an explicit call; against the seam a call here
-            # would report every link TWICE, which a watch cannot tell from a
-            # real reconnect.
+            # override needed an explicit call; against the seam the seam owns
+            # the report and a call here is dead code that stays quiet only
+            # because _report_link_up latches (a second call emits nothing) -
+            # someone else's internal detail, not a contract to lean on.
         except Exception as e:
             logger.error(f"Failed when trying to connect: {e}")
             return False

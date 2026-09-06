@@ -680,7 +680,8 @@ def test_the_driver_carries_no_fallback_machinery():
 # never ran the CLOSER, so episodes opened in the watch and never closed.
 # utils_ble a0e1214 moved the closer to the backend's connected callback,
 # wired at backend construction, so both ends now reach an override without
-# it doing anything - and an explicit call here would double-report.
+# it doing anything - and an explicit call here is dead code (the report
+# latches: two calls, one line - pr-513's measurement, 2026-09-06).
 
 
 def _connect_double(report_hook):
@@ -721,10 +722,12 @@ def _connect_double(report_hook):
 
 def test_the_override_does_not_report_the_link_up_itself():
     """utils_ble (feat/ble-connection-layer a0e1214) delivers link-up through the
-    backend's connected callback, wired by the base class at backend construction;
-    an override that ALSO calls _report_link_up reports every link twice, which a
-    watch cannot tell from a real reconnect. So: the hook must exist on the
-    instance and must NOT be called by connect_to_bms."""
+    backend's connected callback, wired by the base class at backend construction.
+    An override that ALSO calls _report_link_up is dead code: it stays quiet only
+    because the report latches (measured: two calls, one line, in both the
+    first-life and recovery paths), an internal detail of someone else's file.
+    So: the hook must exist on the instance and must NOT be called by
+    connect_to_bms."""
     calls = []
     sync = _connect_double(lambda: calls.append("up"))
     assert calls == [], "connect_to_bms must leave link-up reporting to the backend seam"
