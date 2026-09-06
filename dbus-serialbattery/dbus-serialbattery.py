@@ -419,6 +419,10 @@ def main():
 
             # After the install, never before: utils_ble imports bleak at
             # module scope, and the catcher has to be in place first.
+            # Make the configured adapters durable before anything connects:
+            # a name that resolves to a readable MAC is written back to the
+            # config, because the number can be handed to a different radio
+            # by the next reboot while the name stays put.
             from utils_ble import pin_adapters_by_mac
 
             pin_adapters_by_mac()
@@ -482,6 +486,10 @@ def main():
 
             # After the install, never before: utils_ble imports bleak at
             # module scope, and the catcher has to be in place first.
+            # Make the configured adapters durable before anything connects:
+            # a name that resolves to a readable MAC is written back to the
+            # config, because the number can be handed to a different radio
+            # by the next reboot while the name stays put.
             from utils_ble import pin_adapters_by_mac
 
             pin_adapters_by_mac()

@@ -1,18 +1,18 @@
 import threading
 import asyncio
+import logging
 import os
 import re
 import subprocess
 import sys
 import time
 from bleak import BleakClient, BleakScanner
-from bleak.exc import BleakError
+from bleak.exc import BleakCharacteristicNotFoundError, BleakError
 from time import sleep
 from utils import (
     logger,
     BLUETOOTH_ADAPTERS,
     BLUETOOTH_CONNECTION_BACKEND,
-    BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS,
     BLUETOOTH_FORCE_RESET_BLE_STACK,
     capture_raw_data,
 )
@@ -82,45 +82,97 @@ def is_adapter_mac(entry):
     return bool(MAC_PATTERN.match(str(entry).strip()))
 
 
+# Adapter identity is read from the kernel, never over D-Bus, and cached for
+# this long. Short enough that a replugged or reset card is noticed, long
+# enough that a battery reconnecting in a tight loop does not spawn a
+# subprocess per attempt.
+ADAPTER_IDENTITY_TTL = 30.0
+_adapter_identity_cache = {"at": 0.0, "adapters": {}}
+
+
+def _adapters_from_sysfs():
+    """{hciN: MAC} from /sys/class/bluetooth, or {} if the kernel has no
+    address attribute there - which is the case on Venus OS."""
+    adapters = {}
+    try:
+        names = [n for n in os.listdir("/sys/class/bluetooth") if n.startswith("hci")]
+    except OSError:
+        return {}
+    for name in names:
+        try:
+            with open(f"/sys/class/bluetooth/{name}/address") as f:
+                mac = f.read().strip().upper()
+        except OSError:
+            continue
+        if mac:
+            adapters[name] = mac
+    return adapters
+
+
+def _adapters_from_hciconfig():
+    """{hciN: MAC} by parsing one bare hciconfig call.
+
+    One call returns the whole table, so this spawns a single subprocess
+    however many adapters the box has - the production GX device has seven.
+    """
+    try:
+        result = subprocess.run(["hciconfig"], capture_output=True, text=True, timeout=5)
+    except Exception as e:
+        logger.debug(f"hciconfig unavailable: {repr(e)}")
+        return {}
+    adapters = {}
+    name = None
+    for line in result.stdout.splitlines():
+        match = re.match(r"^(hci\d+):", line)
+        if match:
+            name = match.group(1)
+            continue
+        if name:
+            found = re.search(r"BD Address:\s*([0-9A-Fa-f:]{17})", line)
+            if found:
+                adapters[name] = found.group(1).upper()
+                name = None
+    return adapters
+
+
 def bluez_adapters():
     """
-    {hciN: MAC} for the adapters BlueZ currently exposes, or {} for "no answer".
+    {hciN: MAC} for the adapters the kernel currently exposes, or {} for
+    "no answer".
 
     hciN names are not stable identities: a USB reset or reboot renumbers
     them, and an adapter a battery is configured for can stop existing while
     its number lives on pointing at different hardware. The adapter's own MAC
-    is stable, so configuration can name that instead and be resolved against
-    live BlueZ state here.
+    is stable, so configuration can name that instead and be resolved here.
 
-    Read WITHOUT D-Bus, deliberately. This function is called from the BLE
-    thread (resolve_adapter -> adapters_in_attempt_order -> _select_adapter),
-    and the previous implementation opened a dbus-python SystemBus there,
-    queried BlueZ's ObjectManager, and closed it again. That crashed the
-    driver: dbus-python's DBusGMainLoop supports only the DEFAULT GLib main
-    context ("Non-default main contexts are not currently supported"), so a
-    private=True connection created on this thread still registered its
+    Read from the kernel and NOT over D-Bus, deliberately. This runs on the
+    BLE thread - resolve_adapter -> adapters_in_attempt_order ->
+    _select_adapter is the connect path - and asking BlueZ from here crashed
+    the driver. dbus-python's DBusGMainLoop supports only the DEFAULT GLib
+    main context, so a connection opened on this thread still registers its
     watches and dispatch source on the MAIN thread's loop, and closing it
-    here freed the connection while that loop still held sources for it. The
-    main thread's next dispatch then ran on freed memory - SIGSEGV in
-    _dbus_hash_table_lookup_int, SIGBUS in pthread_mutex_lock, and glibc
-    "malloc_consolidate(): unaligned fastbin chunk detected" aborts, all
-    within about a second of "initiating BLE connection". Diagnosed from
-    core dumps 2026-08-23; see dbus-python issue #8 and Launchpad #1890753
-    for the same race reported upstream.
+    here frees the connection while that loop is still using it. Two core
+    dumps showed the main thread dying inside dbus_connection_dispatch, once
+    on a freed hash table and once on a freed mutex, and the same process
+    also aborted in malloc; one use-after-free with three presentations.
+    dbus-python belongs on the main thread, for velib.
 
-    bleak_connection_manager.claims is stdlib-only (no bleak, no asyncio, no
-    D-Bus), safe from any thread, and reads sysfs first, falling back to a
-    single hciconfig call for the whole table - which is what Venus needs,
-    since its kernels expose no address attribute under /sys/class/bluetooth.
-    dbus-python stays where it belongs: the main thread, for velib.
+    sysfs first because it is a plain file read; hciconfig as the fallback
+    because Venus OS kernels expose no address attribute under
+    /sys/class/bluetooth at all, so on the GX devices the fallback is what
+    actually runs. An all-zeros address is what a dead or unserved
+    controller reports and never identifies anything, so it is dropped
+    rather than cached as an identity.
     """
-    try:
-        from bleak_connection_manager import claims
-
-        return {name: claims.adapter_mac(name).upper() for name in claims.present_hci_names()}
-    except Exception as e:
-        logger.debug(f"Adapter state unavailable, using configured order: {repr(e)}")
-        return {}
+    now = time.monotonic()
+    if _adapter_identity_cache["adapters"] and now - _adapter_identity_cache["at"] < ADAPTER_IDENTITY_TTL:
+        return dict(_adapter_identity_cache["adapters"])
+    adapters = _adapters_from_sysfs() or _adapters_from_hciconfig()
+    adapters = {name: mac for name, mac in adapters.items() if mac != UNKNOWN_ADAPTER_MAC}
+    if adapters:
+        _adapter_identity_cache["at"] = now
+        _adapter_identity_cache["adapters"] = dict(adapters)
+    return adapters
 
 
 def bluez_present_adapters():
@@ -165,7 +217,6 @@ def adapter_identities(adapters=None):
     for pinned in BLUETOOTH_ADAPTER_PINS.values():
         configured.extend(pinned)
     configured.extend(BLUETOOTH_ADAPTER_POOL)
-    configured.extend(entry.rpartition(":")[0] for entry in BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS)
     identities = {}
     for entry in configured:
         entry = str(entry).strip()
@@ -242,6 +293,69 @@ def pin_adapters_by_mac(path=None, adapters=None):
     return True
 
 
+# bleak warns "Failed to cancel connection (<path>): ServiceUnknown" whenever
+# it tears down a client while bluetoothd is not on the bus - which is every
+# reconnect during a bluetoothd restart, exactly when the log is being read.
+# The condition is already handled: the object is gone, so the link is gone,
+# which is what the teardown wanted. Filtered by message on the one logger
+# that emits it rather than by raising that logger's threshold, because the
+# threshold also hides bleak's genuine connect diagnostics from the same
+# window.
+BLEAK_CLIENT_LOGGER = "bleak.backends.bluezdbus.client"
+BLEAK_SILENCED_MESSAGE = "Failed to cancel connection"
+BLEAK_SILENCED_REASON = "ServiceUnknown"
+
+
+class _BluezGoneFilter(logging.Filter):
+    """Drop bleak's teardown warning for a BlueZ that has gone away."""
+
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not (BLEAK_SILENCED_MESSAGE in message and BLEAK_SILENCED_REASON in message)
+
+
+def silence_bluez_gone_warning(logger_name=BLEAK_CLIENT_LOGGER):
+    """Install the filter once; returns it so a caller can remove it again."""
+    target = logging.getLogger(logger_name)
+    for existing in target.filters:
+        if isinstance(existing, _BluezGoneFilter):
+            return existing
+    installed = _BluezGoneFilter()
+    target.addFilter(installed)
+    return installed
+
+
+silence_bluez_gone_warning()
+
+
+def describe_adapter(name, adapters=None):
+    """
+    An adapter as "hciN (MAC)", for a log line a human has to act on.
+
+    Both halves earn their place. hciN is what the running system calls it
+    right now and what an operator types; the MAC is what the card will
+    still be called after the next reboot renumbers it. "(MAC unresolved)"
+    is not cosmetic - it means identity could not be read, so MAC pins are
+    not being honoured, and it is worth noticing in a log.
+    """
+    if not name:
+        return "unknown"
+    if adapters is None:
+        adapters = bluez_adapters()
+    mac = adapters.get(name)
+    return f"{name} ({mac})" if mac else f"{name} (MAC unresolved)"
+
+
+# Devices currently known to have lost their MAC pins, so the warning is
+# emitted on the transition into that state rather than on every attempt: a
+# battery reconnecting on the 6 s ramp would otherwise repeat it ten times a
+# minute, which is how a real warning stops being read.
+_unpinned_devices = set()
+
+
 def adapters_in_attempt_order(address, present=None):
     """
     Adapters to try for this battery, best first, as hciN names.
@@ -276,9 +390,44 @@ def adapters_in_attempt_order(address, present=None):
         if name and (not adapters or name in adapters) and name not in resolved:
             resolved.append(name)
     if resolved:
+        _note_pins_honoured(address)
         return resolved
     names = [entry for entry in configured if not is_adapter_mac(entry)]
+    if len(names) < len(configured):
+        _warn_pins_dropped(address, configured, names)
     return names
+
+
+def _warn_pins_dropped(address, configured, names):
+    """Say so when a battery stops being pinned to the adapters it names.
+
+    Reaching here means no configured entry resolved, and dropping the MAC
+    entries is what the caller does about it - correctly, since a MAC is not
+    a name bleak can use. But the effect is that an explicit pin silently
+    stops being honoured and the battery goes out on the default adapter or
+    on some other card, which is exactly the separation the option exists to
+    express. The likely cause is that adapter identity cannot be read at all
+    (on Venus that is one hciconfig call away from being the only source),
+    and until now the only trace of it was a single debug line.
+
+    Warned on the transition, not on the condition: this runs once per
+    connection attempt.
+    """
+    if address in _unpinned_devices:
+        return
+    _unpinned_devices.add(address)
+    dropped = [entry for entry in configured if is_adapter_mac(entry)]
+    logger.warning(
+        f"BLE adapter pins for {address} are not being honoured: {', '.join(dropped)} "
+        f"{'resolves' if len(dropped) == 1 else 'resolve'} to no adapter present. "
+        f"{'Falling back to ' + ', '.join(names) if names else 'Falling back to the default adapter'}. "
+        "Adapter identity may be unreadable - check that hciconfig works."
+    )
+
+
+def _note_pins_honoured(address):
+    """Clear the warned state so a later loss is reported again."""
+    _unpinned_devices.discard(address)
 
 
 # Hold flag: while the flag file for a device exists, the reconnect loop makes
@@ -310,8 +459,24 @@ def ble_hold_flag_path(address):
 # churn on a loaded GX device.
 BLE_SUPERVISION_RECHECK = 5.0
 
+# How long an episode - the span between a link dropping and coming back -
+# may stay open before it says so, and how often it repeats after that. A
+# characterised BMS radio mute lasts 10-20 s and the fallback covers it, so
+# the first line lands well past every ordinary one: an outage has to be
+# genuinely unusual to say anything at all. In a sustained outage this is 12
+# lines an hour per battery, and none otherwise.
+BLE_EPISODE_REPORT_AFTER = 300.0
+
 BLE_ESTABLISH_TIMEOUT = 300.0
 BLE_RELEASE_TIMEOUT = 30.0
+
+# How long the reaper waits for an abandoned BLE generation's thread to finish
+# on its own before freeing its D-Bus resources out from under it. Slightly
+# above BLE_ESTABLISH_TIMEOUT because an abandoned generation is most often
+# parked inside one in-flight establish; a generation still alive after that
+# is the truly-hung case, and closing its bus socket makes its pending await
+# raise, which helps it exit rather than hurting it.
+BLE_GENERATION_REAP_TIMEOUT = 330.0
 
 
 # bleak-retry-connector lives in the ext folder, which dbus-serialbattery.py
@@ -334,6 +499,97 @@ except ImportError:
     HAS_BLEAK_RETRY_CONNECTOR = False
 
 
+# BlueZ can report a device's services as resolved while its own view of the
+# GATT tree is still incomplete, and start_notify then raises for a
+# characteristic the battery genuinely has - after which the driver drops the
+# link and reconnects forever against hardware that is working. Observed on a
+# Cerbo GX. Rebuilding the tree from live BlueZ state and trying again clears
+# it, so a connection is only given up on once that has failed too.
+# Neither number is measured. The last attempt raises without sleeping, so
+# three attempts spend two settles: the budget is 1.0s and two rebuilds, not
+# 1.5s. The warning below names the attempt it is on, so the field settles
+# this without new instrumentation - only ever attempt 1 and the first settle
+# is always enough, attempt 2 and it is marginal, exhaustion and 1.0s is too
+# short. Raise it on that evidence rather than on argument.
+GATT_REDISCOVERY_ATTEMPTS = 3
+GATT_REDISCOVERY_SETTLE = 0.5
+
+
+async def rediscover_services(client, notify_char):
+    """
+    Rebuild a connected client's GATT tree from what BlueZ holds now.
+
+    bleak has no public call for this: services is read-only, clear_cache is
+    not implemented for the BlueZ backend, and the one public route - a
+    disconnect - is unusable here because it fires the driver's own
+    disconnected callback and tears down the session still being set up. So
+    this goes through the backend, and checks for the attributes first: a
+    bleak that moves them must fail loudly here rather than quietly stop
+    rediscovering and leave the endless reconnect this exists to prevent.
+    """
+    backend = getattr(client, "_backend", None)
+    get_services = getattr(backend, "_get_services", None)
+    if get_services is None or not hasattr(backend, "services"):
+        raise BleakError(
+            f"characteristic {notify_char} is missing from the resolved GATT tree, and this bleak "
+            "offers no way to rebuild it (expected _backend._get_services); connection unusable"
+        )
+    # _get_services returns the tree it already has, so it has to be dropped
+    # first for the rebuild to read BlueZ again. The rebuild goes to live
+    # BlueZ state rather than any cached collection, so a client that was
+    # connected against a cached tree recovers here the same way - which is
+    # why the connector's services cache can be left on.
+    backend.services = None
+    await get_services()
+
+
+async def start_notify_when_resolved(client, notify_char, notify_callback):
+    """Subscribe to notifications, rebuilding the GATT tree if the characteristic is missing."""
+    for attempt in range(GATT_REDISCOVERY_ATTEMPTS):
+        try:
+            await client.start_notify(notify_char, notify_callback)
+            return
+        except BleakCharacteristicNotFoundError:
+            if attempt == GATT_REDISCOVERY_ATTEMPTS - 1:
+                raise
+            logger.warning(f"characteristic {notify_char} not in the resolved GATT tree, rebuilding it (attempt {attempt + 1})")
+            await rediscover_services(client, notify_char)
+            # BlueZ fills the tree in asynchronously, so give it a moment
+            # before asking again
+            await asyncio.sleep(GATT_REDISCOVERY_SETTLE)
+
+
+def landed_adapter(client):
+    """
+    The adapter a connected client's link is actually on, as hciN, or None.
+
+    The adapter a backend ASKS for and the one a link ends up on are not the
+    same thing. bleak-retry-connector swaps the BLEDevice for BlueZ's
+    already-connected copy when one exists on any adapter, so a battery can
+    be bound to a card the driver did not select - and every piece of state
+    keyed to the request is then describing the wrong radio.
+
+    BlueZ's own object path is the answer: a device lives under the adapter
+    holding it, so /org/bluez/hci3/dev_... means hci3 whatever was asked for.
+    bleak keeps that path on the backend and prefers it over the requested
+    name itself when it needs the adapter. The attribute is private and read
+    defensively, because a bleak that moves it should degrade to "unknown"
+    rather than silently report the request as though it were the outcome.
+
+    Read it AFTER connect and carry the answer. It is populated at different
+    moments on the two backends - at construction from a BLEDevice, only
+    during connect() from a bare address - and cleared again on teardown, so
+    after-connect is the one moment correct for both.
+    """
+    path = getattr(getattr(client, "_backend", None), "_device_path", None)
+    if not path:
+        return None
+    for part in str(path).split("/"):
+        if re.fullmatch(r"hci\d+", part):
+            return part
+    return None
+
+
 class BleConnectionBackend:
     """
     Interface for establishing and releasing BLE connections.
@@ -343,6 +599,28 @@ class BleConnectionBackend:
     alternative connection strategies can be plugged in without touching the
     drivers.
     """
+
+    # the adapter this backend asked for, and the one the link came up on;
+    # they differ whenever a lingering link elsewhere is adopted
+    requested_adapter = None
+    landed_adapter_name = None
+    # only backends that resolve a device themselves ever scan
+    scans_devices = False
+
+    def _record_landed(self, client):
+        """Remember which adapter the link actually came up on.
+
+        current_adapter is what the rest of the driver reports and reasons
+        about, so it must describe the live link rather than the request that
+        started it. The requested name is kept alongside: the two differing
+        is the signal that a link elsewhere was adopted.
+        """
+        self.requested_adapter = self.current_adapter
+        landed = landed_adapter(client)
+        self.landed_adapter_name = landed
+        if landed:
+            self.current_adapter = landed
+        return landed
 
     def create_client(self, address, disconnected_callback):
         """
@@ -414,10 +692,10 @@ class BleakBackend(BleConnectionBackend):
             raise
 
     async def _establish(self, client, address, notify_char, notify_callback):
-        logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
+        logger.debug("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
         await client.connect()
-        logger.info("connected to bluetooh device" + address)
-        await client.start_notify(notify_char, notify_callback)
+        self._record_landed(client)
+        await start_notify_when_resolved(client, notify_char, notify_callback)
         return client
 
     async def release(self, client):
@@ -438,10 +716,15 @@ class BleakRetryBackend(BleConnectionBackend):
     attempt.
     """
 
+    scans_devices = True
+
     def __init__(self):
         self.adapter_index = 0
         self.current_adapter = None
         self.disconnected_callback = None
+        # scans performed for the current episode; the driver reads and
+        # resets it, so it counts per episode rather than for all time
+        self.scans = 0
 
     def _select_adapter(self, address):
         """Same selection contract as BleakBackend: live order, failure-driven index."""
@@ -465,15 +748,15 @@ class BleakRetryBackend(BleConnectionBackend):
             raise
 
     async def _establish(self, client, address, notify_char, notify_callback):
-        logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
+        logger.debug("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
         device = await self._resolve_device(address)
         if device is None:
             raise BleakError(f"bluetooth device {address} not found" + (f" on adapter {self.current_adapter}" if self.current_adapter else ""))
         await close_stale_connections(device)
         kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
         client = await retry_establish_connection(BleakClient, device, address, disconnected_callback=self.disconnected_callback, **kwargs)
-        logger.info("connected to bluetooth device " + address)
-        await client.start_notify(notify_char, notify_callback)
+        self._record_landed(client)
+        await start_notify_when_resolved(client, notify_char, notify_callback)
         return client
 
     async def _resolve_device(self, address):
@@ -488,7 +771,8 @@ class BleakRetryBackend(BleConnectionBackend):
         else:
             device = await get_device(address)
         if device is None:
-            logger.info(f"bluetooth device {address} not in BlueZ cache, scanning")
+            self.scans += 1
+            logger.debug(f"bluetooth device {address} not in BlueZ cache, scanning")
             kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
             device = await BleakScanner.find_device_by_address(address, timeout=10.0, **kwargs)
         return device
@@ -513,6 +797,56 @@ def get_ble_backend(name=None):
     return BleakBackend()
 
 
+def _reap_abandoned_ble_generation(old_thread, old_loop, address, generation):
+    """Free the D-Bus resources of an abandoned BLE thread generation.
+
+    rebuild_ble_thread() abandons the old generation's event loop, but bleak's
+    global BlueZ manager for that loop stays pinned in
+    bleak.backends.bluezdbus.manager._global_instances: bleak's own sweep only
+    runs inside get_global_bluez_manager(), only pops loops that are already
+    closed, and the new generation calls it exactly once — within seconds of
+    the rebuild, while the old loop is still parked inside an in-flight await
+    and not yet closed. Missed once, the entry is never revisited.
+
+    The abandoned manager holds an open system-bus socket with three BlueZ
+    match rules (InterfacesAdded/InterfacesRemoved/PropertiesChanged under
+    /org/bluez) that nothing will ever read again, so dbus-daemon queues every
+    BlueZ signal to it without bound — measured on a Cerbo GX at ~44 MB/h of
+    daemon growth, OOM in hours. The daemon's own max_outgoing_bytes eviction
+    (127 MB) is sized above the box's free RAM, so nothing upstream saves us.
+
+    Closing the raw socket makes dbus-daemon drop the connection, its match
+    rules and its queued messages immediately. Per-client buses need no
+    reaping: nothing module-level pins them, so GC closes them once the old
+    thread's stack unwinds.
+    """
+    try:
+        if old_thread is not None:
+            old_thread.join(BLE_GENERATION_REAP_TIMEOUT)
+        if not old_loop:
+            return
+        from bleak.backends.bluezdbus import manager as bluez_manager
+
+        instances = getattr(bluez_manager, "_global_instances", None)
+        if not isinstance(instances, dict):
+            logger.warning(f"BLE generation {generation} reaper for {address}: bleak has no _global_instances dict; bleak changed, reaper needs updating")
+            return
+        abandoned = instances.pop(old_loop, None)
+        if abandoned is None:
+            # bleak's own closed-loop sweep got there first, or the old
+            # generation never created a manager (e.g. it failed to connect)
+            return
+        sock = getattr(getattr(abandoned, "_bus", None), "_sock", None)
+        if sock is not None:
+            sock.close()
+        logger.warning(
+            f"BLE generation reaper for {address}: freed generation {generation}'s abandoned BlueZ manager bus; "
+            "its match rules would otherwise make dbus-daemon queue signals to it without bound"
+        )
+    except Exception as e:
+        logger.warning(f"BLE generation {generation} reaper for {address} failed: {repr(e)}")
+
+
 # Class that enables synchronous writing and reading to a bluetooh device
 class Syncron_Ble:
 
@@ -528,6 +862,16 @@ class Syncron_Ble:
 
     write_characteristic = None
     read_characteristic = None
+
+    # Episode accounting, defaulted at class level like the rest of this
+    # class's state so a partially constructed instance still reports rather
+    # than raising from a logging path.
+    _attempts = 0
+    _scans_base = 0
+    _first_link_reported = False
+    _episode_started = None
+    _episode_dropped_from = None
+    _episode_report_due = None
 
     def __init__(self, address, read_characteristic, write_characteristic):
         """
@@ -547,11 +891,24 @@ class Syncron_Ble:
         # set when the link drops, so supervision waits instead of polling
         self._disconnected = None
         self._disconnected_loop = None
+        # One line per episode instead of three or four per attempt. An
+        # episode is the span between a link dropping and coming back; the
+        # counters run from the start of the process until the first
+        # connection, then per episode.
+        self._attempts = 0
+        self._scans_base = 0
+        self._first_link_reported = False
+        self._episode_started = None
+        self._episode_dropped_from = None
+        self._episode_report_due = None
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
+        # kept so rebuild_ble_thread's reaper can join the generation it abandons
+        self._ble_async_thread = None
         ble_async_thread = threading.Thread(name="BMS_bluetooth_async_thread", target=self.initiate_ble_thread_main, daemon=True)
         ble_async_thread.start()
+        self._ble_async_thread = ble_async_thread
 
         thread_start_ok = self.ble_async_thread_ready.wait(2)
         connected_ok = self.ble_connection_ready.wait(10)
@@ -563,6 +920,12 @@ class Syncron_Ble:
             self.connected = True
 
     def initiate_ble_thread_main(self, generation=0):
+        # Once per generation, unconditionally - before anything can fail.
+        # It names the backend, which is what tells a reader whether a missing
+        # scan count means "never had to scan" or "cannot scan", and it is the
+        # only marker a first generation emits: the rebuild path announces
+        # itself, generation 0 otherwise never did.
+        logger.info(f"BLE thread for {self.address} generation {generation} started on backend {type(self.backend).__name__}")
         asyncio.run(self.async_main(self.address, generation))
 
     def rebuild_ble_thread(self):
@@ -577,8 +940,22 @@ class Syncron_Ble:
         truly hung one is abandoned (it is a daemon thread).
         """
         try:
+            self._end_episode("abandoned")
             self._ble_thread_generation += 1
             generation = self._ble_thread_generation
+            # Capture the generation being abandoned BEFORE its state is
+            # overwritten, and hand it to a reaper: the old loop's BlueZ
+            # manager bus stays pinned in bleak's module-level dict with
+            # live match rules, and nothing else ever frees it (see
+            # _reap_abandoned_ble_generation).
+            old_thread = self._ble_async_thread
+            old_loop = self.ble_async_thread_event_loop
+            threading.Thread(
+                name=f"BMS_ble_gen{generation - 1}_reaper",
+                target=_reap_abandoned_ble_generation,
+                args=(old_thread, old_loop, self.address, generation - 1),
+                daemon=True,
+            ).start()
             self.ble_async_thread_ready = threading.Event()
             self.ble_connection_ready = threading.Event()
             self.ble_async_thread_event_loop = False
@@ -591,6 +968,7 @@ class Syncron_Ble:
                 daemon=True,
             )
             ble_async_thread.start()
+            self._ble_async_thread = ble_async_thread
             started = self.ble_async_thread_ready.wait(5)
             logger.error(f"BLE thread rebuild for {self.address}: generation {generation} {'started' if started else 'FAILED TO START'}")
             return started
@@ -625,12 +1003,15 @@ class Syncron_Ble:
                         logger.warning(f"BLE hold flag {hold_flag} could not be read: {repr(e)}")
                 if not holding:
                     holding = True
+                    self._end_episode("paused")
                     logger.warning(f"BLE hold flag {hold_flag} present, pausing connection attempts for {self.address}")
                 await asyncio.sleep(BLE_HOLD_POLL_INTERVAL)
                 continue
             if holding:
                 holding = False
                 logger.info(f"BLE hold for {self.address} released, resuming connection attempts")
+            self._report_episode_still_open()
+            self._attempts += 1
             attempt_started = time.time()
             await self.connect_to_bms(self.address)
             if time.time() - attempt_started > 60.0:
@@ -639,8 +1020,103 @@ class Syncron_Ble:
                 failures = min(failures + 1, len(backoff) - 1)
             await asyncio.sleep(backoff[failures])
 
+    def _scans(self):
+        """Scans since the counters were last reset, or None if this backend cannot scan.
+
+        None and zero are different answers: a backend that resolves devices
+        itself and never had to scan hit the BlueZ cache every time, which is
+        the healthy case worth reporting, while a backend with no scan path
+        at all has nothing to say. Reporting both as 0 would make the number
+        unreadable.
+        """
+        if not getattr(self.backend, "scans_devices", False):
+            return None
+        return getattr(self.backend, "scans", 0) - self._scans_base
+
+    def _counters(self):
+        """The "N attempts, M scans" tail, with the scans token omitted where it means nothing."""
+        scans = self._scans()
+        tail = f"{self._attempts} attempts"
+        return tail if scans is None else f"{tail}, {scans} scans"
+
+    def _reset_counters(self):
+        self._attempts = 0
+        self._scans_base = getattr(self.backend, "scans", 0)
+
+    def _begin_episode(self):
+        """A link has dropped: start counting, and arm the still-down report."""
+        landed = getattr(self.backend, "landed_adapter_name", None) or getattr(self.backend, "current_adapter", None)
+        self._episode_dropped_from = landed
+        self._episode_started = time.time()
+        self._episode_report_due = self._episode_started + BLE_EPISODE_REPORT_AFTER
+        self._reset_counters()
+
+    def _end_episode(self, terminator):
+        """Emit one line for an episode that ended without the link coming back.
+
+        The reconnect loop has no give-up, so these are the only two ways an
+        episode ends other than recovery: the generation is abandoned by a
+        thread rebuild, or a hold flag stops the attempts. Both are cases
+        where the driver stops trying and the counters are the whole story.
+        """
+        if self._episode_started is None:
+            return
+        down = time.time() - self._episode_started
+        requested = describe_adapter(getattr(self.backend, "current_adapter", None))
+        dropped = describe_adapter(self._episode_dropped_from)
+        logger.info(
+            f"BLE link {terminator} for {self.address} after {down:.1f} s; "
+            f"dropped from adapter {dropped}; requested adapter {requested}; {self._counters()}"
+        )
+        self._episode_started = None
+        self._episode_report_due = None
+
+    def _report_episode_still_open(self):
+        """One line every BLE_EPISODE_REPORT_AFTER seconds while a link stays down.
+
+        The watch reads logs, not the bus: the connection state is published
+        on D-Bus, but reading it there costs real CPU on a GX device and has
+        set off load alarms. And "still down" is not the useful part - the
+        attempt and scan counts, and which adapter is being asked for, are
+        what separate a systematically failing lookup from a silent battery.
+        """
+        if self._episode_started is None or self._episode_report_due is None:
+            return
+        now = time.time()
+        if now < self._episode_report_due:
+            return
+        self._episode_report_due = now + BLE_EPISODE_REPORT_AFTER
+        requested = describe_adapter(getattr(self.backend, "current_adapter", None))
+        dropped = describe_adapter(self._episode_dropped_from)
+        logger.info(
+            f"still reconnecting to {self.address} after {now - self._episode_started:.0f} s: "
+            f"{self._counters()}, requested adapter {requested}; dropped from adapter {dropped}"
+        )
+
+    def _report_link_up(self):
+        """The one INFO line a healthy life emits, and the one an episode ends with."""
+        landed = describe_adapter(getattr(self.backend, "landed_adapter_name", None) or getattr(self.backend, "current_adapter", None))
+        if not self._first_link_reported:
+            self._first_link_reported = True
+            self._episode_started = None
+            self._episode_report_due = None
+            logger.info(f"connected to bluetooth device {self.address} on adapter {landed}; {self._counters()}")
+            return
+        if self._episode_started is None:
+            return
+        down = time.time() - self._episode_started
+        dropped = describe_adapter(self._episode_dropped_from)
+        logger.info(f"BLE link recovered for {self.address} after {down:.1f} s on adapter {landed}; " f"dropped from adapter {dropped}; {self._counters()}")
+        self._episode_started = None
+        self._episode_report_due = None
+
     def client_disconnected(self, client):
-        logger.error(f"bluetooh device with address: {self.address} disconnected")
+        # A 10-20 s BMS radio mute that the fallback covers is not an error,
+        # and logging it as one taught everyone to ignore the word. The
+        # message text is unchanged: it is the event a log watch keys on to
+        # find episode boundaries.
+        logger.info(f"bluetooh device with address: {self.address} disconnected")
+        self._begin_episode()
         self.signal_disconnected()
 
     def signal_disconnected(self):
@@ -695,9 +1171,10 @@ class Syncron_Ble:
                 self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback),
                 timeout=BLE_ESTABLISH_TIMEOUT,
             )
+            self._report_link_up()
 
         except Exception as e:
-            logger.error("Failed when trying to connect", e)
+            logger.debug(f"Failed when trying to connect: {repr(e)}")
             return False
         finally:
             self.ble_connection_ready.set()
