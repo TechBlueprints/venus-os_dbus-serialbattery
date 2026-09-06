@@ -177,9 +177,7 @@ class TestCoordinationReport:
         monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
         with caplog.at_level("INFO"):
             utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00")
-        assert (
-            "BLE coordination: bleak_connection_manager loaded from /data/bcm/src/bleak_connection_manager"
-        ) in caplog.text
+        assert ("BLE coordination: bleak_connection_manager loaded from /data/bcm/src/bleak_connection_manager") in caplog.text
 
     def test_an_absent_install_is_a_warning_not_an_error(self, _stack, monkeypatch, caplog):
         with caplog.at_level("DEBUG"):
@@ -191,20 +189,14 @@ class TestCoordinationReport:
         monkeypatch.setattr(_stack, "shared_failure", "RuntimeError('boom')", raising=False)
         with caplog.at_level("DEBUG"):
             assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
-        assert (
-            "BLE coordination: shared install at /data/bcm is present but unusable, "
-            "running uncoordinated: RuntimeError('boom')"
-        ) in caplog.text
+        assert ("BLE coordination: shared install at /data/bcm is present but unusable, " "running uncoordinated: RuntimeError('boom')") in caplog.text
         assert [r for r in caplog.records if r.levelname == "ERROR"]
 
     def test_coordination_on_with_no_folder_configured_is_reported(self, _stack, monkeypatch, caplog):
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_DIR", "", raising=False)
         with caplog.at_level("DEBUG"):
             assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
-        assert (
-            "BLE coordination: BLUETOOTH_CONNECTION_MANAGER is on but "
-            f"BLUETOOTH_CONNECTION_MANAGER_DIR is empty; {self.TAIL}"
-        ) in caplog.text
+        assert ("BLE coordination: BLUETOOTH_CONNECTION_MANAGER is on but " f"BLUETOOTH_CONNECTION_MANAGER_DIR is empty; {self.TAIL}") in caplog.text
 
     def test_a_box_that_never_asked_for_coordination_says_nothing(self, _stack, monkeypatch, caplog):
         """The upstream default - option off, no shared install - is silent. Pinned."""
@@ -214,10 +206,25 @@ class TestCoordinationReport:
         assert "BLE coordination:" not in caplog.text
 
     def test_every_line_carries_the_stable_anchor(self):
-        """The watch matches the class on this prefix, not on the sentence."""
+        """The watch matches the class on this prefix, not on the sentence: EVERY
+        logger call inside install_ble_connection_manager must start with it, and
+        the count is whatever the function emits (a magic number pins a layout,
+        not the property). parse_link_caps' own warning is outside the function."""
+        import ast
+
         with open(os.path.join(DRIVER_DIR, "utils_ble_manager.py"), encoding="utf-8") as handle:
             source = handle.read()
-        assert source.count("BLE coordination: ") == 7  # 5 states, the ImportError variant, the legacy-env notice
+        tree = ast.parse(source)
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "install_ble_connection_manager")
+        emitted = []
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and getattr(node.func.value, "id", None) == "logger":
+                arg = node.args[0]
+                first = arg.values[0] if isinstance(arg, ast.JoinedStr) else arg
+                emitted.append((node.func.attr, first.value if isinstance(first, ast.Constant) else None))
+        assert len(emitted) >= 6, emitted
+        for level, text in emitted:
+            assert isinstance(text, str) and text.startswith("BLE coordination: "), (level, text)
         assert "Failed to install the BLE connection manager" not in source
 
     def test_a_catcher_that_will_not_install_is_not_blamed_on_the_shared_tree(self, _stack, monkeypatch, caplog):
