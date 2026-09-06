@@ -585,6 +585,37 @@ def test_a_drop_before_a_life_has_a_link_is_not_an_episode(caplog, monkeypatch):
     assert "disconnected" in caplog.messages[-1]
 
 
+def test_an_outage_is_dated_from_its_first_callback_not_its_last(monkeypatch, caplog):
+    """
+    BlueZ delivers two or three disconnect callbacks for one outage. Dating
+    the episode from the latest one measures from the last callback rather
+    than from when the link went down, and under-reports the outage by the
+    gap between them - measured at up to ~5 s on a production pack.
+    """
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    battery._first_link_reported = True
+
+    clock = [1000.0]
+    monkeypatch.setattr(utils_ble.time, "time", lambda: clock[0])
+    battery.client_disconnected(None)
+    clock[0] = 1005.0
+    battery.client_disconnected(None)  # the same outage, delivered again
+    battery._begin_pending_episode()
+    assert battery._episode_started == 1000.0
+
+    # a further callback while the episode is already open must not re-stamp it
+    clock[0] = 1007.0
+    battery.client_disconnected(None)
+    battery._begin_pending_episode()
+    assert battery._episode_started == 1000.0
+
+    clock[0] = 1010.0
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery._report_link_up()
+    assert "after 10.0 s" in caplog.messages[-1]
+
+
 # --------- a pin that stops being honoured says so ---------
 #
 # Dropping unresolvable MAC entries is correct - a MAC is not a name bleak
