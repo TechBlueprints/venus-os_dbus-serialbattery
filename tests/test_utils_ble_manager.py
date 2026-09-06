@@ -179,6 +179,22 @@ class TestCoordinationReport:
             utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00")
         assert ("BLE coordination: bleak_connection_manager loaded from /data/bcm/src/bleak_connection_manager") in caplog.text
 
+    def test_a_successful_install_states_the_policy_once(self, _stack, monkeypatch, caplog):
+        """Seventh anchored line: BCM's own INFO never reaches this log (root stays at
+        WARNING), so the StartNotify policy and the adapter shape are stated by the
+        driver, once per life, right after the catcher installs."""
+        module = types.ModuleType("bleak_connection_manager")
+        module.__file__ = "/data/bcm/src/bleak_connection_manager/__init__.py"
+        module.install_bleak_catcher = lambda *a, **k: None
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY", True, raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_ADAPTERS", ["C8:47:8C:00:00:00@00:1A:7D:DA:71:13", "hci1"], raising=False)
+        with caplog.at_level("INFO"):
+            assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is True
+        line = "BLE coordination: catcher installed (force_start_notify=True, adapters=2 configured, 1 pinned)"
+        assert caplog.text.count(line) == 1, caplog.text
+        assert caplog.text.index("loaded from") < caplog.text.index("catcher installed"), "loaded first, then the policy"
+
     def test_an_absent_install_is_a_warning_not_an_error(self, _stack, monkeypatch, caplog):
         with caplog.at_level("DEBUG"):
             assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False

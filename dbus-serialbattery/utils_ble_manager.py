@@ -130,26 +130,29 @@ def install_ble_connection_manager(address):
         # box has both a shared install and this repo's ext/ble copies.
         package_dir = os.path.dirname(getattr(_bcm, "__file__", "") or "") or shared_dir
         logger.info(f"BLE coordination: bleak_connection_manager loaded from {package_dir}")
+        # Seventh anchored line (running monitor, 2026-09-06): BCM's own INFO never
+        # reaches this log (root stays at WARNING), so the policy that matters on
+        # BlueZ 5.72 is stated once per life by the driver itself.
+        adapters = list(utils.BLUETOOTH_ADAPTERS)
+        pinned = sum(1 for a in adapters if "@" in a)
+        logger.info(
+            f"BLE coordination: catcher installed (force_start_notify={utils.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY}, "
+            f"adapters={len(adapters)} configured, {pinned} pinned)"
+        )
         return True
     except ImportError:
         # No connection manager to be had. Three reasons, told apart so the
         # operator is sent to the right place.
         if ble_stack.shared_failure:
             # present, could not be imported - the install itself is the fault
-            logger.error(
-                f"BLE coordination: shared install at {shared_dir} is present but unusable, "
-                f"running uncoordinated: {ble_stack.shared_failure}"
-            )
+            logger.error(f"BLE coordination: shared install at {shared_dir} is present but unusable, " f"running uncoordinated: {ble_stack.shared_failure}")
         elif not shared_dir:
             logger.warning(
                 "BLE coordination: BLUETOOTH_CONNECTION_MANAGER is on but "
                 "BLUETOOTH_CONNECTION_MANAGER_DIR is empty; running uncoordinated, no claims, no adapter routing, no card recovery"
             )
         else:
-            logger.warning(
-                f"BLE coordination: no shared install at {shared_dir}; "
-                "running uncoordinated, no claims, no adapter routing, no card recovery"
-            )
+            logger.warning(f"BLE coordination: no shared install at {shared_dir}; " "running uncoordinated, no claims, no adapter routing, no card recovery")
         return False
     except Exception as e:
         # The install imported fine and the catcher refused to install - a bad
