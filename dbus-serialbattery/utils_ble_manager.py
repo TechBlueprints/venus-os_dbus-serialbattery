@@ -12,7 +12,6 @@ bleak, utils_ble or a BMS module at module scope itself.
 
 import inspect
 import os
-import sys
 
 import utils
 from utils import logger
@@ -132,7 +131,7 @@ def install_ble_connection_manager(address):
         package_dir = os.path.dirname(getattr(_bcm, "__file__", "") or "") or shared_dir
         logger.info(f"BLE coordination: bleak_connection_manager loaded from {package_dir}")
         return True
-    except ImportError as e:
+    except ImportError:
         # No connection manager to be had. Three reasons, told apart so the
         # operator is sent to the right place.
         if ble_stack.shared_failure:
