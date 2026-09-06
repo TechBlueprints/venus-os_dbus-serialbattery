@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Opt-in wiring for the vendored bleak-connection-manager (the bleak catcher).
+"""Opt-in wiring for the shared bleak-connection-manager (the bleak catcher).
 
 Kept separate from utils_ble on purpose: the catcher rebinds
 bleak.BleakClient process wide, and a module only picks the wrapper up
@@ -56,8 +56,35 @@ def install_ble_connection_manager(address):
     A failed install is logged and swallowed: the catcher is coordination,
     and connecting uncoordinated beats not connecting at all.
     """
+    import ble_stack
+
+    shared_dir = utils.BLUETOOTH_CONNECTION_MANAGER_DIR
+
+    # Success is worth one line whether or not the catcher is enabled: which
+    # BLE stack the process ended up on is the first thing anyone debugging
+    # this needs, and it is otherwise invisible.
+    if ble_stack.current() == "shared":
+        logger.info(f"BLE coordination: bleak_connection_manager loaded from {shared_dir}")
+
     if not utils.BLUETOOTH_CONNECTION_MANAGER:
         return False
+
+    # Past this point coordination was ASKED FOR, so not getting it is worth
+    # saying. Before it, a missing shared install is nobody's problem - which
+    # is why these three lines live below the option and not above it.
+    if not shared_dir:
+        logger.warning(
+            "BLE coordination: BLUETOOTH_CONNECTION_MANAGER is on but "
+            "BLUETOOTH_CONNECTION_MANAGER_DIR is empty; running uncoordinated"
+        )
+        return False
+    if ble_stack.shared_failure:
+        logger.error(f"BLE coordination: shared install at {shared_dir} is present but unusable: {ble_stack.shared_failure}")
+        return False
+    if ble_stack.current() != "shared":
+        logger.warning(f"BLE coordination: no shared install at {shared_dir}")
+        return False
+
     try:
         from bleak_connection_manager import install_bleak_catcher
 
@@ -81,5 +108,5 @@ def install_ble_connection_manager(address):
         )
         return True
     except Exception as e:
-        logger.error(f"Failed to install the BLE connection manager, continuing without it: {repr(e)}")
+        logger.error(f"BLE coordination: shared install at {shared_dir} is present but unusable: {repr(e)}")
         return False

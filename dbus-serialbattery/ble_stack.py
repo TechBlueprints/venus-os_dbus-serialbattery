@@ -31,6 +31,16 @@ shared_failure = None
 _decided = None
 
 
+def current():
+    """The decision this process made: "shared", "vendored", or None if undecided.
+
+    Deliberately not a log call: this module runs before utils is
+    necessarily usable and must stay importable with nothing but stdlib.
+    The caller owns reporting.
+    """
+    return _decided
+
+
 def shared_roots(shared_dir):
     """The import roots a box install exposes, in the order it exposes them."""
     ext = os.path.join(shared_dir, "ext")

@@ -69,6 +69,16 @@ class TestInstallBleConnectionManager:
         module.install_bleak_catcher = install_bleak_catcher
         monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
 
+        # The install path now requires the stack decision to have been made
+        # and to be "shared" - in the driver, ensure_ble_stack() always runs
+        # first, above the option gate. Arrange that precondition here rather
+        # than let the wiring install a catcher onto an unarranged sys.path.
+        import ble_stack
+
+        monkeypatch.setattr(ble_stack, "_decided", "shared", raising=False)
+        monkeypatch.setattr(ble_stack, "shared_failure", None, raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_DIR", "/data/bcm", raising=False)
+
         validators = types.ModuleType("bleak_connection_manager.validators")
 
         def validate_gatt_services(client):
@@ -133,3 +143,65 @@ class TestInstallBleConnectionManager:
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER", True)
         monkeypatch.setitem(sys.modules, "bleak_connection_manager", None)
         assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
+
+
+class TestCoordinationReport:
+    """One line per process about which BLE stack the driver ended up on.
+
+    The wording is the fleet contract (CONSUMER_MIGRATION.md) and every line
+    carries the literal prefix "BLE coordination: " so a log watch can anchor
+    on the class without depending on the rest of the sentence. Changing these
+    strings means telling running monitor first.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stack(self, monkeypatch):
+        import ble_stack
+
+        monkeypatch.setattr(ble_stack, "_decided", None, raising=False)
+        monkeypatch.setattr(ble_stack, "shared_failure", None, raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_DIR", "/data/bcm", raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER", True, raising=False)
+        return ble_stack
+
+    def test_a_loaded_shared_install_is_reported_once_at_info(self, _stack, monkeypatch, caplog):
+        monkeypatch.setattr(_stack, "_decided", "shared", raising=False)
+        sys.modules["bleak_connection_manager"] = types.SimpleNamespace(install_bleak_catcher=lambda *a, **k: None)
+        with caplog.at_level("INFO"):
+            utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00")
+        assert "BLE coordination: bleak_connection_manager loaded from /data/bcm" in caplog.text
+
+    def test_an_absent_install_is_a_warning_not_an_error(self, _stack, monkeypatch, caplog):
+        monkeypatch.setattr(_stack, "_decided", "vendored", raising=False)
+        with caplog.at_level("DEBUG"):
+            assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
+        assert "BLE coordination: no shared install at /data/bcm" in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+    def test_a_present_but_unusable_install_is_an_error(self, _stack, monkeypatch, caplog):
+        monkeypatch.setattr(_stack, "_decided", "vendored", raising=False)
+        monkeypatch.setattr(_stack, "shared_failure", "RuntimeError('boom')", raising=False)
+        with caplog.at_level("DEBUG"):
+            assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
+        assert "BLE coordination: shared install at /data/bcm is present but unusable: RuntimeError('boom')" in caplog.text
+        assert [r for r in caplog.records if r.levelname == "ERROR"]
+
+    def test_coordination_on_with_no_folder_configured_is_reported(self, _stack, monkeypatch, caplog):
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_DIR", "", raising=False)
+        monkeypatch.setattr(_stack, "_decided", "vendored", raising=False)
+        with caplog.at_level("DEBUG"):
+            assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
+        assert "BLUETOOTH_CONNECTION_MANAGER_DIR is empty" in caplog.text
+
+    def test_a_box_that_never_asked_for_coordination_is_not_warned(self, _stack, monkeypatch, caplog):
+        """The upstream default: option off, no shared install, nothing to say."""
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER", False, raising=False)
+        monkeypatch.setattr(_stack, "_decided", "vendored", raising=False)
+        with caplog.at_level("DEBUG"):
+            assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
+        assert "BLE coordination:" not in caplog.text
+
+    def test_the_removed_fault_wording_is_gone(self):
+        """The old line reported a decision as a fault on every start."""
+        with open(os.path.join(DRIVER_DIR, "utils_ble_manager.py"), encoding="utf-8") as handle:
+            assert "Failed to install the BLE connection manager" not in handle.read()
