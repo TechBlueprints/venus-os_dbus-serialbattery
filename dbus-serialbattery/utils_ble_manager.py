@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Opt-in wiring for the vendored bleak-connection-manager (the bleak catcher).
+"""Opt-in wiring for the shared bleak-connection-manager (the bleak catcher).
 
 Kept separate from utils_ble on purpose: the catcher rebinds
 bleak.BleakClient process wide, and a module only picks the wrapper up
@@ -125,5 +125,10 @@ def install_ble_connection_manager(address):
             )
         return False
     except Exception as e:
-        logger.error(f"Failed to install the BLE connection manager, continuing without it: {repr(e)}")
+        # The install imported fine and the catcher refused to install - a bad
+        # kwarg, a validator that raised, a bug in the catcher. Saying "the
+        # install is unusable" here would send an operator to replace a shared
+        # tree that is not the problem. (Handler and wording from
+        # feat/bcm-v2-backend 6aa3ca9.)
+        logger.error(f"BLE coordination: catcher would not install from {utils.BLUETOOTH_CONNECTION_MANAGER_DIR}, running uncoordinated: {repr(e)}")
         return False
