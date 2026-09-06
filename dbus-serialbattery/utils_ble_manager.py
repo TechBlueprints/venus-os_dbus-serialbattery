@@ -10,6 +10,9 @@ before importing any of them - which is why this module must not import
 bleak, utils_ble or a BMS module at module scope itself.
 """
 
+import os
+import sys
+
 import utils
 from utils import logger
 
@@ -64,7 +67,12 @@ def install_ble_connection_manager(address):
     # BLE stack the process ended up on is the first thing anyone debugging
     # this needs, and it is otherwise invisible.
     if ble_stack.current() == "shared":
-        logger.info(f"BLE coordination: bleak_connection_manager loaded from {shared_dir}")
+        # The PACKAGE directory, not the configured folder: it proves which
+        # tree actually served the import, which is the whole question when a
+        # box has both a shared install and this repo's ext/ble copies.
+        loaded = sys.modules.get("bleak_connection_manager")
+        package_dir = os.path.dirname(getattr(loaded, "__file__", "") or "") or shared_dir
+        logger.info(f"BLE coordination: bleak_connection_manager loaded from {package_dir}")
 
     if not utils.BLUETOOTH_CONNECTION_MANAGER:
         return False
@@ -75,14 +83,14 @@ def install_ble_connection_manager(address):
     if not shared_dir:
         logger.warning(
             "BLE coordination: BLUETOOTH_CONNECTION_MANAGER is on but "
-            "BLUETOOTH_CONNECTION_MANAGER_DIR is empty; running uncoordinated"
+            "BLUETOOTH_CONNECTION_MANAGER_DIR is empty; running uncoordinated, no claims, no adapter routing, no card recovery"
         )
         return False
     if ble_stack.shared_failure:
-        logger.error(f"BLE coordination: shared install at {shared_dir} is present but unusable: {ble_stack.shared_failure}")
+        logger.error(f"BLE coordination: shared install at {shared_dir} is present but unusable, running uncoordinated: {ble_stack.shared_failure}")
         return False
     if ble_stack.current() != "shared":
-        logger.warning(f"BLE coordination: no shared install at {shared_dir}")
+        logger.warning(f"BLE coordination: no shared install at {shared_dir}; running uncoordinated, no claims, no adapter routing, no card recovery")
         return False
 
     try:
@@ -108,5 +116,5 @@ def install_ble_connection_manager(address):
         )
         return True
     except Exception as e:
-        logger.error(f"BLE coordination: shared install at {shared_dir} is present but unusable: {repr(e)}")
+        logger.error(f"BLE coordination: shared install at {shared_dir} is present but unusable, running uncoordinated: {repr(e)}")
         return False
