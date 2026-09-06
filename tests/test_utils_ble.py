@@ -547,6 +547,44 @@ def test_the_driver_wires_the_seam_at_every_place_it_takes_a_backend():
     assert source.count("get_ble_backend()") == 1
 
 
+def test_a_drop_landing_mid_attempt_does_not_rewrite_that_attempt(caplog, monkeypatch):
+    """
+    The disconnect callback arrives at any moment, including part-way through
+    the connect that is about to succeed - a link left by a previous process
+    is delivered to its successor on restart. Resetting the counters there
+    reported a connection that took one attempt as having taken none.
+    """
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    battery._first_link_reported = True
+    battery._attempts = 1
+    # the stale link's callback lands while this attempt is still in flight
+    battery.client_disconnected(None)
+    assert battery._attempts == 1
+    battery._report_link_up()
+    # and the drop it recorded belongs to the link that just came back, so it
+    # must not open an episode on the next pass through the loop
+    battery._begin_pending_episode()
+    assert battery._episode_started is None
+
+
+def test_a_drop_before_a_life_has_a_link_is_not_an_episode(caplog, monkeypatch):
+    """
+    A callback for a link this process never had opens an outage that never
+    happened: the first connection then closes it without a recovery line,
+    and anything counting openings against recoveries is off by one for the
+    life of the driver.
+    """
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery.client_disconnected(None)
+    battery._begin_pending_episode()
+    assert battery._episode_started is None
+    # the event itself is still reported - it happened, and a watch keys on it
+    assert "disconnected" in caplog.messages[-1]
+
+
 # --------- a pin that stops being honoured says so ---------
 #
 # Dropping unresolvable MAC entries is correct - a MAC is not a name bleak
@@ -636,6 +674,9 @@ class _EpisodeBattery(utils_ble.Syncron_Ble):
     def __init__(self, backend):
         self.address = "C8:47:8C:00:00:00"
         self.backend = backend
+        # no supervision wait to wake in a test, so signalling is a no-op
+        self._disconnected = None
+        self._disconnected_loop = None
         self._reset_counters()
 
 
@@ -673,7 +714,9 @@ def test_the_counters_are_the_episode_s_not_the_process_s(monkeypatch):
     backend = _scanning_backend(scans=40)
     battery = _EpisodeBattery(backend)
     battery._attempts = 7
-    battery._begin_episode()
+    battery._first_link_reported = True
+    battery._note_drop()
+    battery._begin_pending_episode()
     backend.scans = 43
     battery._attempts = 2
     assert battery._counters() == "2 attempts, 3 scans"
@@ -684,7 +727,9 @@ def test_a_recovered_link_reports_the_episode_once(monkeypatch, caplog):
     backend = _scanning_backend(scans=5)
     battery = _EpisodeBattery(backend)
     battery._first_link_reported = True
-    battery._begin_episode()
+    battery._first_link_reported = True
+    battery._note_drop()
+    battery._begin_pending_episode()
     battery._attempts = 3
     backend.scans = 8
     with caplog.at_level("INFO", logger="SerialBattery"):
@@ -715,7 +760,9 @@ def test_an_episode_that_ends_without_recovery_still_reports(caplog, monkeypatch
     """
     monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
     battery = _EpisodeBattery(_scanning_backend())
-    battery._begin_episode()
+    battery._first_link_reported = True
+    battery._note_drop()
+    battery._begin_pending_episode()
     battery._attempts = 12
     with caplog.at_level("INFO", logger="SerialBattery"):
         battery._end_episode("abandoned")
@@ -728,7 +775,9 @@ def test_a_short_outage_says_nothing_while_it_is_open(caplog, monkeypatch):
     """Every ordinary mute must pass in silence, or the directive achieved nothing."""
     monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
     battery = _EpisodeBattery(_scanning_backend())
-    battery._begin_episode()
+    battery._first_link_reported = True
+    battery._note_drop()
+    battery._begin_pending_episode()
     with caplog.at_level("INFO", logger="SerialBattery"):
         for _ in range(50):
             battery._report_episode_still_open()
@@ -738,7 +787,9 @@ def test_a_short_outage_says_nothing_while_it_is_open(caplog, monkeypatch):
 def test_a_long_outage_reports_on_a_cadence(caplog, monkeypatch):
     monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
     battery = _EpisodeBattery(_scanning_backend())
-    battery._begin_episode()
+    battery._first_link_reported = True
+    battery._note_drop()
+    battery._begin_pending_episode()
     battery._attempts = 60
     battery._episode_report_due = time.time() - 1
     with caplog.at_level("INFO", logger="SerialBattery"):

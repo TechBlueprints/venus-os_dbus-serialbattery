@@ -881,6 +881,7 @@ class Syncron_Ble:
     _episode_started = None
     _episode_dropped_from = None
     _episode_report_due = None
+    _pending_drop = None
 
     def __init__(self, address, read_characteristic, write_characteristic):
         """
@@ -910,6 +911,7 @@ class Syncron_Ble:
         self._episode_started = None
         self._episode_dropped_from = None
         self._episode_report_due = None
+        self._pending_drop = None
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
@@ -1019,6 +1021,7 @@ class Syncron_Ble:
             if holding:
                 holding = False
                 logger.info(f"BLE hold for {self.address} released, resuming connection attempts")
+            self._begin_pending_episode()
             self._report_episode_still_open()
             self._attempts += 1
             attempt_started = time.time()
@@ -1064,12 +1067,36 @@ class Syncron_Ble:
         self._attempts = 0
         self._scans_base = getattr(self.backend, "scans", 0)
 
-    def _begin_episode(self):
-        """A link has dropped: start counting, and arm the still-down report."""
+    def _note_drop(self):
+        """Record a link dropping. Called from the disconnect callback.
+
+        The callback can arrive at any moment, including part-way through the
+        connect that is about to succeed - a link left behind by a previous
+        process is delivered to its successor, so this happens on every
+        restart where the old link outlives the new registration. Resetting
+        the counters here rewrote an in-flight attempt's history and reported
+        a connection that took one attempt as having taken none. The drop is
+        recorded instead and applied by the loop, which is the only place
+        that knows no attempt is in flight.
+
+        A drop before this life has ever had a link is not an episode: there
+        was nothing to lose, and counting it would open one that the first
+        connection then closes without ever having been an outage.
+        """
+        if not self._first_link_reported:
+            return
         landed = getattr(self.backend, "landed_adapter_name", None) or getattr(self.backend, "current_adapter", None)
+        self._pending_drop = (time.time(), landed)
+
+    def _begin_pending_episode(self):
+        """Open the episode a recorded drop started, between attempts."""
+        if self._pending_drop is None or self._episode_started is not None:
+            return
+        started, landed = self._pending_drop
+        self._pending_drop = None
         self._episode_dropped_from = landed
-        self._episode_started = time.time()
-        self._episode_report_due = self._episode_started + BLE_EPISODE_REPORT_AFTER
+        self._episode_started = started
+        self._episode_report_due = started + BLE_EPISODE_REPORT_AFTER
         self._reset_counters()
 
     def _end_episode(self, terminator):
@@ -1091,6 +1118,7 @@ class Syncron_Ble:
         )
         self._episode_started = None
         self._episode_report_due = None
+        self._pending_drop = None
 
     def _report_episode_still_open(self):
         """One line every BLE_EPISODE_REPORT_AFTER seconds while a link stays down.
@@ -1117,6 +1145,9 @@ class Syncron_Ble:
     def _report_link_up(self):
         """The one INFO line a healthy life emits, and the one an episode ends with."""
         landed = describe_adapter(getattr(self.backend, "landed_adapter_name", None) or getattr(self.backend, "current_adapter", None))
+        # a drop recorded but never opened belongs to the link that just came
+        # back, so it must not open an episode after the fact
+        self._pending_drop = None
         if not self._first_link_reported:
             self._first_link_reported = True
             self._episode_started = None
@@ -1137,7 +1168,7 @@ class Syncron_Ble:
         # message text is unchanged: it is the event a log watch keys on to
         # find episode boundaries.
         logger.info(f"bluetooh device with address: {self.address} disconnected")
-        self._begin_episode()
+        self._note_drop()
         self.signal_disconnected()
 
     def signal_disconnected(self):
