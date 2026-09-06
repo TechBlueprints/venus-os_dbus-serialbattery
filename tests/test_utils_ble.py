@@ -9,9 +9,12 @@ Everything that actually talks to a radio is left untested here.
 
 import configparser
 import importlib.util
+import logging
 import os
 import pytest
+import re
 import sys
+import time
 import types
 
 DRIVER_DIR = os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery")
@@ -515,6 +518,222 @@ def test_only_the_scanning_backend_reports_that_it_scans():
     """
     assert utils_ble.get_ble_backend("BleakRetryBackend").scans_devices is True
     assert utils_ble.get_ble_backend("BleakBackend").scans_devices is False
+
+
+# --------- one line per episode, not three per attempt ---------
+#
+# A characterised BMS radio mute lasts 10-20 s, happens a few times an hour
+# per battery, and the fallback covers it. Narrating every attempt made those
+# three lines the bulk of the log and taught readers to skip the word ERROR.
+
+
+class _EpisodeBattery(utils_ble.Syncron_Ble):
+    """A Syncron_Ble with the threads left out, so the accounting can be driven directly."""
+
+    def __init__(self, backend):
+        self.address = "C8:47:8C:00:00:00"
+        self.backend = backend
+        self._reset_counters()
+
+
+def _scanning_backend(scans=0):
+    return types.SimpleNamespace(scans_devices=True, scans=scans, current_adapter="hci5", landed_adapter_name="hci3")
+
+
+def _plain_backend():
+    return types.SimpleNamespace(scans_devices=False, current_adapter="hci5", landed_adapter_name="hci5")
+
+
+def _adapters_named():
+    return {"hci3": "00:01:95:C9:B4:C6", "hci5": "00:01:95:C9:B2:EA"}
+
+
+def test_an_adapter_is_described_by_both_names_it_answers_to():
+    assert utils_ble.describe_adapter("hci3", _adapters_named()) == "hci3 (00:01:95:C9:B4:C6)"
+
+
+def test_an_adapter_whose_identity_cannot_be_read_says_so():
+    """
+    Silence here would mean pins are not being honoured and nothing said so;
+    the string is the signal, not a cosmetic fallback.
+    """
+    assert utils_ble.describe_adapter("hci7", _adapters_named()) == "hci7 (MAC unresolved)"
+
+
+def test_the_scans_token_is_absent_when_the_backend_cannot_scan():
+    """Absent means "not applicable"; a printed 0 would mean "never needed to"."""
+    assert "scans" not in _EpisodeBattery(_plain_backend())._counters()
+    assert "0 scans" in _EpisodeBattery(_scanning_backend())._counters()
+
+
+def test_the_counters_are_the_episode_s_not_the_process_s(monkeypatch):
+    backend = _scanning_backend(scans=40)
+    battery = _EpisodeBattery(backend)
+    battery._attempts = 7
+    battery._begin_episode()
+    backend.scans = 43
+    battery._attempts = 2
+    assert battery._counters() == "2 attempts, 3 scans"
+
+
+def test_a_recovered_link_reports_the_episode_once(monkeypatch, caplog):
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    backend = _scanning_backend(scans=5)
+    battery = _EpisodeBattery(backend)
+    battery._first_link_reported = True
+    battery._begin_episode()
+    battery._attempts = 3
+    backend.scans = 8
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery._report_link_up()
+    line = "\n".join(caplog.messages)
+    assert "BLE link recovered for C8:47:8C:00:00:00" in line
+    assert "on adapter hci3 (00:01:95:C9:B4:C6)" in line
+    # the link dropped from the adapter it was actually on, not the one requested
+    assert "dropped from adapter hci3 (00:01:95:C9:B4:C6)" in line
+    assert "3 attempts, 3 scans" in line
+    # and the episode is closed, so nothing repeats it
+    assert battery._episode_started is None
+
+
+def test_the_first_link_of_a_life_is_reported_and_is_not_a_recovery(caplog, monkeypatch):
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery._report_link_up()
+    assert "connected to bluetooth device C8:47:8C:00:00:00" in caplog.messages[0]
+    assert "recovered" not in caplog.messages[0]
+
+
+def test_an_episode_that_ends_without_recovery_still_reports(caplog, monkeypatch):
+    """
+    The reconnect loop never gives up, so these two are the only non-recovery
+    endings there are: a rebuild abandons the generation, or a hold stops it.
+    """
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    battery._begin_episode()
+    battery._attempts = 12
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery._end_episode("abandoned")
+    assert "BLE link abandoned for C8:47:8C:00:00:00" in caplog.messages[0]
+    assert "12 attempts" in caplog.messages[0]
+    assert battery._episode_started is None
+
+
+def test_a_short_outage_says_nothing_while_it_is_open(caplog, monkeypatch):
+    """Every ordinary mute must pass in silence, or the directive achieved nothing."""
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    battery._begin_episode()
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        for _ in range(50):
+            battery._report_episode_still_open()
+    assert caplog.messages == []
+
+
+def test_a_long_outage_reports_on_a_cadence(caplog, monkeypatch):
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    battery._begin_episode()
+    battery._attempts = 60
+    battery._episode_report_due = time.time() - 1
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery._report_episode_still_open()
+        # immediately again: the cadence must have re-armed, not re-fired
+        battery._report_episode_still_open()
+    assert len(caplog.messages) == 1
+    assert "still reconnecting to C8:47:8C:00:00:00" in caplog.messages[0]
+    assert "60 attempts" in caplog.messages[0]
+    assert "requested adapter hci5 (00:01:95:C9:B2:EA)" in caplog.messages[0]
+
+
+def test_bleak_s_bluez_gone_warning_is_filtered_and_nothing_else_is():
+    filt = utils_ble.silence_bluez_gone_warning()
+
+    def record(msg):
+        return logging.LogRecord("bleak.backends.bluezdbus.client", logging.WARNING, __file__, 1, msg, None, None)
+
+    assert filt.filter(record("Failed to cancel connection (/org/bluez/hci3/dev_X): ServiceUnknown")) is False
+    # a real teardown failure, and an unrelated warning, both survive
+    assert filt.filter(record("Failed to cancel connection (/org/bluez/hci3/dev_X): TimedOut")) is True
+    assert filt.filter(record("ServiceUnknown while connecting")) is True
+
+
+def test_installing_the_filter_twice_does_not_stack_it():
+    first = utils_ble.silence_bluez_gone_warning()
+    assert utils_ble.silence_bluez_gone_warning() is first
+
+
+# --------- log lines a watch depends on ---------
+#
+# These strings are matched by scripts outside this repo. A level demotion
+# deletes a line from a watch running at INFO just as surely as a reword
+# does, and it is invisible to every other test in this file - which is why
+# it needs one of its own.
+
+WATCHED_LINES = (
+    # the disconnect event: episode boundaries are counted from it. Upstream's
+    # spelling, deliberately unfixed - the watch matches this text.
+    "bluetooh device with address",
+    # the episode summary that replaced the per-attempt narration
+    "BLE link recovered for",
+    # the still-down report during a long outage
+    "still reconnecting to",
+    # the once-per-life line that says the link came up at all
+    "connected to bluetooth device",
+    # the once-per-generation line naming the backend, which is what makes an
+    # absent scan count readable
+    "BLE thread for",
+)
+
+
+def _utils_ble_source():
+    with open(os.path.join(DRIVER_DIR, "utils_ble.py"), encoding="utf-8") as f:
+        return f.read()
+
+
+def _emitting_methods(source, watched):
+    """The logger method enclosing every occurrence of a watched string.
+
+    Scans back from the string to the logger call that contains it, rather
+    than looking for both on one line: the formatter wraps a long call across
+    lines, and a line-by-line scan would find no logger call at all and pass
+    by finding nothing.
+    """
+    methods = []
+    start = 0
+    while True:
+        found = source.find(watched, start)
+        if found == -1:
+            return methods
+        start = found + 1
+        call = source.rfind("logger.", 0, found)
+        if call != -1:
+            methods.append(source[call:].split("(", 1)[0])
+
+
+def test_watched_lines_are_emitted_at_info_or_above():
+    source = _utils_ble_source()
+    for watched in WATCHED_LINES:
+        methods = _emitting_methods(source, watched)
+        assert methods, f"watched string {watched!r} is no longer logged anywhere"
+        for method in methods:
+            assert method != "logger.debug", (
+                f"{watched!r} is logged at DEBUG, which deletes it from a watch running at INFO. " "Re-key the watch before demoting it."
+            )
+
+
+def test_no_watched_line_spans_more_than_one_record():
+    """
+    The consumer treats one line as one event, so an embedded newline splits
+    a single event into two and corrupts every count derived from it.
+    """
+    source = _utils_ble_source()
+    for watched in WATCHED_LINES:
+        for match in re.finditer(re.escape(watched), source):
+            statement = source[source.rfind("logger.", 0, match.start()) : match.end()]
+            assert "\\n" not in statement, f"watched log line {watched!r} contains an embedded newline"
 
 
 # --------- adapter pinning by MAC ---------

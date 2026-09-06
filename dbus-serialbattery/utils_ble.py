@@ -1,5 +1,6 @@
 import threading
 import asyncio
+import logging
 import os
 import re
 import subprocess
@@ -292,6 +293,62 @@ def pin_adapters_by_mac(path=None, adapters=None):
     return True
 
 
+# bleak warns "Failed to cancel connection (<path>): ServiceUnknown" whenever
+# it tears down a client while bluetoothd is not on the bus - which is every
+# reconnect during a bluetoothd restart, exactly when the log is being read.
+# The condition is already handled: the object is gone, so the link is gone,
+# which is what the teardown wanted. Filtered by message on the one logger
+# that emits it rather than by raising that logger's threshold, because the
+# threshold also hides bleak's genuine connect diagnostics from the same
+# window.
+BLEAK_CLIENT_LOGGER = "bleak.backends.bluezdbus.client"
+BLEAK_SILENCED_MESSAGE = "Failed to cancel connection"
+BLEAK_SILENCED_REASON = "ServiceUnknown"
+
+
+class _BluezGoneFilter(logging.Filter):
+    """Drop bleak's teardown warning for a BlueZ that has gone away."""
+
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not (BLEAK_SILENCED_MESSAGE in message and BLEAK_SILENCED_REASON in message)
+
+
+def silence_bluez_gone_warning(logger_name=BLEAK_CLIENT_LOGGER):
+    """Install the filter once; returns it so a caller can remove it again."""
+    target = logging.getLogger(logger_name)
+    for existing in target.filters:
+        if isinstance(existing, _BluezGoneFilter):
+            return existing
+    installed = _BluezGoneFilter()
+    target.addFilter(installed)
+    return installed
+
+
+silence_bluez_gone_warning()
+
+
+def describe_adapter(name, adapters=None):
+    """
+    An adapter as "hciN (MAC)", for a log line a human has to act on.
+
+    Both halves earn their place. hciN is what the running system calls it
+    right now and what an operator types; the MAC is what the card will
+    still be called after the next reboot renumbers it. "(MAC unresolved)"
+    is not cosmetic - it means identity could not be read, so MAC pins are
+    not being honoured, and it is worth noticing in a log.
+    """
+    if not name:
+        return "unknown"
+    if adapters is None:
+        adapters = bluez_adapters()
+    mac = adapters.get(name)
+    return f"{name} ({mac})" if mac else f"{name} (MAC unresolved)"
+
+
 def adapters_in_attempt_order(address, present=None):
     """
     Adapters to try for this battery, best first, as hciN names.
@@ -359,6 +416,14 @@ def ble_hold_flag_path(address):
 # battery for the whole life of every connection and showed up as run-queue
 # churn on a loaded GX device.
 BLE_SUPERVISION_RECHECK = 5.0
+
+# How long an episode - the span between a link dropping and coming back -
+# may stay open before it says so, and how often it repeats after that. A
+# characterised BMS radio mute lasts 10-20 s and the fallback covers it, so
+# the first line lands well past every ordinary one: an outage has to be
+# genuinely unusual to say anything at all. In a sustained outage this is 12
+# lines an hour per battery, and none otherwise.
+BLE_EPISODE_REPORT_AFTER = 300.0
 
 BLE_ESTABLISH_TIMEOUT = 300.0
 BLE_RELEASE_TIMEOUT = 30.0
@@ -585,10 +650,9 @@ class BleakBackend(BleConnectionBackend):
             raise
 
     async def _establish(self, client, address, notify_char, notify_callback):
-        logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
+        logger.debug("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
         await client.connect()
         self._record_landed(client)
-        logger.info("connected to bluetooh device" + address)
         await start_notify_when_resolved(client, notify_char, notify_callback)
         return client
 
@@ -642,7 +706,7 @@ class BleakRetryBackend(BleConnectionBackend):
             raise
 
     async def _establish(self, client, address, notify_char, notify_callback):
-        logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
+        logger.debug("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
         device = await self._resolve_device(address)
         if device is None:
             raise BleakError(f"bluetooth device {address} not found" + (f" on adapter {self.current_adapter}" if self.current_adapter else ""))
@@ -650,7 +714,6 @@ class BleakRetryBackend(BleConnectionBackend):
         kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
         client = await retry_establish_connection(BleakClient, device, address, disconnected_callback=self.disconnected_callback, **kwargs)
         self._record_landed(client)
-        logger.info("connected to bluetooth device " + address)
         await start_notify_when_resolved(client, notify_char, notify_callback)
         return client
 
@@ -667,7 +730,7 @@ class BleakRetryBackend(BleConnectionBackend):
             device = await get_device(address)
         if device is None:
             self.scans += 1
-            logger.info(f"bluetooth device {address} not in BlueZ cache, scanning")
+            logger.debug(f"bluetooth device {address} not in BlueZ cache, scanning")
             kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
             device = await BleakScanner.find_device_by_address(address, timeout=10.0, **kwargs)
         return device
@@ -758,6 +821,16 @@ class Syncron_Ble:
     write_characteristic = None
     read_characteristic = None
 
+    # Episode accounting, defaulted at class level like the rest of this
+    # class's state so a partially constructed instance still reports rather
+    # than raising from a logging path.
+    _attempts = 0
+    _scans_base = 0
+    _first_link_reported = False
+    _episode_started = None
+    _episode_dropped_from = None
+    _episode_report_due = None
+
     def __init__(self, address, read_characteristic, write_characteristic):
         """
         address: the address of the bluetooth device to read and write to
@@ -776,6 +849,16 @@ class Syncron_Ble:
         # set when the link drops, so supervision waits instead of polling
         self._disconnected = None
         self._disconnected_loop = None
+        # One line per episode instead of three or four per attempt. An
+        # episode is the span between a link dropping and coming back; the
+        # counters run from the start of the process until the first
+        # connection, then per episode.
+        self._attempts = 0
+        self._scans_base = 0
+        self._first_link_reported = False
+        self._episode_started = None
+        self._episode_dropped_from = None
+        self._episode_report_due = None
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
@@ -795,6 +878,12 @@ class Syncron_Ble:
             self.connected = True
 
     def initiate_ble_thread_main(self, generation=0):
+        # Once per generation, unconditionally - before anything can fail.
+        # It names the backend, which is what tells a reader whether a missing
+        # scan count means "never had to scan" or "cannot scan", and it is the
+        # only marker a first generation emits: the rebuild path announces
+        # itself, generation 0 otherwise never did.
+        logger.info(f"BLE thread for {self.address} generation {generation} started on backend {type(self.backend).__name__}")
         asyncio.run(self.async_main(self.address, generation))
 
     def rebuild_ble_thread(self):
@@ -809,6 +898,7 @@ class Syncron_Ble:
         truly hung one is abandoned (it is a daemon thread).
         """
         try:
+            self._end_episode("abandoned")
             self._ble_thread_generation += 1
             generation = self._ble_thread_generation
             # Capture the generation being abandoned BEFORE its state is
@@ -871,12 +961,15 @@ class Syncron_Ble:
                         logger.warning(f"BLE hold flag {hold_flag} could not be read: {repr(e)}")
                 if not holding:
                     holding = True
+                    self._end_episode("paused")
                     logger.warning(f"BLE hold flag {hold_flag} present, pausing connection attempts for {self.address}")
                 await asyncio.sleep(BLE_HOLD_POLL_INTERVAL)
                 continue
             if holding:
                 holding = False
                 logger.info(f"BLE hold for {self.address} released, resuming connection attempts")
+            self._report_episode_still_open()
+            self._attempts += 1
             attempt_started = time.time()
             await self.connect_to_bms(self.address)
             if time.time() - attempt_started > 60.0:
@@ -885,8 +978,103 @@ class Syncron_Ble:
                 failures = min(failures + 1, len(backoff) - 1)
             await asyncio.sleep(backoff[failures])
 
+    def _scans(self):
+        """Scans since the counters were last reset, or None if this backend cannot scan.
+
+        None and zero are different answers: a backend that resolves devices
+        itself and never had to scan hit the BlueZ cache every time, which is
+        the healthy case worth reporting, while a backend with no scan path
+        at all has nothing to say. Reporting both as 0 would make the number
+        unreadable.
+        """
+        if not getattr(self.backend, "scans_devices", False):
+            return None
+        return getattr(self.backend, "scans", 0) - self._scans_base
+
+    def _counters(self):
+        """The "N attempts, M scans" tail, with the scans token omitted where it means nothing."""
+        scans = self._scans()
+        tail = f"{self._attempts} attempts"
+        return tail if scans is None else f"{tail}, {scans} scans"
+
+    def _reset_counters(self):
+        self._attempts = 0
+        self._scans_base = getattr(self.backend, "scans", 0)
+
+    def _begin_episode(self):
+        """A link has dropped: start counting, and arm the still-down report."""
+        landed = getattr(self.backend, "landed_adapter_name", None) or getattr(self.backend, "current_adapter", None)
+        self._episode_dropped_from = landed
+        self._episode_started = time.time()
+        self._episode_report_due = self._episode_started + BLE_EPISODE_REPORT_AFTER
+        self._reset_counters()
+
+    def _end_episode(self, terminator):
+        """Emit one line for an episode that ended without the link coming back.
+
+        The reconnect loop has no give-up, so these are the only two ways an
+        episode ends other than recovery: the generation is abandoned by a
+        thread rebuild, or a hold flag stops the attempts. Both are cases
+        where the driver stops trying and the counters are the whole story.
+        """
+        if self._episode_started is None:
+            return
+        down = time.time() - self._episode_started
+        requested = describe_adapter(getattr(self.backend, "current_adapter", None))
+        dropped = describe_adapter(self._episode_dropped_from)
+        logger.info(
+            f"BLE link {terminator} for {self.address} after {down:.1f} s; "
+            f"dropped from adapter {dropped}; requested adapter {requested}; {self._counters()}"
+        )
+        self._episode_started = None
+        self._episode_report_due = None
+
+    def _report_episode_still_open(self):
+        """One line every BLE_EPISODE_REPORT_AFTER seconds while a link stays down.
+
+        The watch reads logs, not the bus: the connection state is published
+        on D-Bus, but reading it there costs real CPU on a GX device and has
+        set off load alarms. And "still down" is not the useful part - the
+        attempt and scan counts, and which adapter is being asked for, are
+        what separate a systematically failing lookup from a silent battery.
+        """
+        if self._episode_started is None or self._episode_report_due is None:
+            return
+        now = time.time()
+        if now < self._episode_report_due:
+            return
+        self._episode_report_due = now + BLE_EPISODE_REPORT_AFTER
+        requested = describe_adapter(getattr(self.backend, "current_adapter", None))
+        dropped = describe_adapter(self._episode_dropped_from)
+        logger.info(
+            f"still reconnecting to {self.address} after {now - self._episode_started:.0f} s: "
+            f"{self._counters()}, requested adapter {requested}; dropped from adapter {dropped}"
+        )
+
+    def _report_link_up(self):
+        """The one INFO line a healthy life emits, and the one an episode ends with."""
+        landed = describe_adapter(getattr(self.backend, "landed_adapter_name", None) or getattr(self.backend, "current_adapter", None))
+        if not self._first_link_reported:
+            self._first_link_reported = True
+            self._episode_started = None
+            self._episode_report_due = None
+            logger.info(f"connected to bluetooth device {self.address} on adapter {landed}; {self._counters()}")
+            return
+        if self._episode_started is None:
+            return
+        down = time.time() - self._episode_started
+        dropped = describe_adapter(self._episode_dropped_from)
+        logger.info(f"BLE link recovered for {self.address} after {down:.1f} s on adapter {landed}; " f"dropped from adapter {dropped}; {self._counters()}")
+        self._episode_started = None
+        self._episode_report_due = None
+
     def client_disconnected(self, client):
-        logger.error(f"bluetooh device with address: {self.address} disconnected")
+        # A 10-20 s BMS radio mute that the fallback covers is not an error,
+        # and logging it as one taught everyone to ignore the word. The
+        # message text is unchanged: it is the event a log watch keys on to
+        # find episode boundaries.
+        logger.info(f"bluetooh device with address: {self.address} disconnected")
+        self._begin_episode()
         self.signal_disconnected()
 
     def signal_disconnected(self):
@@ -941,9 +1129,10 @@ class Syncron_Ble:
                 self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback),
                 timeout=BLE_ESTABLISH_TIMEOUT,
             )
+            self._report_link_up()
 
         except Exception as e:
-            logger.error("Failed when trying to connect", e)
+            logger.debug(f"Failed when trying to connect: {repr(e)}")
             return False
         finally:
             self.ble_connection_ready.set()
