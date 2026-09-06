@@ -266,7 +266,11 @@ BLUETOOTH_CONNECTION_BACKEND: str = config["DEFAULT"]["BLUETOOTH_CONNECTION_BACK
 # joins the shared pool, an entry of the form MAC@hciX pins that device to that
 # adapter. Empty list = use the system default adapter.
 BLUETOOTH_ADAPTERS: List[str] = get_list_from_config("DEFAULT", "BLUETOOTH_ADAPTERS", str)
-# Opt-in: route every bleak client in this process through the vendored
+# Folder holding a shared bleak-connection-manager install (its src/ and
+# ext/ are added to sys.path when present). Empty means never look, which
+# is the default: a box without a shared install runs plain vendored bleak.
+BLUETOOTH_CONNECTION_MANAGER_DIR: str = config["DEFAULT"]["BLUETOOTH_CONNECTION_MANAGER_DIR"].strip()
+# Opt-in: route every bleak client in this process through the shared
 # bleak-connection-manager (claim-aware adapter selection, link slots,
 # connection parameter tuning), coordinated across processes via /run/bt-claims
 BLUETOOTH_CONNECTION_MANAGER: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER")

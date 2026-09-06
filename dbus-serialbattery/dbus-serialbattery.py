@@ -409,6 +409,16 @@ def main():
         else:
             ble_address = sys.argv[2]
 
+            # Arrange the BLE stack FIRST: this decides whether the box's
+            # shared connection manager or this repo's ext/ble copies end up
+            # on sys.path. Unconditional and above the option below, because
+            # the driver needs an importable bleak whether or not the
+            # connection manager is enabled or even installed.
+            from ble_stack import ensure_ble_stack
+            from utils import BLUETOOTH_CONNECTION_MANAGER_DIR
+
+            ensure_ble_stack(BLUETOOTH_CONNECTION_MANAGER_DIR)
+
             # Must run before the BMS modules below are imported: they (and
             # utils_ble) capture `from bleak import BleakClient` at import
             # time, and only pick up the connection manager's routed client
@@ -475,6 +485,16 @@ def main():
             exit_driver(None, None, 1)
         else:
             ble_address = sys.argv[2]
+
+            # Arrange the BLE stack FIRST: this decides whether the box's
+            # shared connection manager or this repo's ext/ble copies end up
+            # on sys.path. Unconditional and above the option below, because
+            # the driver needs an importable bleak whether or not the
+            # connection manager is enabled or even installed.
+            from ble_stack import ensure_ble_stack
+            from utils import BLUETOOTH_CONNECTION_MANAGER_DIR
+
+            ensure_ble_stack(BLUETOOTH_CONNECTION_MANAGER_DIR)
 
             # Before the aiobmsble import chain, for the same reason as above.
             # aiobmsble is the main beneficiary: its BaseBMS._connect is
