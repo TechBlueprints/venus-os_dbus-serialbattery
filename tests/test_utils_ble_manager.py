@@ -148,7 +148,7 @@ class TestInstallBleConnectionManager:
 class TestCoordinationReport:
     """One line per process about which BLE stack the driver ended up on.
 
-    The wording below is the FLEET CONTRACT (CONSUMER_MIGRATION.md) and is
+    The wording below is the FLEET CONTRACT (CONSUMERS.md) and is
     pinned verbatim: running monitor's log watches anchor on it, and the other
     consumers emit the same sentences. Changing any of these strings means
     telling running monitor first, not after.
