@@ -458,6 +458,65 @@ def test_neither_backend_subscribes_without_the_rebuild_guard():
         assert "client.start_notify(" not in source
 
 
+# --------- which adapter the link actually landed on ---------
+#
+# The adapter a backend asks for and the one the link comes up on are not the
+# same thing: bleak-retry-connector swaps in BlueZ's already-connected copy
+# when a link lingers on another card, so state keyed to the request then
+# describes the wrong radio.
+
+
+def _client_on(path):
+    return types.SimpleNamespace(_backend=types.SimpleNamespace(_device_path=path))
+
+
+def test_the_landed_adapter_comes_from_bluez_s_own_object_path():
+    assert utils_ble.landed_adapter(_client_on("/org/bluez/hci3/dev_C8_47_8C_00_00_00")) == "hci3"
+
+
+def test_a_two_digit_adapter_is_not_truncated():
+    """hci1 must never be read out of hci10 - the box has ten radios."""
+    assert utils_ble.landed_adapter(_client_on("/org/bluez/hci10/dev_C8_47_8C_00_00_00")) == "hci10"
+
+
+def test_an_unreadable_path_is_unknown_rather_than_the_requested_name():
+    """
+    A bleak that moves the attribute must degrade to "we cannot tell", never
+    to "it landed where we asked" - the second is a lie the log would repeat.
+    """
+    assert utils_ble.landed_adapter(_client_on(None)) is None
+    assert utils_ble.landed_adapter(types.SimpleNamespace()) is None
+    assert utils_ble.landed_adapter(_client_on("/org/bluez/dev_C8_47_8C_00_00_00")) is None
+
+
+def test_the_landed_adapter_replaces_the_requested_one_in_backend_state():
+    backend = utils_ble.get_ble_backend("BleakBackend")
+    backend.current_adapter = "hci5"
+    landed = backend._record_landed(_client_on("/org/bluez/hci3/dev_C8_47_8C_00_00_00"))
+    assert landed == "hci3"
+    assert backend.current_adapter == "hci3"
+    # the request is kept, because the two differing is the signal
+    assert backend.requested_adapter == "hci5"
+
+
+def test_an_unknown_landing_leaves_the_requested_adapter_alone():
+    backend = utils_ble.get_ble_backend("BleakBackend")
+    backend.current_adapter = "hci5"
+    assert backend._record_landed(types.SimpleNamespace()) is None
+    assert backend.current_adapter == "hci5"
+    assert backend.landed_adapter_name is None
+
+
+def test_only_the_scanning_backend_reports_that_it_scans():
+    """
+    A scan count of zero means "cache hit every time" on a backend that can
+    scan, and nothing at all on one that cannot; the two must be tellable
+    apart or the count is unreadable.
+    """
+    assert utils_ble.get_ble_backend("BleakRetryBackend").scans_devices is True
+    assert utils_ble.get_ble_backend("BleakBackend").scans_devices is False
+
+
 # --------- adapter pinning by MAC ---------
 #
 # hciN numbering is assigned in probe order: a reboot or USB reset can renumber

@@ -452,6 +452,37 @@ async def start_notify_when_resolved(client, notify_char, notify_callback):
             await asyncio.sleep(GATT_REDISCOVERY_SETTLE)
 
 
+def landed_adapter(client):
+    """
+    The adapter a connected client's link is actually on, as hciN, or None.
+
+    The adapter a backend ASKS for and the one a link ends up on are not the
+    same thing. bleak-retry-connector swaps the BLEDevice for BlueZ's
+    already-connected copy when one exists on any adapter, so a battery can
+    be bound to a card the driver did not select - and every piece of state
+    keyed to the request is then describing the wrong radio.
+
+    BlueZ's own object path is the answer: a device lives under the adapter
+    holding it, so /org/bluez/hci3/dev_... means hci3 whatever was asked for.
+    bleak keeps that path on the backend and prefers it over the requested
+    name itself when it needs the adapter. The attribute is private and read
+    defensively, because a bleak that moves it should degrade to "unknown"
+    rather than silently report the request as though it were the outcome.
+
+    Read it AFTER connect and carry the answer. It is populated at different
+    moments on the two backends - at construction from a BLEDevice, only
+    during connect() from a bare address - and cleared again on teardown, so
+    after-connect is the one moment correct for both.
+    """
+    path = getattr(getattr(client, "_backend", None), "_device_path", None)
+    if not path:
+        return None
+    for part in str(path).split("/"):
+        if re.fullmatch(r"hci\d+", part):
+            return part
+    return None
+
+
 class BleConnectionBackend:
     """
     Interface for establishing and releasing BLE connections.
@@ -461,6 +492,28 @@ class BleConnectionBackend:
     alternative connection strategies can be plugged in without touching the
     drivers.
     """
+
+    # the adapter this backend asked for, and the one the link came up on;
+    # they differ whenever a lingering link elsewhere is adopted
+    requested_adapter = None
+    landed_adapter_name = None
+    # only backends that resolve a device themselves ever scan
+    scans_devices = False
+
+    def _record_landed(self, client):
+        """Remember which adapter the link actually came up on.
+
+        current_adapter is what the rest of the driver reports and reasons
+        about, so it must describe the live link rather than the request that
+        started it. The requested name is kept alongside: the two differing
+        is the signal that a link elsewhere was adopted.
+        """
+        self.requested_adapter = self.current_adapter
+        landed = landed_adapter(client)
+        self.landed_adapter_name = landed
+        if landed:
+            self.current_adapter = landed
+        return landed
 
     def create_client(self, address, disconnected_callback):
         """
@@ -534,6 +587,7 @@ class BleakBackend(BleConnectionBackend):
     async def _establish(self, client, address, notify_char, notify_callback):
         logger.info("initiating BLE connection to: " + address + (f" (adapter {self.current_adapter})" if self.current_adapter else ""))
         await client.connect()
+        self._record_landed(client)
         logger.info("connected to bluetooh device" + address)
         await start_notify_when_resolved(client, notify_char, notify_callback)
         return client
@@ -556,10 +610,15 @@ class BleakRetryBackend(BleConnectionBackend):
     attempt.
     """
 
+    scans_devices = True
+
     def __init__(self):
         self.adapter_index = 0
         self.current_adapter = None
         self.disconnected_callback = None
+        # scans performed for the current episode; the driver reads and
+        # resets it, so it counts per episode rather than for all time
+        self.scans = 0
 
     def _select_adapter(self, address):
         """Same selection contract as BleakBackend: live order, failure-driven index."""
@@ -590,6 +649,7 @@ class BleakRetryBackend(BleConnectionBackend):
         await close_stale_connections(device)
         kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
         client = await retry_establish_connection(BleakClient, device, address, disconnected_callback=self.disconnected_callback, **kwargs)
+        self._record_landed(client)
         logger.info("connected to bluetooth device " + address)
         await start_notify_when_resolved(client, notify_char, notify_callback)
         return client
@@ -606,6 +666,7 @@ class BleakRetryBackend(BleConnectionBackend):
         else:
             device = await get_device(address)
         if device is None:
+            self.scans += 1
             logger.info(f"bluetooth device {address} not in BlueZ cache, scanning")
             kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
             device = await BleakScanner.find_device_by_address(address, timeout=10.0, **kwargs)
