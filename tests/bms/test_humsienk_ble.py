@@ -670,3 +670,63 @@ def test_the_driver_carries_no_fallback_machinery():
     import inspect
 
     assert "fallback" not in inspect.getsource(humsienk_ble).lower()
+
+
+# ------------------------------------------------- the link-up report hook
+#
+# Field 2026-09-06, prod RS pack, first life on the de-vendored driver: the
+# life was healthy but utils_ble's once-per-life "connected to bluetooth
+# device ... on adapter" line and its "BLE link recovered for" episode
+# terminator never appeared. HumsiENK_Syncron_Ble.connect_to_bms replaces the
+# base method wholesale, and the base is where _report_link_up() is called;
+# client_disconnected is inherited, so an episode OPENED in the watch and
+# never closed. The override must report through the same hook.
+
+
+def _connect_double(report_hook):
+    import asyncio
+
+    sync = object.__new__(humsienk_ble.HumsiENK_Syncron_Ble)
+
+    class Backend:
+        def create_client(self, address, on_disconnect):
+            return "client"
+
+        async def establish(self, client, address, read_characteristic, callback):
+            return client
+
+        async def release(self, client):
+            return None
+
+    async def supervise_link():
+        return None
+
+    sync.backend = Backend()
+    sync.read_characteristic = "rx"
+    sync.notify_read_callback = lambda *args: None
+    sync.feed_watchdog = lambda: None
+    sync.supervise_link = supervise_link
+    sync.connected = False
+    sync.client = None
+    if report_hook is not None:
+        sync._report_link_up = report_hook
+
+    async def run():
+        sync.ble_connection_ready = asyncio.Event()
+        return await sync.connect_to_bms("53:20:B7:D7:F9:E7")
+
+    asyncio.run(run())
+    return sync
+
+
+def test_a_successful_connect_reports_the_link_up_through_utils_ble_hook():
+    calls = []
+    sync = _connect_double(lambda: calls.append("up"))
+    assert calls == ["up"], "the base class's once-per-life / episode-terminator report must fire exactly once per connect"
+    assert sync.connected is False, "teardown still runs after supervision ends"
+
+
+def test_an_older_utils_ble_without_the_hook_still_connects():
+    sync = _connect_double(None)
+    assert not hasattr(sync, "_report_link_up")
+    assert sync.connected is False

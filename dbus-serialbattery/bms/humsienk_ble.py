@@ -153,6 +153,15 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
             )
             self.feed_watchdog()
             self.connected = True
+            # utils_ble's once-per-life "connected to bluetooth device ... on
+            # adapter" line and its "BLE link recovered for" episode terminator
+            # are emitted by the base connect_to_bms this override replaces
+            # (utils_ble.py: _report_link_up). Field 2026-09-06, prod: without
+            # this call an episode opened by client_disconnected never closed in
+            # the watch. Looked up by name so this file pairs with any utils_ble.
+            report_link_up = getattr(self, "_report_link_up", None)
+            if callable(report_link_up):
+                report_link_up()
         except Exception as e:
             logger.error(f"Failed when trying to connect: {e}")
             return False
