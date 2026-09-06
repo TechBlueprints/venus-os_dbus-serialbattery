@@ -22,7 +22,7 @@ connection manager is enabled - importability is not a feature flag.
 
 This module is the reference implementation of the consumer contract for
 every service on the box that uses the shared install (see the connection
-manager's CONSUMER_MIGRATION.md). It imports nothing from this driver: lift
+manager's CONSUMERS.md). It imports nothing from this driver: lift
 it as-is and pass your own vendored fallback directory, or none.
 """
 
