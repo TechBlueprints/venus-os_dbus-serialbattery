@@ -219,5 +219,29 @@ class TestCoordinationReport:
         """The watch matches the class on this prefix, not on the sentence."""
         with open(os.path.join(DRIVER_DIR, "utils_ble_manager.py"), encoding="utf-8") as handle:
             source = handle.read()
-        assert source.count("BLE coordination: ") == 5  # 4 states, one repeated for the install failure
+        assert source.count("BLE coordination: ") == 6  # 5 states + the ImportError variant
         assert "Failed to install the BLE connection manager" not in source
+
+    def test_a_catcher_that_will_not_install_is_not_blamed_on_the_shared_tree(self, _stack, monkeypatch, caplog):
+        """An install failure and an unusable install are different faults.
+
+        Reporting a bad kwarg or a raising validator as "the shared install is
+        present but unusable" sends an operator to replace a tree that is fine.
+        Caught by serialbattery-bcmv2 in the symbol diff of 425d813.
+        """
+        module = types.ModuleType("bleak_connection_manager")
+        module.__file__ = "/data/bcm/src/bleak_connection_manager/__init__.py"
+
+        def install_bleak_catcher(owner, **kwargs):
+            raise TypeError("unexpected keyword argument")
+
+        module.install_bleak_catcher = install_bleak_catcher
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
+        monkeypatch.setattr(_stack, "_decided", "shared", raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_VALIDATION", False, raising=False)
+
+        with caplog.at_level("DEBUG"):
+            assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
+
+        assert "catcher would not install from /data/bcm" in caplog.text
+        assert "is present but unusable" not in caplog.text

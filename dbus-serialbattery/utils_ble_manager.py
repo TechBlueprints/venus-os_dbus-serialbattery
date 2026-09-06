@@ -63,9 +63,12 @@ def install_ble_connection_manager(address):
 
     shared_dir = utils.BLUETOOTH_CONNECTION_MANAGER_DIR
 
-    # Success is worth one line whether or not the catcher is enabled: which
-    # BLE stack the process ended up on is the first thing anyone debugging
-    # this needs, and it is otherwise invisible.
+    if not utils.BLUETOOTH_CONNECTION_MANAGER:
+        # Silent. A box that never asked for coordination has nothing to
+        # report, and "loaded from" is what the fleet's log watch reads as
+        # coordination ACTIVE - which it would not be with the catcher off.
+        return False
+
     if ble_stack.current() == "shared":
         # The PACKAGE directory, not the configured folder: it proves which
         # tree actually served the import, which is the whole question when a
@@ -74,12 +77,6 @@ def install_ble_connection_manager(address):
         package_dir = os.path.dirname(getattr(loaded, "__file__", "") or "") or shared_dir
         logger.info(f"BLE coordination: bleak_connection_manager loaded from {package_dir}")
 
-    if not utils.BLUETOOTH_CONNECTION_MANAGER:
-        return False
-
-    # Past this point coordination was ASKED FOR, so not getting it is worth
-    # saying. Before it, a missing shared install is nobody's problem - which
-    # is why these three lines live below the option and not above it.
     if not shared_dir:
         logger.warning(
             "BLE coordination: BLUETOOTH_CONNECTION_MANAGER is on but "
@@ -115,6 +112,15 @@ def install_ble_connection_manager(address):
             validate_connection=validator,
         )
         return True
-    except Exception as e:
+    except ImportError as e:
+        # The shared tree could not give us the module or the validators:
+        # that IS the install being unusable.
         logger.error(f"BLE coordination: shared install at {shared_dir} is present but unusable, running uncoordinated: {repr(e)}")
+        return False
+    except Exception as e:
+        # The install imported fine and the catcher refused to install -
+        # a bad kwarg, a validator that raised, a bug in the catcher. Saying
+        # "the install is unusable" here would send an operator to replace a
+        # shared tree that is not the problem.
+        logger.error(f"BLE coordination: catcher would not install from {shared_dir}, running uncoordinated: {repr(e)}")
         return False
