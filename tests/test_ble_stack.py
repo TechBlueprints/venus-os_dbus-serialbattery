@@ -45,8 +45,10 @@ def _make_shared(tmp_path, body="VERSION = 'shared'\n"):
 
 
 def test_an_empty_setting_never_looks_and_uses_the_vendored_stack():
+    script_dir_before = sys.path[0]
     assert ble_stack.ensure_ble_stack("") == "vendored"
-    assert ble_stack.VENDORED_BLE_DIR in sys.path
+    assert sys.path[1] == ble_stack.VENDORED_BLE_DIR
+    assert sys.path[0] == script_dir_before
     assert ble_stack.shared_failure is None
 
 
@@ -63,7 +65,11 @@ def test_a_shared_install_is_used_and_its_roots_come_first(tmp_path):
     assert "bleak_connection_manager" in sys.modules
     # the shared roots must precede the vendored stack, or ext/ble would win
     assert ble_stack.VENDORED_BLE_DIR not in sys.path
-    assert sys.path[0] == os.path.join(shared, "src")
+    # position 1, never 0: the script dir keeps precedence over a shared tree
+    script_dir_before = sys.path[0]
+    assert sys.path[1:5] == ble_stack.shared_roots(shared)
+    assert sys.path[0] == script_dir_before
+    assert sys.path[0] not in ble_stack.shared_roots(shared)
 
 
 def test_a_present_but_broken_install_is_withdrawn_completely(tmp_path):

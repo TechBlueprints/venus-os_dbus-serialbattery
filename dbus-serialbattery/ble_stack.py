@@ -94,9 +94,14 @@ def ensure_ble_stack(shared_dir):
     # process, so the shared bleak/brc win every later import.
     before_path = list(sys.path)
     before_modules = set(sys.modules)
+    # Position 1, not 0, for the same reason the vendored fallback uses it and
+    # the same reason dbus-serialbattery.py has always inserted ext/ there:
+    # sys.path[0] is the script's own directory, holding utils.py, utils_ble.py
+    # and this file. A shared tree must beat PYTHONPATH and site-packages - it
+    # does, from position 1 - but it must never shadow the driver's own modules.
     for root in reversed(shared_roots(shared_dir)):
         if root not in sys.path:
-            sys.path.insert(0, root)
+            sys.path.insert(1, root)
     try:
         importlib.import_module("bleak_connection_manager")
     except BaseException as e:
