@@ -600,6 +600,13 @@ class BleConnectionBackend:
     drivers.
     """
 
+    # Called when a link comes up, the mirror of the disconnected callback
+    # the driver already hands to create_client. Both ends of a connection's
+    # life are then delivered by the same seam: a driver that replaces the
+    # connect path either gets both or neither, and can never open an episode
+    # it has no way to close.
+    connected_callback = None
+
     # the adapter this backend asked for, and the one the link came up on;
     # they differ whenever a lingering link elsewhere is adopted
     requested_adapter = None
@@ -620,6 +627,8 @@ class BleConnectionBackend:
         self.landed_adapter_name = landed
         if landed:
             self.current_adapter = landed
+        if self.connected_callback is not None:
+            self.connected_callback()
         return landed
 
     def create_client(self, address, disconnected_callback):
@@ -884,7 +893,7 @@ class Syncron_Ble:
         self.write_characteristic = write_characteristic
         self.read_characteristic = read_characteristic
         self.address = address
-        self.backend = get_ble_backend()
+        self.backend = self._new_backend()
         # Only the BLE thread of the current generation keeps running; see
         # rebuild_ble_thread()
         self._ble_thread_generation = 0
@@ -960,7 +969,7 @@ class Syncron_Ble:
             self.ble_connection_ready = threading.Event()
             self.ble_async_thread_event_loop = False
             self.connected = False
-            self.backend = get_ble_backend()  # fresh backend state
+            self.backend = self._new_backend()  # fresh backend state
             ble_async_thread = threading.Thread(
                 name=f"BMS_bluetooth_async_thread_gen{generation}",
                 target=self.initiate_ble_thread_main,
@@ -1019,6 +1028,18 @@ class Syncron_Ble:
             else:
                 failures = min(failures + 1, len(backoff) - 1)
             await asyncio.sleep(backoff[failures])
+
+    def _new_backend(self):
+        """A backend wired to report both ends of a connection's life.
+
+        Obtained here rather than at each construction site so the wiring
+        cannot be forgotten by one of them - the reason the link-up report
+        was skippable in the first place was that it lived on a path a
+        subclass could replace.
+        """
+        backend = get_ble_backend()
+        backend.connected_callback = self._report_link_up
+        return backend
 
     def _scans(self):
         """Scans since the counters were last reset, or None if this backend cannot scan.
@@ -1171,7 +1192,6 @@ class Syncron_Ble:
                 self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback),
                 timeout=BLE_ESTABLISH_TIMEOUT,
             )
-            self._report_link_up()
 
         except Exception as e:
             logger.debug(f"Failed when trying to connect: {repr(e)}")

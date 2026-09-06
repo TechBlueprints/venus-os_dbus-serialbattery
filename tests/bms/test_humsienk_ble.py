@@ -674,13 +674,13 @@ def test_the_driver_carries_no_fallback_machinery():
 
 # ------------------------------------------------- the link-up report hook
 #
-# Field 2026-09-06, prod RS pack, first life on the de-vendored driver: the
-# life was healthy but utils_ble's once-per-life "connected to bluetooth
-# device ... on adapter" line and its "BLE link recovered for" episode
-# terminator never appeared. HumsiENK_Syncron_Ble.connect_to_bms replaces the
-# base method wholesale, and the base is where _report_link_up() is called;
-# client_disconnected is inherited, so an episode OPENED in the watch and
-# never closed. The override must report through the same hook.
+# Field 2026-09-06, prod RS pack: against the utils_ble that reported link-up
+# from inside the base connect_to_bms, this override (which replaces that
+# method wholesale) inherited the episode OPENER (client_disconnected) but
+# never ran the CLOSER, so episodes opened in the watch and never closed.
+# utils_ble a0e1214 moved the closer to the backend's connected callback,
+# wired at backend construction, so both ends now reach an override without
+# it doing anything - and an explicit call here would double-report.
 
 
 def _connect_double(report_hook):
@@ -719,10 +719,15 @@ def _connect_double(report_hook):
     return sync
 
 
-def test_a_successful_connect_reports_the_link_up_through_utils_ble_hook():
+def test_the_override_does_not_report_the_link_up_itself():
+    """utils_ble (feat/ble-connection-layer a0e1214) delivers link-up through the
+    backend's connected callback, wired by the base class at backend construction;
+    an override that ALSO calls _report_link_up reports every link twice, which a
+    watch cannot tell from a real reconnect. So: the hook must exist on the
+    instance and must NOT be called by connect_to_bms."""
     calls = []
     sync = _connect_double(lambda: calls.append("up"))
-    assert calls == ["up"], "the base class's once-per-life / episode-terminator report must fire exactly once per connect"
+    assert calls == [], "connect_to_bms must leave link-up reporting to the backend seam"
     assert sync.connected is False, "teardown still runs after supervision ends"
 
 

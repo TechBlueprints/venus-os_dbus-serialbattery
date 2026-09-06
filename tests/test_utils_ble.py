@@ -520,6 +520,33 @@ def test_only_the_scanning_backend_reports_that_it_scans():
     assert utils_ble.get_ble_backend("BleakBackend").scans_devices is False
 
 
+def test_a_link_coming_up_is_reported_through_the_seam_not_the_connect_path():
+    """
+    The disconnect is delivered by a callback the backend invokes, so a driver
+    that replaces connect_to_bms still opens episodes. The link-up used to be
+    reported from inside connect_to_bms, so that same driver never closed
+    them and a watch saw episodes that ran forever. Both ends now arrive by
+    the same route: either a driver gets both or it gets neither.
+    """
+    reported = []
+    backend = utils_ble.get_ble_backend("BleakBackend")
+    backend.connected_callback = lambda: reported.append(True)
+    backend.current_adapter = "hci5"
+    backend._record_landed(_client_on("/org/bluez/hci3/dev_C8_47_8C_00_00_00"))
+    assert reported == [True]
+
+
+def test_the_driver_wires_the_seam_at_every_place_it_takes_a_backend():
+    """A second construction site that forgets the wiring is the same defect again."""
+    battery = utils_ble.Syncron_Ble.__new__(utils_ble.Syncron_Ble)
+    battery.address = "C8:47:8C:00:00:00"
+    backend = battery._new_backend()
+    assert backend.connected_callback == battery._report_link_up
+    source = _utils_ble_source()
+    # the driver must not obtain a backend any other way
+    assert source.count("get_ble_backend()") == 1
+
+
 # --------- a pin that stops being honoured says so ---------
 #
 # Dropping unresolvable MAC entries is correct - a MAC is not a name bleak
