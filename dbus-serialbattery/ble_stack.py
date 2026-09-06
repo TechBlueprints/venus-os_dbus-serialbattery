@@ -1,118 +1,101 @@
 # -*- coding: utf-8 -*-
-"""Decide, once per process, where this driver's BLE stack comes from.
+"""Make the BLE stack importable: a shared install when the box has one, else ext/ble/.
 
-Two sources, never both. A box install of bleak-connection-manager (the
-shared install, with its own bleak and bleak-retry-connector) is used when
-it is present; otherwise this repo's own copies under ext/ble are used and
-the driver runs plain bleak with no coordination at all.
+The shared bleak-connection-manager install lives in one folder on the box
+(BLUETOOTH_CONNECTION_MANAGER_DIR, /data/bcm by default) and carries ITS OWN
+bleak and bleak-retry-connector; a consumer must use those, never shadow them
+with vendored copies. With no shared install - every upstream deployment - the
+vendored copies under ext/ble/ are the only BLE stack there is, and there is
+deliberately no vendored connection manager: absent means plain bleak.
 
-This has to run before ANY module imports bleak: bleak is bound at import
-time, and a module that already holds a binding never sees a later change.
-That is also why this module imports neither bleak nor utils_ble.
+Nothing here depends on how the process was launched: no interpreter shim, no
+PYTHONPATH, no environment contract. The folder is looked up, its layout is
+the one the connection manager's own installer writes (mirrors
+bcm_autowire._lib_paths() in that project), and the connection manager is
+imported BEFORE bleak so that its sitewide autowire hook, if planted, stands
+down for this process instead of installing a generic catcher with a
+cmdline-derived owner and the box-wide config.
 
-The BLE packages live in ext/ble rather than the flat ext/ for one reason:
-dbus-serialbattery.py inserts ext/ at sys.path position 1, which is ahead
-of PYTHONPATH, so a flat vendored bleak would shadow a box-installed one no
-matter how the process was started.
+Called UNCONDITIONALLY before any module captures bleak.BleakClient at import
+time (aiobmsble does so at module scope), and independently of whether the
+connection manager is enabled - importability is not a feature flag.
+
+This module is the reference implementation of the consumer contract for
+every service on the box that uses the shared install (see the connection
+manager's CONSUMER_MIGRATION.md). It imports nothing from this driver: lift
+it as-is and pass your own vendored fallback directory, or none.
 """
 
-import importlib
 import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-VENDORED_BLE_DIR = os.path.join(_HERE, "ext", "ble")
+DEFAULT_SHARED_DIR = "/data/bcm"
+EXT_BLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext", "ble")
 
-# repr() of what went wrong when a shared install was PRESENT but unusable.
-# None means either "no shared install" or "the shared install worked" - the
-# caller distinguishes those by the return value, not by this.
+# repr of the exception when a shared install was present but could not be
+# imported; None otherwise. Read by utils_ble_manager to tell "no shared
+# install" (normal, a warning) from "shared install present but unusable"
+# (a fault, an error), which are different operator actions.
 shared_failure = None
 
-_decided = None
 
-
-def current():
-    """The decision this process made: "shared", "vendored", or None if undecided.
-
-    Deliberately not a log call: this module runs before utils is
-    necessarily usable and must stay importable with nothing but stdlib.
-    The caller owns reporting.
-    """
-    return _decided
-
-
-def shared_roots(shared_dir):
-    """The import roots a box install exposes, in the order it exposes them."""
-    ext = os.path.join(shared_dir, "ext")
+def shared_lib_paths(root):
+    """The shared install's import roots, in import-priority order."""
     return [
-        os.path.join(shared_dir, "src"),
-        ext,
-        os.path.join(ext, "upstream", "bleak"),
-        os.path.join(ext, "upstream", "bleak-retry-connector", "src"),
+        os.path.join(root, "src"),
+        os.path.join(root, "ext"),
+        os.path.join(root, "ext", "upstream", "bleak"),
+        os.path.join(root, "ext", "upstream", "bleak-retry-connector", "src"),
     ]
 
 
-def _use_vendored():
-    global _decided
-    if VENDORED_BLE_DIR not in sys.path:
-        sys.path.insert(1, VENDORED_BLE_DIR)
-    _decided = "vendored"
-    return _decided
+def shared_install_present(root):
+    return bool(root) and os.path.isdir(os.path.join(root, "src", "bleak_connection_manager"))
 
 
-def ensure_ble_stack(shared_dir):
-    """
-    Put exactly one BLE stack on sys.path and return which one.
-
-    "shared"   - the box install at shared_dir is in use
-    "vendored" - ext/ble is in use, plain bleak, no connection manager
-
-    An empty shared_dir means "never look", which is the upstream default:
-    a box that has no shared install should not pay for a lookup or be told
-    about one it never asked for.
-
-    Idempotent: the first call decides, later calls report that decision.
-    """
-    global shared_failure, _decided
-
-    if _decided is not None:
-        return _decided
-
-    # Already importable - a shim on PYTHONPATH, or a test stub. Whoever put
-    # it there owns the arrangement; do not add paths underneath it.
-    if "bleak_connection_manager" in sys.modules:
-        _decided = "shared"
-        return _decided
-
-    if not shared_dir:
-        return _use_vendored()
-
-    if not os.path.isdir(os.path.join(shared_dir, "src", "bleak_connection_manager")):
-        return _use_vendored()
-
-    # Present. Claim it by importing it HERE, before bleak exists in this
-    # process, so the shared bleak/brc win every later import.
-    before_path = list(sys.path)
-    before_modules = set(sys.modules)
-    # Position 1, not 0, for the same reason the vendored fallback uses it and
-    # the same reason dbus-serialbattery.py has always inserted ext/ there:
-    # sys.path[0] is the script's own directory, holding utils.py, utils_ble.py
-    # and this file. A shared tree must beat PYTHONPATH and site-packages - it
-    # does, from position 1 - but it must never shadow the driver's own modules.
-    for root in reversed(shared_roots(shared_dir)):
-        if root not in sys.path:
-            sys.path.insert(1, root)
-    try:
-        importlib.import_module("bleak_connection_manager")
-    except BaseException as e:
-        # Present but unusable. Withdraw completely rather than run half of
-        # it: leaving a partially imported shared stack behind would let some
-        # later import resolve against it and the rest against ext/ble.
-        shared_failure = repr(e)
-        for name in set(sys.modules) - before_modules:
+def _purge_modules_under(root):
+    for name, mod in list(sys.modules.items()):
+        f = getattr(mod, "__file__", None) or ""
+        if f.startswith(root + os.sep):
             del sys.modules[name]
-        sys.path[:] = before_path
-        return _use_vendored()
 
-    _decided = "shared"
-    return _decided
+
+def ensure_ble_stack(shared_dir=DEFAULT_SHARED_DIR, vendored_dir=EXT_BLE):
+    """Return "provided", "shared" or "vendored".
+
+    provided: a connection manager is already imported (a launcher put it on
+              the path, or a test stubbed it) - nothing is inserted.
+    shared:   shared_dir holds an install; its roots were put at sys.path[1:]
+              - ahead of every site-packages and PYTHONPATH entry, behind only
+              the script's own directory, the position this driver has always
+              given its vendored packages - and the connection manager was
+              imported from there.
+    vendored: vendored_dir (this driver's ext/ble/) was inserted when it
+              exists; no connection manager is importable. If a shared install
+              was present but broken, shared_failure says why and every path
+              and module it contributed has been withdrawn. A consumer with no
+              vendored copy passes vendored_dir=None and gets "vendored" with
+              nothing inserted: whatever bleak the interpreter has is used.
+    """
+    global shared_failure
+    shared_failure = None
+    if "bleak_connection_manager" in sys.modules:
+        return "provided"
+    if shared_install_present(shared_dir):
+        inserted = []
+        for p in reversed(shared_lib_paths(shared_dir)):
+            if p not in sys.path:
+                sys.path.insert(1, p)
+                inserted.append(p)
+        try:
+            import bleak_connection_manager  # noqa: F401  (before bleak: see module docstring)
+
+            return "shared"
+        except Exception as e:  # a broken shared install must not take the driver down
+            shared_failure = repr(e)
+            for p in inserted:
+                sys.path.remove(p)
+            _purge_modules_under(os.path.abspath(shared_dir))
+    if vendored_dir and os.path.isdir(vendored_dir) and vendored_dir not in sys.path:
+        sys.path.insert(1, vendored_dir)
+    return "vendored"

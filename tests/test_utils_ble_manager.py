@@ -75,9 +75,9 @@ class TestInstallBleConnectionManager:
         # than let the wiring install a catcher onto an unarranged sys.path.
         import ble_stack
 
-        monkeypatch.setattr(ble_stack, "_decided", "shared", raising=False)
         monkeypatch.setattr(ble_stack, "shared_failure", None, raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_DIR", "/data/bcm", raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY", True, raising=False)
 
         validators = types.ModuleType("bleak_connection_manager.validators")
 
@@ -160,10 +160,13 @@ class TestCoordinationReport:
     def _stack(self, monkeypatch):
         import ble_stack
 
-        monkeypatch.setattr(ble_stack, "_decided", None, raising=False)
         monkeypatch.setattr(ble_stack, "shared_failure", None, raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_DIR", "/data/bcm", raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER", True, raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY", True, raising=False)
+        # None in sys.modules makes `import bleak_connection_manager` raise
+        # ImportError deterministically - the absent path, whatever sys.path holds
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", None)
         return ble_stack
 
     def test_a_loaded_shared_install_reports_the_package_directory(self, _stack, monkeypatch, caplog):
@@ -172,7 +175,6 @@ class TestCoordinationReport:
         module.__file__ = "/data/bcm/src/bleak_connection_manager/__init__.py"
         module.install_bleak_catcher = lambda *a, **k: None
         monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
-        monkeypatch.setattr(_stack, "_decided", "shared", raising=False)
         with caplog.at_level("INFO"):
             utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00")
         assert (
@@ -180,14 +182,12 @@ class TestCoordinationReport:
         ) in caplog.text
 
     def test_an_absent_install_is_a_warning_not_an_error(self, _stack, monkeypatch, caplog):
-        monkeypatch.setattr(_stack, "_decided", "vendored", raising=False)
         with caplog.at_level("DEBUG"):
             assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
         assert f"BLE coordination: no shared install at /data/bcm; {self.TAIL}" in caplog.text
         assert not [r for r in caplog.records if r.levelname == "ERROR"]
 
     def test_a_present_but_unusable_install_is_an_error(self, _stack, monkeypatch, caplog):
-        monkeypatch.setattr(_stack, "_decided", "vendored", raising=False)
         monkeypatch.setattr(_stack, "shared_failure", "RuntimeError('boom')", raising=False)
         with caplog.at_level("DEBUG"):
             assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
@@ -199,7 +199,6 @@ class TestCoordinationReport:
 
     def test_coordination_on_with_no_folder_configured_is_reported(self, _stack, monkeypatch, caplog):
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_DIR", "", raising=False)
-        monkeypatch.setattr(_stack, "_decided", "vendored", raising=False)
         with caplog.at_level("DEBUG"):
             assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
         assert (
@@ -210,7 +209,6 @@ class TestCoordinationReport:
     def test_a_box_that_never_asked_for_coordination_says_nothing(self, _stack, monkeypatch, caplog):
         """The upstream default - option off, no shared install - is silent. Pinned."""
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER", False, raising=False)
-        monkeypatch.setattr(_stack, "_decided", "vendored", raising=False)
         with caplog.at_level("DEBUG"):
             assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is False
         assert "BLE coordination:" not in caplog.text
@@ -237,7 +235,6 @@ class TestCoordinationReport:
 
         module.install_bleak_catcher = install_bleak_catcher
         monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
-        monkeypatch.setattr(_stack, "_decided", "shared", raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_VALIDATION", False, raising=False)
 
         with caplog.at_level("DEBUG"):
@@ -252,7 +249,6 @@ class TestCoordinationReport:
         module.__file__ = "/data/bcm/src/bleak_connection_manager/__init__.py"
         module.install_bleak_catcher = lambda owner, force_start_notify=None, **kw: calls.append(force_start_notify)
         monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
-        monkeypatch.setattr(_stack, "_decided", "shared", raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_VALIDATION", False, raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY", True, raising=False)
         monkeypatch.delenv("BCM_FORCE_START_NOTIFY", raising=False)
@@ -273,7 +269,6 @@ class TestCoordinationReport:
 
         module.install_bleak_catcher = install_bleak_catcher
         monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
-        monkeypatch.setattr(_stack, "_decided", "shared", raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_VALIDATION", False, raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY", True, raising=False)
         monkeypatch.delenv("BCM_FORCE_START_NOTIFY", raising=False)

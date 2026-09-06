@@ -68,6 +68,12 @@ def install_ble_connection_manager(address):
     devices - so one config key drives both the catcher and the plain
     backends identically.
 
+    Keyed on the IMPORT OUTCOME, not on ble_stack's return value: whether the
+    connection manager is importable right now is the fact, and
+    ble_stack.shared_failure says why when a present install could not be.
+    Every line here starts with "BLE coordination: " - the fleet's log watch
+    anchors on it, so changing a sentence means telling running monitor first.
+
     A failed install is logged and swallowed: the catcher is coordination,
     and connecting uncoordinated beats not connecting at all.
     """
@@ -77,32 +83,12 @@ def install_ble_connection_manager(address):
 
     if not utils.BLUETOOTH_CONNECTION_MANAGER:
         # Silent. A box that never asked for coordination has nothing to
-        # report, and "loaded from" is what the fleet's log watch reads as
-        # coordination ACTIVE - which it would not be with the catcher off.
-        return False
-
-    if ble_stack.current() == "shared":
-        # The PACKAGE directory, not the configured folder: it proves which
-        # tree actually served the import, which is the whole question when a
-        # box has both a shared install and this repo's ext/ble copies.
-        loaded = sys.modules.get("bleak_connection_manager")
-        package_dir = os.path.dirname(getattr(loaded, "__file__", "") or "") or shared_dir
-        logger.info(f"BLE coordination: bleak_connection_manager loaded from {package_dir}")
-
-    if not shared_dir:
-        logger.warning(
-            "BLE coordination: BLUETOOTH_CONNECTION_MANAGER is on but "
-            "BLUETOOTH_CONNECTION_MANAGER_DIR is empty; running uncoordinated, no claims, no adapter routing, no card recovery"
-        )
-        return False
-    if ble_stack.shared_failure:
-        logger.error(f"BLE coordination: shared install at {shared_dir} is present but unusable, running uncoordinated: {ble_stack.shared_failure}")
-        return False
-    if ble_stack.current() != "shared":
-        logger.warning(f"BLE coordination: no shared install at {shared_dir}; running uncoordinated, no claims, no adapter routing, no card recovery")
+        # report, and "loaded from" is what the fleet's watch reads as
+        # coordination ACTIVE - which it is not with the catcher off.
         return False
 
     try:
+        import bleak_connection_manager as _bcm
         from bleak_connection_manager import install_bleak_catcher
 
         validator = None
@@ -139,16 +125,37 @@ def install_ble_connection_manager(address):
             )
 
         install_bleak_catcher(f"dbus-serialbattery.{str(address).strip().lower().replace(':', '')}", **kwargs)
+
+        # The PACKAGE directory, not the configured folder: it proves which
+        # tree actually served the import, which is the whole question when a
+        # box has both a shared install and this repo's ext/ble copies.
+        package_dir = os.path.dirname(getattr(_bcm, "__file__", "") or "") or shared_dir
+        logger.info(f"BLE coordination: bleak_connection_manager loaded from {package_dir}")
         return True
     except ImportError as e:
-        # The shared tree could not give us the module or the validators:
-        # that IS the install being unusable.
-        logger.error(f"BLE coordination: shared install at {shared_dir} is present but unusable, running uncoordinated: {repr(e)}")
+        # No connection manager to be had. Three reasons, told apart so the
+        # operator is sent to the right place.
+        if ble_stack.shared_failure:
+            # present, could not be imported - the install itself is the fault
+            logger.error(
+                f"BLE coordination: shared install at {shared_dir} is present but unusable, "
+                f"running uncoordinated: {ble_stack.shared_failure}"
+            )
+        elif not shared_dir:
+            logger.warning(
+                "BLE coordination: BLUETOOTH_CONNECTION_MANAGER is on but "
+                "BLUETOOTH_CONNECTION_MANAGER_DIR is empty; running uncoordinated, no claims, no adapter routing, no card recovery"
+            )
+        else:
+            logger.warning(
+                f"BLE coordination: no shared install at {shared_dir}; "
+                "running uncoordinated, no claims, no adapter routing, no card recovery"
+            )
         return False
     except Exception as e:
-        # The install imported fine and the catcher refused to install -
-        # a bad kwarg, a validator that raised, a bug in the catcher. Saying
-        # "the install is unusable" here would send an operator to replace a
-        # shared tree that is not the problem.
+        # The install imported fine and the catcher refused to install - a bad
+        # kwarg, a validator that raised, a bug in the catcher. Saying "the
+        # install is unusable" here would send an operator to replace a shared
+        # tree that is not the problem.
         logger.error(f"BLE coordination: catcher would not install from {shared_dir}, running uncoordinated: {repr(e)}")
         return False
