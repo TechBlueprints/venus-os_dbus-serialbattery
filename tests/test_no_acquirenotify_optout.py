@@ -27,7 +27,7 @@ import re
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DRIVER_DIR = os.path.join(REPO_ROOT, "dbus-serialbattery")
 VENDORED_EXT_DIR = os.path.join(DRIVER_DIR, "ext")
-VENDORED_BLUEZ_CLIENT = os.path.join(VENDORED_EXT_DIR, "bleak", "backends", "bluezdbus", "client.py")
+VENDORED_BLUEZ_CLIENT = os.path.join(VENDORED_EXT_DIR, "ble", "bleak", "backends", "bluezdbus", "client.py")
 
 NEEDLE = "use_start_notify"
 THIS_FILE = os.path.abspath(__file__)
