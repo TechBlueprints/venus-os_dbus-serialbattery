@@ -873,6 +873,38 @@ class FallbackBattery:
         if protection is not None:
             protection.internal_failure = 0
 
+    def _bms_outage_started(self) -> float:
+        """
+        When the BMS was last heard - the clock for the alarm and the GUI.
+
+        Normally the moment this process engaged the fallback. But a process
+        started mid-outage has never heard the BMS, and its own engagement
+        time says nothing about how long the pack has been uncovered:
+        measured from it, a reboot silently re-arms the BmsCable grace, and
+        an outage that has already run for an hour is warning-silent for
+        another ten minutes. Field-observed on dev-cerbo 2026-08-28: a
+        47-minute outage, rebooted at 03:26Z, raised the alarm at ~03:37Z.
+
+        The stash is written only while the BMS is fresh, so its timestamp
+        IS the last BMS contact and survives the reboot - the same number
+        the "stash loaded (Ns old)" line already prints. It is used only
+        while this process has no BMS contact of its own; the moment the
+        BMS answers, the process clock takes over and a later outage is
+        measured from that, never from a stale stash.
+
+        Deliberately not folded into _fallback_since: the recovery ladder
+        measures its stall from that, and an inherited hour-old start would
+        rebuild the BLE thread the instant a cold start engaged.
+
+        :return: epoch seconds of the last BMS contact, or now if unknown
+        """
+        started = self._fallback_since if self._fallback_since is not None else time()
+        if self._last_fresh_time == 0.0:
+            inherited = self._stash.get("timestamp") if self._stash else None
+            if inherited is not None and inherited < started:
+                started = inherited
+        return started
+
     def _update_alarms(self) -> None:
         """
         While the fallback sensor is actively serving, the outage's one
@@ -884,7 +916,7 @@ class FallbackBattery:
         """
         if self._serving:
             self._clear_internal_failure()
-            outage = time() - (self._fallback_since if self._fallback_since is not None else time())
+            outage = time() - self._bms_outage_started()
             self.bms_cable_alarm = 1 if outage >= utils.FALLBACK_BMS_CABLE_WARN_MINUTES * 60 else 0
         else:
             # Not serving: either everything is fine, or both instruments are
@@ -1532,7 +1564,7 @@ class FallbackBattery:
         """Connection line for the GUI, telling the truth while serving."""
         if not self._serving:
             return self.battery.connection_info
-        outage = int(time() - self._fallback_since) if self._fallback_since is not None else 0
+        outage = int(time() - self._bms_outage_started())
         return f"BMS lost for: {self.battery.get_seconds_to_string(outage, 3)} | operating on live fallback values"
 
     def connection_name(self) -> str:

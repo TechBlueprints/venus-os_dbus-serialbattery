@@ -1486,6 +1486,60 @@ class TestFallbackLoggingVolume:
         assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 
+class TestOutageClockSurvivesRestart:
+    """Field-observed on dev-cerbo 2026-08-28: a 47-minute-old outage went
+    warning-silent for another ~10 minutes after a mid-outage reboot, because
+    the grace was measured from the new process's engagement rather than from
+    when the BMS was last heard. The stash is written only while the BMS is
+    fresh, so its timestamp is that moment, and it survives the reboot."""
+
+    def _cold_start(self, monkeypatch, outage_age):
+        # a process that has NEVER heard the BMS: _last_fresh_time stays at its
+        # __init__ 0.0. No _serve() here - that helper fakes a BMS contact.
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        assert wrapper._last_fresh_time == 0.0
+        wrapper._stash = {"timestamp": _now() - outage_age}
+        assert wrapper.refresh_data() is True
+        assert wrapper._serving is True
+        return wrapper
+
+    def test_a_restart_mid_outage_does_not_rearm_the_grace(self, monkeypatch):
+        grace = utils.FALLBACK_BMS_CABLE_WARN_MINUTES * 60
+        wrapper = self._cold_start(monkeypatch, outage_age=grace + 60)
+
+        assert wrapper.bms_cable_alarm == 1
+
+    def test_a_restart_inside_the_grace_still_waits_it_out(self, monkeypatch):
+        # the inherited clock is the real outage, not a shortcut to the alarm
+        grace = utils.FALLBACK_BMS_CABLE_WARN_MINUTES * 60
+        wrapper = self._cold_start(monkeypatch, outage_age=grace / 2)
+
+        assert wrapper.bms_cable_alarm == 0
+
+    def test_once_the_bms_has_answered_the_stash_clock_is_ignored(self, monkeypatch):
+        # a stale stash must never make a NEW outage look old
+        wrapper = _make_wrapper(monkeypatch, shunt=_LIVE_SHUNT, connected=False)
+        wrapper._stash = {"timestamp": _now() - 86400}
+        _serve(wrapper)  # this process heard the BMS 100 s ago
+
+        assert wrapper.bms_cable_alarm == 0
+
+    def test_the_inherited_clock_does_not_reach_the_recovery_ladder(self, monkeypatch):
+        # the ladder measures its stall from THIS process's engagement. An
+        # inherited hours-old start folded into _fallback_since would rebuild
+        # the BLE thread on the very first cycle of every cold start.
+        wrapper = self._cold_start(monkeypatch, outage_age=3 * 3600)
+
+        assert wrapper._stall_rebuilds == 0
+        assert wrapper.battery.ble_handle.rebuilds == 0
+
+    def test_the_gui_reports_the_real_outage_after_a_restart(self, monkeypatch):
+        wrapper = self._cold_start(monkeypatch, outage_age=3 * 3600)
+
+        assert abs((_now() - wrapper._bms_outage_started()) - 3 * 3600) < 5
+        assert "BMS lost for" in wrapper.connection_info
+
+
 class _CountingBus:
     """Bus stub that records how many presence queries it is asked for.
 
