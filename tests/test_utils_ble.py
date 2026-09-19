@@ -684,18 +684,58 @@ def test_the_warning_is_not_repeated_on_every_attempt(caplog):
         utils_ble._unpinned_devices.discard(PINNED)
 
 
-def test_a_pin_that_comes_back_is_warned_about_again_if_it_goes(caplog):
-    """The warning marks a transition, so a second loss must be reported."""
+def test_a_card_reappearing_does_not_by_itself_re_arm_the_warning(caplog):
+    """
+    Re-armed on a CONNECTION with resolving pins, not on the card merely
+    reappearing in the BlueZ table. The connection manager warns about the
+    same condition and re-arms on connect; a watch counts both, so a card
+    flapping in and out would make one count climb while the other stood
+    still and the first reader would file a layer as broken.
+    """
     original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
     _pin(["00:1A:7D:DA:71:13"])
     try:
         with caplog.at_level("WARNING", logger="SerialBattery"):
             utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
-            # the card comes back
-            utils_ble.adapters_in_attempt_order(PINNED, present={"hci3": "00:1A:7D:DA:71:13"})
-            # and goes again
+            for _ in range(3):
+                # the card comes back and goes again, with no connection between
+                utils_ble.adapters_in_attempt_order(PINNED, present={"hci3": "00:1A:7D:DA:71:13"})
+                utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+        assert len(caplog.messages) == 1
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_a_connection_with_the_pins_resolving_re_arms_the_warning(caplog):
+    """A second genuine loss, after the pins were honoured again, is reported."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+            utils_ble._note_pins_honoured(PINNED, adapters={"hci3": "00:1A:7D:DA:71:13"})
             utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
         assert len(caplog.messages) == 2
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_a_connection_while_the_pins_still_fail_does_not_re_arm(caplog):
+    """
+    Connecting on a FALLBACK card is not the pins being honoured - that is
+    the condition still holding, and re-arming there would warn again on the
+    next attempt with nothing having changed.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+            utils_ble._note_pins_honoured(PINNED, adapters={"hci9": "00:01:95:00:00:09"})
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+        assert len(caplog.messages) == 1
     finally:
         _configure(original_pins, original_pool)
         utils_ble._unpinned_devices.discard(PINNED)

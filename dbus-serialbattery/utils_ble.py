@@ -390,7 +390,6 @@ def adapters_in_attempt_order(address, present=None):
         if name and (not adapters or name in adapters) and name not in resolved:
             resolved.append(name)
     if resolved:
-        _note_pins_honoured(address)
         return resolved
     names = [entry for entry in configured if not is_adapter_mac(entry)]
     if len(names) < len(configured):
@@ -456,9 +455,29 @@ def _warn_pins_dropped(address, configured, names):
     )
 
 
-def _note_pins_honoured(address):
-    """Clear the warned state so a later loss is reported again."""
-    _unpinned_devices.discard(address)
+def _note_pins_honoured(address, adapters=None):
+    """Re-arm the pin warning, once the battery is connected AND its pins resolve.
+
+    Deliberately NOT re-armed the moment a configured card reappears in the
+    BlueZ table. The connection manager warns about the same condition from
+    its own layer and re-arms on connect, and a log watch counts both: with
+    two triggers on one box, a card flapping in and out of the table makes
+    one count climb while the other stays put, and the first person reading
+    it files a layer as broken. Both layers now count alike.
+
+    A recurring condition already has a voice - the per-episode still-down
+    report - so this line can afford to be once per outage.
+    """
+    if address not in _unpinned_devices:
+        return
+    configured = adapters_for(address)
+    if not configured:
+        _unpinned_devices.discard(address)
+        return
+    if adapters is None:
+        adapters = bluez_adapters()
+    if any(resolve_adapter(entry, adapters) in adapters for entry in configured):
+        _unpinned_devices.discard(address)
 
 
 # Hold flag: while the flag file for a device exists, the reconnect loop makes
@@ -1189,6 +1208,7 @@ class Syncron_Ble:
         # a drop recorded but never opened belongs to the link that just came
         # back, so it must not open an episode after the fact
         self._pending_drop = None
+        _note_pins_honoured(self.address)
         if not self._first_link_reported:
             self._first_link_reported = True
             self._episode_started = None
