@@ -406,9 +406,22 @@ def _warn_pins_dropped(address, configured, names):
     a name bleak can use. But the effect is that an explicit pin silently
     stops being honoured and the battery goes out on the default adapter or
     on some other card, which is exactly the separation the option exists to
-    express. The likely cause is that adapter identity cannot be read at all
-    (on Venus that is one hciconfig call away from being the only source),
-    and until now the only trace of it was a single debug line.
+    express.
+
+    Two causes, and the message names both because they need different
+    repairs. The card may have been REMOVED OR SWAPPED: a MAC pin is only as
+    durable as the card that answers to it, so changing a dongle unpins
+    whatever named it, silently, and the fix is to repin the config. Or
+    adapter identity may be unreadable, which on Venus is one hciconfig call
+    away from being the only source, and the fix is to that.
+
+    The fallback is worth saying out loud because it is not necessarily
+    benign: with no other configured adapter left, the battery goes out on
+    the system default, which may be a card nothing else uses - on a box
+    whose scanners have their own allowlist, the device is then never
+    discovered there and every attempt fails not-found. Observed on a swapped
+    dongle: the pin died with the card, the default was the new card, and the
+    battery was unreachable for 18 hours with nothing alarming on it.
 
     Warned on the transition, not on the condition: this runs once per
     connection attempt.
@@ -417,11 +430,13 @@ def _warn_pins_dropped(address, configured, names):
         return
     _unpinned_devices.add(address)
     dropped = [entry for entry in configured if is_adapter_mac(entry)]
+    fallback = ", ".join(names) if names else "the system default adapter, which may be a card nothing else scans on"
     logger.warning(
         f"BLE adapter pins for {address} are not being honoured: {', '.join(dropped)} "
         f"{'resolves' if len(dropped) == 1 else 'resolve'} to no adapter present. "
-        f"{'Falling back to ' + ', '.join(names) if names else 'Falling back to the default adapter'}. "
-        "Adapter identity may be unreadable - check that hciconfig works."
+        f"Falling back to {fallback}. Either the pinned card was removed or swapped - a MAC pin "
+        "is only as durable as the card that answers to it, so repin the config - or adapter "
+        "identity cannot be read at all, in which case check that hciconfig works."
     )
 
 

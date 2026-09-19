@@ -639,6 +639,14 @@ def test_a_pin_that_resolves_to_nothing_is_warned_about(caplog):
             assert utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"}) == []
         assert "adapter pins for C8:47:8C:00:00:00 are not being honoured" in caplog.messages[0]
         assert "00:1A:7D:DA:71:13" in caplog.messages[0]
+        # both causes, because they need different repairs: a swapped card is
+        # repinned, an unreadable identity is fixed at hciconfig. Naming only
+        # one sends the reader to the wrong check - a swapped dongle on dev
+        # cost 18 h of unreachability with hciconfig working perfectly.
+        assert "removed or swapped" in caplog.messages[0]
+        assert "hciconfig" in caplog.messages[0]
+        # and what the fallback actually is, since it is not necessarily benign
+        assert "system default adapter" in caplog.messages[0]
     finally:
         _configure(original_pins, original_pool)
         utils_ble._unpinned_devices.discard(PINNED)
