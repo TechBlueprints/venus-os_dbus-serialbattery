@@ -636,7 +636,8 @@ def test_a_pin_that_resolves_to_nothing_is_warned_about(caplog):
     _pin(["00:1A:7D:DA:71:13"])
     try:
         with caplog.at_level("WARNING", logger="SerialBattery"):
-            assert utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"}) == []
+            # falls back to the adapter that is present, not to bleak's default
+            assert utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"}) == ["hci9"]
         assert "adapter pins for C8:47:8C:00:00:00 are not being honoured" in caplog.messages[0]
         assert "00:1A:7D:DA:71:13" in caplog.messages[0]
         # both causes, because they need different repairs: a swapped card is
@@ -646,6 +647,23 @@ def test_a_pin_that_resolves_to_nothing_is_warned_about(caplog):
         assert "removed or swapped" in caplog.messages[0]
         assert "hciconfig" in caplog.messages[0]
         # and what the fallback actually is, since it is not necessarily benign
+        assert "Falling back to hci9" in caplog.messages[0]
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_with_no_adapters_present_at_all_the_warning_names_the_system_default(caplog):
+    """
+    The one case that still reaches bleak's default: nothing is present to
+    fall back TO. Worth naming, because the default is a card chosen by
+    BlueZ for reasons unrelated to this driver.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            assert utils_ble.adapters_in_attempt_order(PINNED, present={}) == []
         assert "system default adapter" in caplog.messages[0]
     finally:
         _configure(original_pins, original_pool)
@@ -990,19 +1008,38 @@ def test_a_mac_whose_adapter_is_gone_is_dropped():
         _configure(original_pins, original_pool)
 
 
-def test_only_unresolvable_macs_degrade_to_the_default_adapter_not_to_garbage():
+def test_unresolvable_macs_fall_back_to_the_adapters_that_are_present():
     """
-    A MAC is not a name bleak can use. Where an unresolvable hciN list is
-    handed back unfiltered (better to try than to refuse), an unresolvable MAC
-    list must come back empty so the caller falls back to the system default
-    adapter instead of passing a MAC into the connect.
+    A MAC is not a name bleak can use, so an unresolvable MAC list cannot be
+    passed through. It falls back to every adapter that IS present rather
+    than to nothing: an empty list hands the battery to bleak's system
+    default, which is one card chosen by BlueZ for reasons unrelated to this
+    driver and may be one the device is never discovered on.
     """
     original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
     _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99"]}, [])
+    utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
     try:
-        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == []
+        chosen = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS)
+        assert chosen == ["hci3", "hci4"]
+        # and never the MAC itself, which bleak cannot use
+        assert not any(utils_ble.is_adapter_mac(name) for name in chosen)
     finally:
         _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
+
+
+def test_the_present_fallback_is_ordered_by_adapter_number():
+    """hci9 before hci10: string order puts a ten-adapter box's cards backwards."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99"]}, [])
+    utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
+    try:
+        present = {"hci10": "00:01:95:00:00:10", "hci9": "00:01:95:00:00:09", "hci2": "00:01:95:00:00:02"}
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=present) == ["hci2", "hci9", "hci10"]
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
 
 
 def test_the_pool_accepts_macs_too():

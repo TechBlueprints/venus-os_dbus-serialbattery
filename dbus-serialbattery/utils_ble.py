@@ -394,8 +394,24 @@ def adapters_in_attempt_order(address, present=None):
         return resolved
     names = [entry for entry in configured if not is_adapter_mac(entry)]
     if len(names) < len(configured):
+        # Nothing the battery named is here. Fall back to every adapter that
+        # IS, rather than to nothing - returning an empty list hands the
+        # battery to bleak's system default, which is one particular card
+        # chosen by BlueZ for reasons unrelated to this driver. On a box
+        # whose scanners have their own allowlist, that card may be one the
+        # device is never discovered on, so the battery fails not-found
+        # forever while a working radio sits unused two entries away.
+        # Observed on a swapped dongle: eighteen hours unreachable with a
+        # scanned adapter present the whole time.
+        names = names or sorted(adapters, key=_adapter_sort_key)
         _warn_pins_dropped(address, configured, names)
     return names
+
+
+def _adapter_sort_key(name):
+    """hci ordering by number, so hci9 comes before hci10 rather than after."""
+    match = re.match(r"^hci(\d+)$", str(name))
+    return (0, int(match.group(1))) if match else (1, 0)
 
 
 def _warn_pins_dropped(address, configured, names):
