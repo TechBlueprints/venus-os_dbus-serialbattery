@@ -26,6 +26,20 @@ SERVICES = {
     "/service/dbus-mqttbattery/run": ["mqtt-battery"],
 }
 
+# the log/run scripts, generated next to each run script
+LOG_SERVICES = {
+    "/service/dbus-blebattery.$1/log/run": ["0", "Jkbms_Ble", "C8:47:8C:E4:9F:2A"],
+    "/service/dbus-canbattery.$1/log/run": ["can0"],
+    "/service/dbus-mqttbattery/log/run": ["mqtt-battery"],
+}
+
+# the log/run of the serial service, shipped as a file instead of generated
+STATIC_LOG_RUN = os.path.join(os.path.dirname(__file__), "..", "dbus-serialbattery", "service", "log", "run")
+
+# multilog keeps n files of s bytes. Sized against the rate during an incident, not
+# when idle, because the flood that accompanies an incident evicts the record of it.
+EXPECTED_RETENTION = "s1500000 n20"
+
 
 def _extract_block(target):
     """Return the shell group command that writes the run script for `target`.
@@ -45,8 +59,9 @@ def _extract_block(target):
 
 def _render(target):
     """Run the emitting block and return the run script it produces."""
+    arguments = dict(SERVICES, **LOG_SERVICES)[target]
     result = subprocess.run(
-        ["sh", "-s"] + SERVICES[target],
+        ["sh", "-s"] + arguments,
         input=_extract_block(target),
         capture_output=True,
         text=True,
@@ -105,3 +120,29 @@ def test_run_script_is_a_valid_shell_script():
         rendered = _render(target)
         assert rendered.startswith("#!/bin/sh")
         subprocess.run(["sh", "-n"], input=rendered, text=True, check=True)
+
+
+@pytest.mark.parametrize("target", sorted(LOG_SERVICES))
+def test_log_run_script_uses_the_agreed_retention(target):
+    """Retention is sized against the log rate during an incident, not when idle."""
+    rendered = _render(target)
+
+    assert f"multilog t {EXPECTED_RETENTION} " in rendered
+
+
+def test_static_log_run_matches_the_generated_ones():
+    """The serial service ships its log/run as a file, so it drifts silently."""
+    with open(STATIC_LOG_RUN, encoding="utf-8") as static_file:
+        static = static_file.read()
+
+    assert f"multilog t {EXPECTED_RETENTION} " in static
+
+
+def test_every_service_keeps_the_same_amount_of_log():
+    """One service retaining less than the others is the case that loses the evidence."""
+    settings = {re.search(r"multilog t (s\d+ n\d+)", _render(target)).group(1) for target in LOG_SERVICES}
+
+    with open(STATIC_LOG_RUN, encoding="utf-8") as static_file:
+        settings.add(re.search(r"multilog t (s\d+ n\d+)", static_file.read()).group(1))
+
+    assert settings == {EXPECTED_RETENTION}

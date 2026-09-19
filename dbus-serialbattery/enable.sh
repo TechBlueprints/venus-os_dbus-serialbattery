@@ -284,7 +284,7 @@ if [ "$bluetooth_length" -gt 0 ]; then
         mkdir -p "/service/dbus-blebattery.$1/log"
         {
             echo "#!/bin/sh"
-            echo "exec multilog t s500000 n4 /var/log/dbus-blebattery.$1"
+            echo "exec multilog t s1500000 n20 /var/log/dbus-blebattery.$1"
         } > "/service/dbus-blebattery.$1/log/run"
         chmod 755 "/service/dbus-blebattery.$1/log/run"
 
@@ -387,7 +387,7 @@ if [ "$can_length" -gt 0 ]; then
         mkdir -p "/service/dbus-canbattery.$1/log"
         {
             echo "#!/bin/sh"
-            echo "exec multilog t s500000 n4 /var/log/dbus-canbattery.$1"
+            echo "exec multilog t s1500000 n20 /var/log/dbus-canbattery.$1"
         } > "/service/dbus-canbattery.$1/log/run"
         chmod 755 "/service/dbus-canbattery.$1/log/run"
 
@@ -479,7 +479,7 @@ if [ "$mqtt_length" -gt 0 ]; then
         mkdir -p "/service/dbus-mqttbattery/log"
         {
             echo "#!/bin/sh"
-            echo "exec multilog t s500000 n4 /var/log/dbus-mqttbattery"
+            echo "exec multilog t s1500000 n20 /var/log/dbus-mqttbattery"
         } > "/service/dbus-mqttbattery/log/run"
         chmod 755 "/service/dbus-mqttbattery/log/run"
 
