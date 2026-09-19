@@ -29,6 +29,26 @@ from bleak.exc import BleakError  # noqa: E402
 from aiobmsble import BMSInfo, BMSSample, TempSensor  # noqa: E402
 
 
+# Reconnect pacing for a device the adapter cannot reach.
+#
+# refresh_data polls once a second, and every poll that finds no client runs a
+# full establish_connection, which makes its own four BlueZ attempts before it
+# raises. When the cause is structural - the adapter the battery is pinned to
+# left the box, the configured MAC names hardware that is no longer present,
+# the device was removed - retrying at 1 Hz cannot fix it, because the
+# condition does not clear until a card or the config changes.
+#
+# Field case, dev-cerbo 2026-09-18: a USB dongle was swapped, the pin still
+# named the old card's MAC, and this path retried at roughly 1 Hz for about
+# 18 hours. It bought nothing, cost load, and at two log lines per second it
+# evicted its own onset from the retained log inside the first hour.
+#
+# The ladder is deliberately flat at the start: a genuinely transient miss -
+# a pack that slept through one advertising window - must still recover in
+# seconds, so only a sustained run of failures earns a long wait.
+RECONNECT_BACKOFF_SECONDS = (0, 0, 5, 15, 30, 60)
+
+
 class Generic_AioBmsBle(Battery):
     def __init__(self, port, baud, address):
         super(Generic_AioBmsBle, self).__init__(port, baud, address)
@@ -83,6 +103,11 @@ class Generic_AioBmsBle(Battery):
         # staleness tracking
         self._last_successful_update: float | None = None
         self._max_data_age: int = 5  # seconds before stale cached data causes failure
+        # reconnect pacing: consecutive failed connects, when the next attempt
+        # is allowed, and whether the sustained-failure warning has been logged
+        self._connect_failures: int = 0
+        self._reconnect_hold_until: float = 0.0
+        self._reconnect_warned: bool = False
 
     BATTERYTYPE = "Generic aiobmsble BMS"
 
@@ -127,6 +152,41 @@ class Generic_AioBmsBle(Battery):
             logger.debug("aiobmsble: using __aexit__ to close connection")
             await aexit(None, None, None)
             logger.debug("aiobmsble: disconnected via context manager")
+
+    def _reconnect_on_hold(self) -> bool:
+        """True while the next connect attempt is still being paced out."""
+        return time.monotonic() < self._reconnect_hold_until
+
+    def _note_connect_failure(self, reason: str) -> None:
+        """Record a failed connect and pace the next attempt.
+
+        Emits exactly ONE warning per outage, when the ladder reaches its
+        longest step. Logging every failure is what made the original incident
+        unreadable: the flood evicted the onset from the log, so the record of
+        why it started was gone by the time anyone looked.
+        """
+        self._connect_failures += 1
+        delay = RECONNECT_BACKOFF_SECONDS[min(self._connect_failures, len(RECONNECT_BACKOFF_SECONDS) - 1)]
+        self._reconnect_hold_until = time.monotonic() + delay
+        if delay == RECONNECT_BACKOFF_SECONDS[-1] and not self._reconnect_warned:
+            self._reconnect_warned = True
+            logger.warning(
+                "aiobmsble: %s unreachable after %d attempts (%s); retrying every %ds until it returns",
+                self.address,
+                self._connect_failures,
+                reason,
+                delay,
+            )
+        else:
+            logger.debug("aiobmsble: connect failed for %s (%s), next attempt in %ds", self.address, reason, delay)
+
+    def _note_connect_success(self) -> None:
+        """Clear the pacing state so the next outage starts from the top."""
+        if self._reconnect_warned:
+            logger.warning("aiobmsble: %s reachable again after %d failed attempts", self.address, self._connect_failures)
+        self._connect_failures = 0
+        self._reconnect_hold_until = 0.0
+        self._reconnect_warned = False
 
     async def _resolve_device(self) -> BLEDevice | None:
         """BLEDevice for this address from the BlueZ cache, scanning as fallback.
@@ -575,6 +635,12 @@ class Generic_AioBmsBle(Battery):
         async def _update_async():
             # ensure we have a client, try to find device and connect if not
             if self._aiobmsble is None:
+                # Pace an unreachable device rather than hammering it: every
+                # attempt below costs a full establish_connection, which makes
+                # four BlueZ attempts of its own, and when the adapter this
+                # battery is pinned to has left the box none of them can win.
+                if self._reconnect_on_hold():
+                    return False
                 # Cache-first, like test_connection: a bare
                 # find_device_by_address here starts a fresh BlueZ discovery on
                 # EVERY poll of a battery whose client was lost, which on a GX
@@ -584,12 +650,19 @@ class Generic_AioBmsBle(Battery):
                 # the BlueZ cache costs no scan at all in the common case.
                 device: BLEDevice | None = await self._resolve_device()
                 if device is None:
+                    self._note_connect_failure("device not found")
                     logger.debug(f"Could not find device {self.address} for refresh")
                     return False
                 self._ensure_aiobmsble(device)
                 if self._aiobmsble is None:
+                    self._note_connect_failure("no aiobmsble client")
                     return False
-                await self._aiobmsble_connect(self._aiobmsble)
+                try:
+                    await self._aiobmsble_connect(self._aiobmsble)
+                except Exception as ex:
+                    self._note_connect_failure(repr(ex))
+                    raise
+                self._note_connect_success()
 
             update = getattr(self._aiobmsble, "async_update", None)
             if callable(update):
