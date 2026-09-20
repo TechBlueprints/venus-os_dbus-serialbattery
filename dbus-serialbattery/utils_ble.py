@@ -11,6 +11,7 @@ from bleak.exc import BleakCharacteristicNotFoundError, BleakError
 from time import sleep
 from utils import (
     logger,
+    BLUETOOTH_ADAPTER_PIN_STRICT,
     BLUETOOTH_ADAPTERS,
     BLUETOOTH_CONNECTION_BACKEND,
     BLUETOOTH_FORCE_RESET_BLE_STACK,
@@ -384,11 +385,7 @@ def adapters_in_attempt_order(address, present=None):
     # callers that only know what exists keep working - MAC entries simply
     # cannot resolve against it, which is the honest answer
     adapters = present if isinstance(present, dict) else {name: "" for name in present}
-    resolved = []
-    for entry in configured:
-        name = resolve_adapter(entry, adapters)
-        if name and (not adapters or name in adapters) and name not in resolved:
-            resolved.append(name)
+    resolved = _resolve_all(configured, adapters)
     if resolved:
         return resolved
     names = [entry for entry in configured if not is_adapter_mac(entry)]
@@ -405,6 +402,36 @@ def adapters_in_attempt_order(address, present=None):
         names = names or sorted(adapters, key=_adapter_sort_key)
         _warn_pins_dropped(address, configured, names)
     return names
+
+
+def _resolve_all(configured, adapters):
+    """Configured entries as the hciN names they name right now, in order."""
+    resolved = []
+    for entry in configured:
+        name = resolve_adapter(entry, adapters)
+        if name and (not adapters or name in adapters) and name not in resolved:
+            resolved.append(name)
+    return resolved
+
+
+def configured_adapter_present(address, present=None):
+    """
+    Whether any adapter this battery names is here right now.
+
+    Shares _resolve_all with the selection, so the question "may this battery
+    connect" and the answer "over which adapter" can never disagree - the
+    whole point of a strict pin is that the two are the same decision.
+
+    A battery that names no adapters is trivially satisfied: it never asked
+    for a particular radio, so there is nothing to wait for.
+    """
+    configured = adapters_for(address) or list(BLUETOOTH_ADAPTER_POOL)
+    if not configured:
+        return True
+    if present is None:
+        present = bluez_adapters()
+    adapters = present if isinstance(present, dict) else {name: "" for name in present}
+    return bool(_resolve_all(configured, adapters))
 
 
 def _adapter_sort_key(name):
@@ -515,6 +542,13 @@ BLE_SUPERVISION_RECHECK = 5.0
 # the first line lands well past every ordinary one: an outage has to be
 # genuinely unusual to say anything at all. In a sustained outage this is 12
 # lines an hour per battery, and none otherwise.
+# Spacing between connection attempts: the first retry stays quick for an
+# ordinary blip, then it settles. The flat 1 s retry this replaced turned a
+# real outage into continuous hammering - production logs show single
+# recovery episodes of 220 attempts - which wedged the adapter's discovery
+# state and made recovery take longer than the outage.
+BLE_RECONNECT_BACKOFF = [1, 3, 6]
+
 BLE_EPISODE_REPORT_AFTER = 300.0
 
 BLE_ESTABLISH_TIMEOUT = 300.0
@@ -1041,15 +1075,11 @@ class Syncron_Ble:
         self.ble_async_thread_event_loop = asyncio.get_event_loop()
         self.ble_async_thread_ready.set()
 
-        # Space out connection attempts: 1s, 3s, then steady 6s. The first
-        # retry stays instant-ish for ordinary blips; the 6s cruise stops
-        # the continuous hammering that produced 220-attempt recovery
-        # storms and wedged adapter discovery state. A session that held
-        # for over a minute resets the ramp.
-        backoff = [1, 3, 6]
+        # A session that held for over a minute resets the ramp.
         failures = 0
         hold_flag = ble_hold_flag_path(self.address)
         holding = False
+        waiting_for_adapter = False
         while self.main_thread.is_alive() and generation == self._ble_thread_generation:
             if os.path.exists(hold_flag):
                 try:
@@ -1071,6 +1101,26 @@ class Syncron_Ble:
             if holding:
                 holding = False
                 logger.info(f"BLE hold for {self.address} released, resuming connection attempts")
+            # A strict pin means the named adapter is protecting something -
+            # keeping two batteries off one radio, or off a card another
+            # service owns - so connecting over a different one is worse than
+            # not connecting. Wait rather than fall back, and say so once.
+            if BLUETOOTH_ADAPTER_PIN_STRICT and not configured_adapter_present(self.address):
+                if not waiting_for_adapter:
+                    waiting_for_adapter = True
+                    logger.warning(
+                        f"BLE adapter pins for {self.address} are not being honoured: none of "
+                        f"{', '.join(adapters_for(self.address) or BLUETOOTH_ADAPTER_POOL)} is present. "
+                        "Waiting for one of them rather than falling back (BLUETOOTH_ADAPTER_PIN_STRICT is on). "
+                        "Either the pinned card was removed or swapped - a MAC pin is only as durable as the "
+                        "card that answers to it, so repin the config - or adapter identity cannot be read at "
+                        "all, in which case check that hciconfig works."
+                    )
+                await asyncio.sleep(BLE_HOLD_POLL_INTERVAL)
+                continue
+            if waiting_for_adapter:
+                waiting_for_adapter = False
+                logger.info(f"BLE adapter for {self.address} is present again, resuming connection attempts")
             self._begin_pending_episode()
             self._report_episode_still_open()
             self._attempts += 1
@@ -1079,8 +1129,8 @@ class Syncron_Ble:
             if time.time() - attempt_started > 60.0:
                 failures = 0
             else:
-                failures = min(failures + 1, len(backoff) - 1)
-            await asyncio.sleep(backoff[failures])
+                failures = min(failures + 1, len(BLE_RECONNECT_BACKOFF) - 1)
+            await asyncio.sleep(BLE_RECONNECT_BACKOFF[failures])
 
     def _new_backend(self):
         """A backend wired to report both ends of a connection's life.

@@ -758,6 +758,130 @@ def test_an_unresolvable_hci_name_is_not_a_dropped_pin(caplog):
         utils_ble._unpinned_devices.discard(PINNED)
 
 
+# --------- a strict pin waits rather than falling back ---------
+#
+# The default is to warn and connect over whatever is present: a battery
+# working on the wrong radio beats a battery not working. A strict pin says
+# the opposite, for the case where the pin is protecting something.
+
+
+def test_a_configured_adapter_that_is_present_satisfies_the_pin():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({PINNED: ["00:1A:7D:DA:71:13"]}, [])
+    try:
+        assert utils_ble.configured_adapter_present(PINNED, present={"hci3": "00:1A:7D:DA:71:13"}) is True
+        assert utils_ble.configured_adapter_present(PINNED, present={"hci9": "00:01:95:00:00:09"}) is False
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_battery_naming_no_adapters_is_never_waiting_for_one():
+    """It never asked for a particular radio, so there is nothing to wait for."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, [])
+    try:
+        assert utils_ble.configured_adapter_present(PINNED, present={}) is True
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_the_pin_question_and_the_adapter_choice_are_one_decision():
+    """
+    Whether a battery may connect and which adapter it connects over must
+    come from the same resolution: if they disagree, a strict pin either
+    blocks a battery whose card is present or admits one whose card is not.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({PINNED: ["00:1A:7D:DA:71:13", "hci4"]}, [])
+    utils_ble._unpinned_devices.discard(PINNED)
+    try:
+        for present in ({"hci3": "00:1A:7D:DA:71:13"}, {"hci4": "00:01:95:00:00:04"}, {"hci9": "00:01:95:00:00:09"}, {}):
+            resolved = utils_ble.adapters_in_attempt_order(PINNED, present=present)
+            satisfied = utils_ble.configured_adapter_present(PINNED, present=present)
+            # a battery is satisfied exactly when the selection resolved a
+            # configured entry rather than falling back
+            assert satisfied == (resolved == utils_ble._resolve_all(["00:1A:7D:DA:71:13", "hci4"], present or {}))
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def _loop_battery(monkeypatch, present, iterations=3):
+    """A Syncron_Ble with the threads left out, so async_main can be run for a few passes."""
+    import asyncio
+
+    battery = utils_ble.Syncron_Ble.__new__(utils_ble.Syncron_Ble)
+    battery.address = PINNED
+    battery._ble_thread_generation = 0
+    battery.backend = _plain_backend()
+    battery._reset_counters()
+
+    remaining = [iterations]
+
+    def is_alive():
+        remaining[0] -= 1
+        return remaining[0] > 0
+
+    battery.main_thread = types.SimpleNamespace(is_alive=is_alive)
+
+    attempts = []
+
+    async def fake_connect(address):
+        attempts.append(address)
+
+    battery.connect_to_bms = fake_connect
+    monkeypatch.setattr(utils_ble, "BLE_HOLD_POLL_INTERVAL", 0)
+    monkeypatch.setattr(utils_ble, "BLE_RECONNECT_BACKOFF", [0, 0, 0])
+    monkeypatch.setattr(utils_ble, "bluez_adapters", lambda: present)
+    monkeypatch.setattr(utils_ble, "ble_hold_flag_path", lambda address: os.path.join(DRIVER_DIR, "no-such-hold-flag"))
+    return battery, attempts, asyncio
+
+
+def test_a_strict_pin_makes_no_attempt_while_its_adapter_is_absent(monkeypatch, caplog):
+    """
+    The point of strict is that the named adapter is protecting something, so
+    connecting over a different one is worse than not connecting. A test that
+    only checked the predicate would pass with the loop ignoring it entirely.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({PINNED: ["00:1A:7D:DA:71:13"]}, [])
+    monkeypatch.setattr(utils_ble, "BLUETOOTH_ADAPTER_PIN_STRICT", True)
+    battery, attempts, asyncio_mod = _loop_battery(monkeypatch, {"hci9": "00:01:95:00:00:09"})
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            asyncio_mod.run(battery.async_main(PINNED, 0))
+        assert attempts == []
+        # said once, not once per pass
+        assert len([m for m in caplog.messages if "Waiting for one of them" in m]) == 1
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_strict_pin_connects_as_soon_as_its_adapter_is_there(monkeypatch):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({PINNED: ["00:1A:7D:DA:71:13"]}, [])
+    monkeypatch.setattr(utils_ble, "BLUETOOTH_ADAPTER_PIN_STRICT", True)
+    battery, attempts, asyncio_mod = _loop_battery(monkeypatch, {"hci3": "00:1A:7D:DA:71:13"})
+    try:
+        asyncio_mod.run(battery.async_main(PINNED, 0))
+        assert attempts == [PINNED, PINNED]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_without_strict_an_absent_pin_still_attempts(monkeypatch):
+    """The default is unchanged: warn, and connect over whatever is present."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({PINNED: ["00:1A:7D:DA:71:13"]}, [])
+    monkeypatch.setattr(utils_ble, "BLUETOOTH_ADAPTER_PIN_STRICT", False)
+    battery, attempts, asyncio_mod = _loop_battery(monkeypatch, {"hci9": "00:01:95:00:00:09"})
+    try:
+        asyncio_mod.run(battery.async_main(PINNED, 0))
+        assert attempts == [PINNED, PINNED]
+    finally:
+        _configure(original_pins, original_pool)
+
+
 # --------- one line per episode, not three per attempt ---------
 #
 # A characterised BMS radio mute lasts 10-20 s, happens a few times an hour

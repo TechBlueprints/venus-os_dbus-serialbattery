@@ -266,6 +266,9 @@ BLUETOOTH_CONNECTION_BACKEND: str = config["DEFAULT"]["BLUETOOTH_CONNECTION_BACK
 # joins the shared pool, an entry of the form MAC@hciX pins that device to that
 # adapter. Empty list = use the system default adapter.
 BLUETOOTH_ADAPTERS: List[str] = get_list_from_config("DEFAULT", "BLUETOOTH_ADAPTERS", str)
+# Refuse to connect at all when none of a battery's configured adapters are
+# present, instead of falling back to whatever is. See config.default.ini.
+BLUETOOTH_ADAPTER_PIN_STRICT: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_ADAPTER_PIN_STRICT")
 
 # --------- Daisy Chain Configuration (Multiple BMS on one cable) ---------
 BATTERY_ADDRESSES: list = get_list_from_config("DEFAULT", "BATTERY_ADDRESSES", str)
