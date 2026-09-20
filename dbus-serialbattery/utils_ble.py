@@ -390,12 +390,27 @@ def adapters_in_attempt_order(address, present=None):
         if name and (not adapters or name in adapters) and name not in resolved:
             resolved.append(name)
     if resolved:
-        _note_pins_honoured(address)
         return resolved
     names = [entry for entry in configured if not is_adapter_mac(entry)]
     if len(names) < len(configured):
+        # Nothing the battery named is here. Fall back to every adapter that
+        # IS, rather than to nothing - returning an empty list hands the
+        # battery to bleak's system default, which is one particular card
+        # chosen by BlueZ for reasons unrelated to this driver. On a box
+        # whose scanners have their own allowlist, that card may be one the
+        # device is never discovered on, so the battery fails not-found
+        # forever while a working radio sits unused two entries away.
+        # Observed on a swapped dongle: eighteen hours unreachable with a
+        # scanned adapter present the whole time.
+        names = names or sorted(adapters, key=_adapter_sort_key)
         _warn_pins_dropped(address, configured, names)
     return names
+
+
+def _adapter_sort_key(name):
+    """hci ordering by number, so hci9 comes before hci10 rather than after."""
+    match = re.match(r"^hci(\d+)$", str(name))
+    return (0, int(match.group(1))) if match else (1, 0)
 
 
 def _warn_pins_dropped(address, configured, names):
@@ -406,9 +421,22 @@ def _warn_pins_dropped(address, configured, names):
     a name bleak can use. But the effect is that an explicit pin silently
     stops being honoured and the battery goes out on the default adapter or
     on some other card, which is exactly the separation the option exists to
-    express. The likely cause is that adapter identity cannot be read at all
-    (on Venus that is one hciconfig call away from being the only source),
-    and until now the only trace of it was a single debug line.
+    express.
+
+    Two causes, and the message names both because they need different
+    repairs. The card may have been REMOVED OR SWAPPED: a MAC pin is only as
+    durable as the card that answers to it, so changing a dongle unpins
+    whatever named it, silently, and the fix is to repin the config. Or
+    adapter identity may be unreadable, which on Venus is one hciconfig call
+    away from being the only source, and the fix is to that.
+
+    The fallback is worth saying out loud because it is not necessarily
+    benign: with no other configured adapter left, the battery goes out on
+    the system default, which may be a card nothing else uses - on a box
+    whose scanners have their own allowlist, the device is then never
+    discovered there and every attempt fails not-found. Observed on a swapped
+    dongle: the pin died with the card, the default was the new card, and the
+    battery was unreachable for 18 hours with nothing alarming on it.
 
     Warned on the transition, not on the condition: this runs once per
     connection attempt.
@@ -417,17 +445,39 @@ def _warn_pins_dropped(address, configured, names):
         return
     _unpinned_devices.add(address)
     dropped = [entry for entry in configured if is_adapter_mac(entry)]
+    fallback = ", ".join(names) if names else "the system default adapter, which may be a card nothing else scans on"
     logger.warning(
         f"BLE adapter pins for {address} are not being honoured: {', '.join(dropped)} "
         f"{'resolves' if len(dropped) == 1 else 'resolve'} to no adapter present. "
-        f"{'Falling back to ' + ', '.join(names) if names else 'Falling back to the default adapter'}. "
-        "Adapter identity may be unreadable - check that hciconfig works."
+        f"Falling back to {fallback}. Either the pinned card was removed or swapped - a MAC pin "
+        "is only as durable as the card that answers to it, so repin the config - or adapter "
+        "identity cannot be read at all, in which case check that hciconfig works."
     )
 
 
-def _note_pins_honoured(address):
-    """Clear the warned state so a later loss is reported again."""
-    _unpinned_devices.discard(address)
+def _note_pins_honoured(address, adapters=None):
+    """Re-arm the pin warning, once the battery is connected AND its pins resolve.
+
+    Deliberately NOT re-armed the moment a configured card reappears in the
+    BlueZ table. The connection manager warns about the same condition from
+    its own layer and re-arms on connect, and a log watch counts both: with
+    two triggers on one box, a card flapping in and out of the table makes
+    one count climb while the other stays put, and the first person reading
+    it files a layer as broken. Both layers now count alike.
+
+    A recurring condition already has a voice - the per-episode still-down
+    report - so this line can afford to be once per outage.
+    """
+    if address not in _unpinned_devices:
+        return
+    configured = adapters_for(address)
+    if not configured:
+        _unpinned_devices.discard(address)
+        return
+    if adapters is None:
+        adapters = bluez_adapters()
+    if any(resolve_adapter(entry, adapters) in adapters for entry in configured):
+        _unpinned_devices.discard(address)
 
 
 # Hold flag: while the flag file for a device exists, the reconnect loop makes
@@ -600,6 +650,13 @@ class BleConnectionBackend:
     drivers.
     """
 
+    # Called when a link comes up, the mirror of the disconnected callback
+    # the driver already hands to create_client. Both ends of a connection's
+    # life are then delivered by the same seam: a driver that replaces the
+    # connect path either gets both or neither, and can never open an episode
+    # it has no way to close.
+    connected_callback = None
+
     # the adapter this backend asked for, and the one the link came up on;
     # they differ whenever a lingering link elsewhere is adopted
     requested_adapter = None
@@ -620,6 +677,8 @@ class BleConnectionBackend:
         self.landed_adapter_name = landed
         if landed:
             self.current_adapter = landed
+        if self.connected_callback is not None:
+            self.connected_callback()
         return landed
 
     def create_client(self, address, disconnected_callback):
@@ -872,6 +931,7 @@ class Syncron_Ble:
     _episode_started = None
     _episode_dropped_from = None
     _episode_report_due = None
+    _pending_drop = None
 
     def __init__(self, address, read_characteristic, write_characteristic):
         """
@@ -884,7 +944,7 @@ class Syncron_Ble:
         self.write_characteristic = write_characteristic
         self.read_characteristic = read_characteristic
         self.address = address
-        self.backend = get_ble_backend()
+        self.backend = self._new_backend()
         # Only the BLE thread of the current generation keeps running; see
         # rebuild_ble_thread()
         self._ble_thread_generation = 0
@@ -901,6 +961,7 @@ class Syncron_Ble:
         self._episode_started = None
         self._episode_dropped_from = None
         self._episode_report_due = None
+        self._pending_drop = None
 
         # Start a new thread that will run bleak the async bluetooth LE library
         self.main_thread = threading.current_thread()
@@ -960,7 +1021,7 @@ class Syncron_Ble:
             self.ble_connection_ready = threading.Event()
             self.ble_async_thread_event_loop = False
             self.connected = False
-            self.backend = get_ble_backend()  # fresh backend state
+            self.backend = self._new_backend()  # fresh backend state
             ble_async_thread = threading.Thread(
                 name=f"BMS_bluetooth_async_thread_gen{generation}",
                 target=self.initiate_ble_thread_main,
@@ -1010,6 +1071,7 @@ class Syncron_Ble:
             if holding:
                 holding = False
                 logger.info(f"BLE hold for {self.address} released, resuming connection attempts")
+            self._begin_pending_episode()
             self._report_episode_still_open()
             self._attempts += 1
             attempt_started = time.time()
@@ -1019,6 +1081,18 @@ class Syncron_Ble:
             else:
                 failures = min(failures + 1, len(backoff) - 1)
             await asyncio.sleep(backoff[failures])
+
+    def _new_backend(self):
+        """A backend wired to report both ends of a connection's life.
+
+        Obtained here rather than at each construction site so the wiring
+        cannot be forgotten by one of them - the reason the link-up report
+        was skippable in the first place was that it lived on a path a
+        subclass could replace.
+        """
+        backend = get_ble_backend()
+        backend.connected_callback = self._report_link_up
+        return backend
 
     def _scans(self):
         """Scans since the counters were last reset, or None if this backend cannot scan.
@@ -1043,12 +1117,46 @@ class Syncron_Ble:
         self._attempts = 0
         self._scans_base = getattr(self.backend, "scans", 0)
 
-    def _begin_episode(self):
-        """A link has dropped: start counting, and arm the still-down report."""
+    def _note_drop(self):
+        """Record a link dropping. Called from the disconnect callback.
+
+        The callback can arrive at any moment, including part-way through the
+        connect that is about to succeed - a link left behind by a previous
+        process is delivered to its successor, so this happens on every
+        restart where the old link outlives the new registration. Resetting
+        the counters here rewrote an in-flight attempt's history and reported
+        a connection that took one attempt as having taken none. The drop is
+        recorded instead and applied by the loop, which is the only place
+        that knows no attempt is in flight.
+
+        A drop before this life has ever had a link is not an episode: there
+        was nothing to lose, and counting it would open one that the first
+        connection then closes without ever having been an outage.
+
+        The FIRST callback of an outage is the one that counts. BlueZ
+        delivers two or three for a single outage - a re-drop during a
+        reconnect attempt, or the same drop more than once - and taking the
+        latest would date the outage from its last callback rather than its
+        start, under-reporting how long the link was down by the whole gap
+        between them. Measured on a production pack: up to about 5 s, on
+        exactly the outages someone is reading the number for.
+        """
+        if not self._first_link_reported:
+            return
+        if self._pending_drop is not None:
+            return
         landed = getattr(self.backend, "landed_adapter_name", None) or getattr(self.backend, "current_adapter", None)
+        self._pending_drop = (time.time(), landed)
+
+    def _begin_pending_episode(self):
+        """Open the episode a recorded drop started, between attempts."""
+        if self._pending_drop is None or self._episode_started is not None:
+            return
+        started, landed = self._pending_drop
+        self._pending_drop = None
         self._episode_dropped_from = landed
-        self._episode_started = time.time()
-        self._episode_report_due = self._episode_started + BLE_EPISODE_REPORT_AFTER
+        self._episode_started = started
+        self._episode_report_due = started + BLE_EPISODE_REPORT_AFTER
         self._reset_counters()
 
     def _end_episode(self, terminator):
@@ -1070,6 +1178,7 @@ class Syncron_Ble:
         )
         self._episode_started = None
         self._episode_report_due = None
+        self._pending_drop = None
 
     def _report_episode_still_open(self):
         """One line every BLE_EPISODE_REPORT_AFTER seconds while a link stays down.
@@ -1096,6 +1205,10 @@ class Syncron_Ble:
     def _report_link_up(self):
         """The one INFO line a healthy life emits, and the one an episode ends with."""
         landed = describe_adapter(getattr(self.backend, "landed_adapter_name", None) or getattr(self.backend, "current_adapter", None))
+        # a drop recorded but never opened belongs to the link that just came
+        # back, so it must not open an episode after the fact
+        self._pending_drop = None
+        _note_pins_honoured(self.address)
         if not self._first_link_reported:
             self._first_link_reported = True
             self._episode_started = None
@@ -1116,7 +1229,7 @@ class Syncron_Ble:
         # message text is unchanged: it is the event a log watch keys on to
         # find episode boundaries.
         logger.info(f"bluetooh device with address: {self.address} disconnected")
-        self._begin_episode()
+        self._note_drop()
         self.signal_disconnected()
 
     def signal_disconnected(self):
@@ -1171,7 +1284,6 @@ class Syncron_Ble:
                 self.backend.establish(self.client, address, self.read_characteristic, self.notify_read_callback),
                 timeout=BLE_ESTABLISH_TIMEOUT,
             )
-            self._report_link_up()
 
         except Exception as e:
             logger.debug(f"Failed when trying to connect: {repr(e)}")

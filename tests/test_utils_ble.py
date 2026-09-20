@@ -520,6 +520,102 @@ def test_only_the_scanning_backend_reports_that_it_scans():
     assert utils_ble.get_ble_backend("BleakBackend").scans_devices is False
 
 
+def test_a_link_coming_up_is_reported_through_the_seam_not_the_connect_path():
+    """
+    The disconnect is delivered by a callback the backend invokes, so a driver
+    that replaces connect_to_bms still opens episodes. The link-up used to be
+    reported from inside connect_to_bms, so that same driver never closed
+    them and a watch saw episodes that ran forever. Both ends now arrive by
+    the same route: either a driver gets both or it gets neither.
+    """
+    reported = []
+    backend = utils_ble.get_ble_backend("BleakBackend")
+    backend.connected_callback = lambda: reported.append(True)
+    backend.current_adapter = "hci5"
+    backend._record_landed(_client_on("/org/bluez/hci3/dev_C8_47_8C_00_00_00"))
+    assert reported == [True]
+
+
+def test_the_driver_wires_the_seam_at_every_place_it_takes_a_backend():
+    """A second construction site that forgets the wiring is the same defect again."""
+    battery = utils_ble.Syncron_Ble.__new__(utils_ble.Syncron_Ble)
+    battery.address = "C8:47:8C:00:00:00"
+    backend = battery._new_backend()
+    assert backend.connected_callback == battery._report_link_up
+    source = _utils_ble_source()
+    # the driver must not obtain a backend any other way
+    assert source.count("get_ble_backend()") == 1
+
+
+def test_a_drop_landing_mid_attempt_does_not_rewrite_that_attempt(caplog, monkeypatch):
+    """
+    The disconnect callback arrives at any moment, including part-way through
+    the connect that is about to succeed - a link left by a previous process
+    is delivered to its successor on restart. Resetting the counters there
+    reported a connection that took one attempt as having taken none.
+    """
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    battery._first_link_reported = True
+    battery._attempts = 1
+    # the stale link's callback lands while this attempt is still in flight
+    battery.client_disconnected(None)
+    assert battery._attempts == 1
+    battery._report_link_up()
+    # and the drop it recorded belongs to the link that just came back, so it
+    # must not open an episode on the next pass through the loop
+    battery._begin_pending_episode()
+    assert battery._episode_started is None
+
+
+def test_a_drop_before_a_life_has_a_link_is_not_an_episode(caplog, monkeypatch):
+    """
+    A callback for a link this process never had opens an outage that never
+    happened: the first connection then closes it without a recovery line,
+    and anything counting openings against recoveries is off by one for the
+    life of the driver.
+    """
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery.client_disconnected(None)
+    battery._begin_pending_episode()
+    assert battery._episode_started is None
+    # the event itself is still reported - it happened, and a watch keys on it
+    assert "disconnected" in caplog.messages[-1]
+
+
+def test_an_outage_is_dated_from_its_first_callback_not_its_last(monkeypatch, caplog):
+    """
+    BlueZ delivers two or three disconnect callbacks for one outage. Dating
+    the episode from the latest one measures from the last callback rather
+    than from when the link went down, and under-reports the outage by the
+    gap between them - measured at up to ~5 s on a production pack.
+    """
+    monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
+    battery = _EpisodeBattery(_scanning_backend())
+    battery._first_link_reported = True
+
+    clock = [1000.0]
+    monkeypatch.setattr(utils_ble.time, "time", lambda: clock[0])
+    battery.client_disconnected(None)
+    clock[0] = 1005.0
+    battery.client_disconnected(None)  # the same outage, delivered again
+    battery._begin_pending_episode()
+    assert battery._episode_started == 1000.0
+
+    # a further callback while the episode is already open must not re-stamp it
+    clock[0] = 1007.0
+    battery.client_disconnected(None)
+    battery._begin_pending_episode()
+    assert battery._episode_started == 1000.0
+
+    clock[0] = 1010.0
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        battery._report_link_up()
+    assert "after 10.0 s" in caplog.messages[-1]
+
+
 # --------- a pin that stops being honoured says so ---------
 #
 # Dropping unresolvable MAC entries is correct - a MAC is not a name bleak
@@ -540,9 +636,35 @@ def test_a_pin_that_resolves_to_nothing_is_warned_about(caplog):
     _pin(["00:1A:7D:DA:71:13"])
     try:
         with caplog.at_level("WARNING", logger="SerialBattery"):
-            assert utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"}) == []
+            # falls back to the adapter that is present, not to bleak's default
+            assert utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"}) == ["hci9"]
         assert "adapter pins for C8:47:8C:00:00:00 are not being honoured" in caplog.messages[0]
         assert "00:1A:7D:DA:71:13" in caplog.messages[0]
+        # both causes, because they need different repairs: a swapped card is
+        # repinned, an unreadable identity is fixed at hciconfig. Naming only
+        # one sends the reader to the wrong check - a swapped dongle on dev
+        # cost 18 h of unreachability with hciconfig working perfectly.
+        assert "removed or swapped" in caplog.messages[0]
+        assert "hciconfig" in caplog.messages[0]
+        # and what the fallback actually is, since it is not necessarily benign
+        assert "Falling back to hci9" in caplog.messages[0]
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_with_no_adapters_present_at_all_the_warning_names_the_system_default(caplog):
+    """
+    The one case that still reaches bleak's default: nothing is present to
+    fall back TO. Worth naming, because the default is a card chosen by
+    BlueZ for reasons unrelated to this driver.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            assert utils_ble.adapters_in_attempt_order(PINNED, present={}) == []
+        assert "system default adapter" in caplog.messages[0]
     finally:
         _configure(original_pins, original_pool)
         utils_ble._unpinned_devices.discard(PINNED)
@@ -562,18 +684,58 @@ def test_the_warning_is_not_repeated_on_every_attempt(caplog):
         utils_ble._unpinned_devices.discard(PINNED)
 
 
-def test_a_pin_that_comes_back_is_warned_about_again_if_it_goes(caplog):
-    """The warning marks a transition, so a second loss must be reported."""
+def test_a_card_reappearing_does_not_by_itself_re_arm_the_warning(caplog):
+    """
+    Re-armed on a CONNECTION with resolving pins, not on the card merely
+    reappearing in the BlueZ table. The connection manager warns about the
+    same condition and re-arms on connect; a watch counts both, so a card
+    flapping in and out would make one count climb while the other stood
+    still and the first reader would file a layer as broken.
+    """
     original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
     _pin(["00:1A:7D:DA:71:13"])
     try:
         with caplog.at_level("WARNING", logger="SerialBattery"):
             utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
-            # the card comes back
-            utils_ble.adapters_in_attempt_order(PINNED, present={"hci3": "00:1A:7D:DA:71:13"})
-            # and goes again
+            for _ in range(3):
+                # the card comes back and goes again, with no connection between
+                utils_ble.adapters_in_attempt_order(PINNED, present={"hci3": "00:1A:7D:DA:71:13"})
+                utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+        assert len(caplog.messages) == 1
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_a_connection_with_the_pins_resolving_re_arms_the_warning(caplog):
+    """A second genuine loss, after the pins were honoured again, is reported."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+            utils_ble._note_pins_honoured(PINNED, adapters={"hci3": "00:1A:7D:DA:71:13"})
             utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
         assert len(caplog.messages) == 2
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_a_connection_while_the_pins_still_fail_does_not_re_arm(caplog):
+    """
+    Connecting on a FALLBACK card is not the pins being honoured - that is
+    the condition still holding, and re-arming there would warn again on the
+    next attempt with nothing having changed.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+            utils_ble._note_pins_honoured(PINNED, adapters={"hci9": "00:01:95:00:00:09"})
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+        assert len(caplog.messages) == 1
     finally:
         _configure(original_pins, original_pool)
         utils_ble._unpinned_devices.discard(PINNED)
@@ -609,6 +771,9 @@ class _EpisodeBattery(utils_ble.Syncron_Ble):
     def __init__(self, backend):
         self.address = "C8:47:8C:00:00:00"
         self.backend = backend
+        # no supervision wait to wake in a test, so signalling is a no-op
+        self._disconnected = None
+        self._disconnected_loop = None
         self._reset_counters()
 
 
@@ -646,7 +811,9 @@ def test_the_counters_are_the_episode_s_not_the_process_s(monkeypatch):
     backend = _scanning_backend(scans=40)
     battery = _EpisodeBattery(backend)
     battery._attempts = 7
-    battery._begin_episode()
+    battery._first_link_reported = True
+    battery._note_drop()
+    battery._begin_pending_episode()
     backend.scans = 43
     battery._attempts = 2
     assert battery._counters() == "2 attempts, 3 scans"
@@ -657,7 +824,9 @@ def test_a_recovered_link_reports_the_episode_once(monkeypatch, caplog):
     backend = _scanning_backend(scans=5)
     battery = _EpisodeBattery(backend)
     battery._first_link_reported = True
-    battery._begin_episode()
+    battery._first_link_reported = True
+    battery._note_drop()
+    battery._begin_pending_episode()
     battery._attempts = 3
     backend.scans = 8
     with caplog.at_level("INFO", logger="SerialBattery"):
@@ -688,7 +857,9 @@ def test_an_episode_that_ends_without_recovery_still_reports(caplog, monkeypatch
     """
     monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
     battery = _EpisodeBattery(_scanning_backend())
-    battery._begin_episode()
+    battery._first_link_reported = True
+    battery._note_drop()
+    battery._begin_pending_episode()
     battery._attempts = 12
     with caplog.at_level("INFO", logger="SerialBattery"):
         battery._end_episode("abandoned")
@@ -701,7 +872,9 @@ def test_a_short_outage_says_nothing_while_it_is_open(caplog, monkeypatch):
     """Every ordinary mute must pass in silence, or the directive achieved nothing."""
     monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
     battery = _EpisodeBattery(_scanning_backend())
-    battery._begin_episode()
+    battery._first_link_reported = True
+    battery._note_drop()
+    battery._begin_pending_episode()
     with caplog.at_level("INFO", logger="SerialBattery"):
         for _ in range(50):
             battery._report_episode_still_open()
@@ -711,7 +884,9 @@ def test_a_short_outage_says_nothing_while_it_is_open(caplog, monkeypatch):
 def test_a_long_outage_reports_on_a_cadence(caplog, monkeypatch):
     monkeypatch.setattr(utils_ble, "bluez_adapters", _adapters_named)
     battery = _EpisodeBattery(_scanning_backend())
-    battery._begin_episode()
+    battery._first_link_reported = True
+    battery._note_drop()
+    battery._begin_pending_episode()
     battery._attempts = 60
     battery._episode_report_due = time.time() - 1
     with caplog.at_level("INFO", logger="SerialBattery"):
@@ -873,19 +1048,38 @@ def test_a_mac_whose_adapter_is_gone_is_dropped():
         _configure(original_pins, original_pool)
 
 
-def test_only_unresolvable_macs_degrade_to_the_default_adapter_not_to_garbage():
+def test_unresolvable_macs_fall_back_to_the_adapters_that_are_present():
     """
-    A MAC is not a name bleak can use. Where an unresolvable hciN list is
-    handed back unfiltered (better to try than to refuse), an unresolvable MAC
-    list must come back empty so the caller falls back to the system default
-    adapter instead of passing a MAC into the connect.
+    A MAC is not a name bleak can use, so an unresolvable MAC list cannot be
+    passed through. It falls back to every adapter that IS present rather
+    than to nothing: an empty list hands the battery to bleak's system
+    default, which is one card chosen by BlueZ for reasons unrelated to this
+    driver and may be one the device is never discovered on.
     """
     original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
     _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99"]}, [])
+    utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
     try:
-        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == []
+        chosen = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS)
+        assert chosen == ["hci3", "hci4"]
+        # and never the MAC itself, which bleak cannot use
+        assert not any(utils_ble.is_adapter_mac(name) for name in chosen)
     finally:
         _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
+
+
+def test_the_present_fallback_is_ordered_by_adapter_number():
+    """hci9 before hci10: string order puts a ten-adapter box's cards backwards."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99"]}, [])
+    utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
+    try:
+        present = {"hci10": "00:01:95:00:00:10", "hci9": "00:01:95:00:00:09", "hci2": "00:01:95:00:00:02"}
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=present) == ["hci2", "hci9", "hci10"]
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
 
 
 def test_the_pool_accepts_macs_too():
