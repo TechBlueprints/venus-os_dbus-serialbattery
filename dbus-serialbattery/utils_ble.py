@@ -11,6 +11,7 @@ from bleak.exc import BleakCharacteristicNotFoundError, BleakError
 from time import sleep
 from utils import (
     logger,
+    BLUETOOTH_ADAPTER_PIN_STRICT,
     BLUETOOTH_ADAPTERS,
     BLUETOOTH_CONNECTION_BACKEND,
     BLUETOOTH_FORCE_RESET_BLE_STACK,
@@ -384,18 +385,59 @@ def adapters_in_attempt_order(address, present=None):
     # callers that only know what exists keep working - MAC entries simply
     # cannot resolve against it, which is the honest answer
     adapters = present if isinstance(present, dict) else {name: "" for name in present}
+    resolved = _resolve_all(configured, adapters)
+    if resolved:
+        return resolved
+    names = [entry for entry in configured if not is_adapter_mac(entry)]
+    if len(names) < len(configured):
+        # Nothing the battery named is here. Fall back to every adapter that
+        # IS, rather than to nothing - returning an empty list hands the
+        # battery to bleak's system default, which is one particular card
+        # chosen by BlueZ for reasons unrelated to this driver. On a box
+        # whose scanners have their own allowlist, that card may be one the
+        # device is never discovered on, so the battery fails not-found
+        # forever while a working radio sits unused two entries away.
+        # Observed on a swapped dongle: eighteen hours unreachable with a
+        # scanned adapter present the whole time.
+        names = names or sorted(adapters, key=_adapter_sort_key)
+        _warn_pins_dropped(address, configured, names)
+    return names
+
+
+def _resolve_all(configured, adapters):
+    """Configured entries as the hciN names they name right now, in order."""
     resolved = []
     for entry in configured:
         name = resolve_adapter(entry, adapters)
         if name and (not adapters or name in adapters) and name not in resolved:
             resolved.append(name)
-    if resolved:
-        _note_pins_honoured(address)
-        return resolved
-    names = [entry for entry in configured if not is_adapter_mac(entry)]
-    if len(names) < len(configured):
-        _warn_pins_dropped(address, configured, names)
-    return names
+    return resolved
+
+
+def configured_adapter_present(address, present=None):
+    """
+    Whether any adapter this battery names is here right now.
+
+    Shares _resolve_all with the selection, so the question "may this battery
+    connect" and the answer "over which adapter" can never disagree - the
+    whole point of a strict pin is that the two are the same decision.
+
+    A battery that names no adapters is trivially satisfied: it never asked
+    for a particular radio, so there is nothing to wait for.
+    """
+    configured = adapters_for(address) or list(BLUETOOTH_ADAPTER_POOL)
+    if not configured:
+        return True
+    if present is None:
+        present = bluez_adapters()
+    adapters = present if isinstance(present, dict) else {name: "" for name in present}
+    return bool(_resolve_all(configured, adapters))
+
+
+def _adapter_sort_key(name):
+    """hci ordering by number, so hci9 comes before hci10 rather than after."""
+    match = re.match(r"^hci(\d+)$", str(name))
+    return (0, int(match.group(1))) if match else (1, 0)
 
 
 def _warn_pins_dropped(address, configured, names):
@@ -406,9 +448,22 @@ def _warn_pins_dropped(address, configured, names):
     a name bleak can use. But the effect is that an explicit pin silently
     stops being honoured and the battery goes out on the default adapter or
     on some other card, which is exactly the separation the option exists to
-    express. The likely cause is that adapter identity cannot be read at all
-    (on Venus that is one hciconfig call away from being the only source),
-    and until now the only trace of it was a single debug line.
+    express.
+
+    Two causes, and the message names both because they need different
+    repairs. The card may have been REMOVED OR SWAPPED: a MAC pin is only as
+    durable as the card that answers to it, so changing a dongle unpins
+    whatever named it, silently, and the fix is to repin the config. Or
+    adapter identity may be unreadable, which on Venus is one hciconfig call
+    away from being the only source, and the fix is to that.
+
+    The fallback is worth saying out loud because it is not necessarily
+    benign: with no other configured adapter left, the battery goes out on
+    the system default, which may be a card nothing else uses - on a box
+    whose scanners have their own allowlist, the device is then never
+    discovered there and every attempt fails not-found. Observed on a swapped
+    dongle: the pin died with the card, the default was the new card, and the
+    battery was unreachable for 18 hours with nothing alarming on it.
 
     Warned on the transition, not on the condition: this runs once per
     connection attempt.
@@ -417,17 +472,39 @@ def _warn_pins_dropped(address, configured, names):
         return
     _unpinned_devices.add(address)
     dropped = [entry for entry in configured if is_adapter_mac(entry)]
+    fallback = ", ".join(names) if names else "the system default adapter, which may be a card nothing else scans on"
     logger.warning(
         f"BLE adapter pins for {address} are not being honoured: {', '.join(dropped)} "
         f"{'resolves' if len(dropped) == 1 else 'resolve'} to no adapter present. "
-        f"{'Falling back to ' + ', '.join(names) if names else 'Falling back to the default adapter'}. "
-        "Adapter identity may be unreadable - check that hciconfig works."
+        f"Falling back to {fallback}. Either the pinned card was removed or swapped - a MAC pin "
+        "is only as durable as the card that answers to it, so repin the config - or adapter "
+        "identity cannot be read at all, in which case check that hciconfig works."
     )
 
 
-def _note_pins_honoured(address):
-    """Clear the warned state so a later loss is reported again."""
-    _unpinned_devices.discard(address)
+def _note_pins_honoured(address, adapters=None):
+    """Re-arm the pin warning, once the battery is connected AND its pins resolve.
+
+    Deliberately NOT re-armed the moment a configured card reappears in the
+    BlueZ table. The connection manager warns about the same condition from
+    its own layer and re-arms on connect, and a log watch counts both: with
+    two triggers on one box, a card flapping in and out of the table makes
+    one count climb while the other stays put, and the first person reading
+    it files a layer as broken. Both layers now count alike.
+
+    A recurring condition already has a voice - the per-episode still-down
+    report - so this line can afford to be once per outage.
+    """
+    if address not in _unpinned_devices:
+        return
+    configured = adapters_for(address)
+    if not configured:
+        _unpinned_devices.discard(address)
+        return
+    if adapters is None:
+        adapters = bluez_adapters()
+    if any(resolve_adapter(entry, adapters) in adapters for entry in configured):
+        _unpinned_devices.discard(address)
 
 
 # Hold flag: while the flag file for a device exists, the reconnect loop makes
@@ -465,6 +542,13 @@ BLE_SUPERVISION_RECHECK = 5.0
 # the first line lands well past every ordinary one: an outage has to be
 # genuinely unusual to say anything at all. In a sustained outage this is 12
 # lines an hour per battery, and none otherwise.
+# Spacing between connection attempts: the first retry stays quick for an
+# ordinary blip, then it settles. The flat 1 s retry this replaced turned a
+# real outage into continuous hammering - production logs show single
+# recovery episodes of 220 attempts - which wedged the adapter's discovery
+# state and made recovery take longer than the outage.
+BLE_RECONNECT_BACKOFF = [1, 3, 6]
+
 BLE_EPISODE_REPORT_AFTER = 300.0
 
 BLE_ESTABLISH_TIMEOUT = 300.0
@@ -991,15 +1075,11 @@ class Syncron_Ble:
         self.ble_async_thread_event_loop = asyncio.get_event_loop()
         self.ble_async_thread_ready.set()
 
-        # Space out connection attempts: 1s, 3s, then steady 6s. The first
-        # retry stays instant-ish for ordinary blips; the 6s cruise stops
-        # the continuous hammering that produced 220-attempt recovery
-        # storms and wedged adapter discovery state. A session that held
-        # for over a minute resets the ramp.
-        backoff = [1, 3, 6]
+        # A session that held for over a minute resets the ramp.
         failures = 0
         hold_flag = ble_hold_flag_path(self.address)
         holding = False
+        waiting_for_adapter = False
         while self.main_thread.is_alive() and generation == self._ble_thread_generation:
             if os.path.exists(hold_flag):
                 try:
@@ -1021,6 +1101,26 @@ class Syncron_Ble:
             if holding:
                 holding = False
                 logger.info(f"BLE hold for {self.address} released, resuming connection attempts")
+            # A strict pin means the named adapter is protecting something -
+            # keeping two batteries off one radio, or off a card another
+            # service owns - so connecting over a different one is worse than
+            # not connecting. Wait rather than fall back, and say so once.
+            if BLUETOOTH_ADAPTER_PIN_STRICT and not configured_adapter_present(self.address):
+                if not waiting_for_adapter:
+                    waiting_for_adapter = True
+                    logger.warning(
+                        f"BLE adapter pins for {self.address} are not being honoured: none of "
+                        f"{', '.join(adapters_for(self.address) or BLUETOOTH_ADAPTER_POOL)} is present. "
+                        "Waiting for one of them rather than falling back (BLUETOOTH_ADAPTER_PIN_STRICT is on). "
+                        "Either the pinned card was removed or swapped - a MAC pin is only as durable as the "
+                        "card that answers to it, so repin the config - or adapter identity cannot be read at "
+                        "all, in which case check that hciconfig works."
+                    )
+                await asyncio.sleep(BLE_HOLD_POLL_INTERVAL)
+                continue
+            if waiting_for_adapter:
+                waiting_for_adapter = False
+                logger.info(f"BLE adapter for {self.address} is present again, resuming connection attempts")
             self._begin_pending_episode()
             self._report_episode_still_open()
             self._attempts += 1
@@ -1029,8 +1129,8 @@ class Syncron_Ble:
             if time.time() - attempt_started > 60.0:
                 failures = 0
             else:
-                failures = min(failures + 1, len(backoff) - 1)
-            await asyncio.sleep(backoff[failures])
+                failures = min(failures + 1, len(BLE_RECONNECT_BACKOFF) - 1)
+            await asyncio.sleep(BLE_RECONNECT_BACKOFF[failures])
 
     def _new_backend(self):
         """A backend wired to report both ends of a connection's life.
@@ -1158,6 +1258,7 @@ class Syncron_Ble:
         # a drop recorded but never opened belongs to the link that just came
         # back, so it must not open an episode after the fact
         self._pending_drop = None
+        _note_pins_honoured(self.address)
         if not self._first_link_reported:
             self._first_link_reported = True
             self._episode_started = None

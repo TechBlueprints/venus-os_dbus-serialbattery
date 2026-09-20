@@ -266,6 +266,9 @@ BLUETOOTH_CONNECTION_BACKEND: str = config["DEFAULT"]["BLUETOOTH_CONNECTION_BACK
 # joins the shared pool, an entry of the form MAC@hciX pins that device to that
 # adapter. Empty list = use the system default adapter.
 BLUETOOTH_ADAPTERS: List[str] = get_list_from_config("DEFAULT", "BLUETOOTH_ADAPTERS", str)
+# Refuse to connect at all when none of a battery's configured adapters are
+# present, instead of falling back to whatever is. See config.default.ini.
+BLUETOOTH_ADAPTER_PIN_STRICT: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_ADAPTER_PIN_STRICT")
 BLUETOOTH_ADAPTER_CLAIMS: str = config["DEFAULT"]["BLUETOOTH_ADAPTER_CLAIMS"].strip().lower()
 # Opt-in: route every bleak client in this process through the vendored
 # bleak-connection-manager v2 (claim-aware adapter selection, link slots,

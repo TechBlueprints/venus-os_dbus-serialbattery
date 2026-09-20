@@ -636,9 +636,35 @@ def test_a_pin_that_resolves_to_nothing_is_warned_about(caplog):
     _pin(["00:1A:7D:DA:71:13"])
     try:
         with caplog.at_level("WARNING", logger="SerialBattery"):
-            assert utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"}) == []
+            # falls back to the adapter that is present, not to bleak's default
+            assert utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"}) == ["hci9"]
         assert "adapter pins for C8:47:8C:00:00:00 are not being honoured" in caplog.messages[0]
         assert "00:1A:7D:DA:71:13" in caplog.messages[0]
+        # both causes, because they need different repairs: a swapped card is
+        # repinned, an unreadable identity is fixed at hciconfig. Naming only
+        # one sends the reader to the wrong check - a swapped dongle on dev
+        # cost 18 h of unreachability with hciconfig working perfectly.
+        assert "removed or swapped" in caplog.messages[0]
+        assert "hciconfig" in caplog.messages[0]
+        # and what the fallback actually is, since it is not necessarily benign
+        assert "Falling back to hci9" in caplog.messages[0]
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_with_no_adapters_present_at_all_the_warning_names_the_system_default(caplog):
+    """
+    The one case that still reaches bleak's default: nothing is present to
+    fall back TO. Worth naming, because the default is a card chosen by
+    BlueZ for reasons unrelated to this driver.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            assert utils_ble.adapters_in_attempt_order(PINNED, present={}) == []
+        assert "system default adapter" in caplog.messages[0]
     finally:
         _configure(original_pins, original_pool)
         utils_ble._unpinned_devices.discard(PINNED)
@@ -658,18 +684,58 @@ def test_the_warning_is_not_repeated_on_every_attempt(caplog):
         utils_ble._unpinned_devices.discard(PINNED)
 
 
-def test_a_pin_that_comes_back_is_warned_about_again_if_it_goes(caplog):
-    """The warning marks a transition, so a second loss must be reported."""
+def test_a_card_reappearing_does_not_by_itself_re_arm_the_warning(caplog):
+    """
+    Re-armed on a CONNECTION with resolving pins, not on the card merely
+    reappearing in the BlueZ table. The connection manager warns about the
+    same condition and re-arms on connect; a watch counts both, so a card
+    flapping in and out would make one count climb while the other stood
+    still and the first reader would file a layer as broken.
+    """
     original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
     _pin(["00:1A:7D:DA:71:13"])
     try:
         with caplog.at_level("WARNING", logger="SerialBattery"):
             utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
-            # the card comes back
-            utils_ble.adapters_in_attempt_order(PINNED, present={"hci3": "00:1A:7D:DA:71:13"})
-            # and goes again
+            for _ in range(3):
+                # the card comes back and goes again, with no connection between
+                utils_ble.adapters_in_attempt_order(PINNED, present={"hci3": "00:1A:7D:DA:71:13"})
+                utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+        assert len(caplog.messages) == 1
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_a_connection_with_the_pins_resolving_re_arms_the_warning(caplog):
+    """A second genuine loss, after the pins were honoured again, is reported."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+            utils_ble._note_pins_honoured(PINNED, adapters={"hci3": "00:1A:7D:DA:71:13"})
             utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
         assert len(caplog.messages) == 2
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def test_a_connection_while_the_pins_still_fail_does_not_re_arm(caplog):
+    """
+    Connecting on a FALLBACK card is not the pins being honoured - that is
+    the condition still holding, and re-arming there would warn again on the
+    next attempt with nothing having changed.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _pin(["00:1A:7D:DA:71:13"])
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+            utils_ble._note_pins_honoured(PINNED, adapters={"hci9": "00:01:95:00:00:09"})
+            utils_ble.adapters_in_attempt_order(PINNED, present={"hci9"})
+        assert len(caplog.messages) == 1
     finally:
         _configure(original_pins, original_pool)
         utils_ble._unpinned_devices.discard(PINNED)
@@ -690,6 +756,130 @@ def test_an_unresolvable_hci_name_is_not_a_dropped_pin(caplog):
     finally:
         _configure(original_pins, original_pool)
         utils_ble._unpinned_devices.discard(PINNED)
+
+
+# --------- a strict pin waits rather than falling back ---------
+#
+# The default is to warn and connect over whatever is present: a battery
+# working on the wrong radio beats a battery not working. A strict pin says
+# the opposite, for the case where the pin is protecting something.
+
+
+def test_a_configured_adapter_that_is_present_satisfies_the_pin():
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({PINNED: ["00:1A:7D:DA:71:13"]}, [])
+    try:
+        assert utils_ble.configured_adapter_present(PINNED, present={"hci3": "00:1A:7D:DA:71:13"}) is True
+        assert utils_ble.configured_adapter_present(PINNED, present={"hci9": "00:01:95:00:00:09"}) is False
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_battery_naming_no_adapters_is_never_waiting_for_one():
+    """It never asked for a particular radio, so there is nothing to wait for."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({}, [])
+    try:
+        assert utils_ble.configured_adapter_present(PINNED, present={}) is True
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_the_pin_question_and_the_adapter_choice_are_one_decision():
+    """
+    Whether a battery may connect and which adapter it connects over must
+    come from the same resolution: if they disagree, a strict pin either
+    blocks a battery whose card is present or admits one whose card is not.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({PINNED: ["00:1A:7D:DA:71:13", "hci4"]}, [])
+    utils_ble._unpinned_devices.discard(PINNED)
+    try:
+        for present in ({"hci3": "00:1A:7D:DA:71:13"}, {"hci4": "00:01:95:00:00:04"}, {"hci9": "00:01:95:00:00:09"}, {}):
+            resolved = utils_ble.adapters_in_attempt_order(PINNED, present=present)
+            satisfied = utils_ble.configured_adapter_present(PINNED, present=present)
+            # a battery is satisfied exactly when the selection resolved a
+            # configured entry rather than falling back
+            assert satisfied == (resolved == utils_ble._resolve_all(["00:1A:7D:DA:71:13", "hci4"], present or {}))
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard(PINNED)
+
+
+def _loop_battery(monkeypatch, present, iterations=3):
+    """A Syncron_Ble with the threads left out, so async_main can be run for a few passes."""
+    import asyncio
+
+    battery = utils_ble.Syncron_Ble.__new__(utils_ble.Syncron_Ble)
+    battery.address = PINNED
+    battery._ble_thread_generation = 0
+    battery.backend = _plain_backend()
+    battery._reset_counters()
+
+    remaining = [iterations]
+
+    def is_alive():
+        remaining[0] -= 1
+        return remaining[0] > 0
+
+    battery.main_thread = types.SimpleNamespace(is_alive=is_alive)
+
+    attempts = []
+
+    async def fake_connect(address):
+        attempts.append(address)
+
+    battery.connect_to_bms = fake_connect
+    monkeypatch.setattr(utils_ble, "BLE_HOLD_POLL_INTERVAL", 0)
+    monkeypatch.setattr(utils_ble, "BLE_RECONNECT_BACKOFF", [0, 0, 0])
+    monkeypatch.setattr(utils_ble, "bluez_adapters", lambda: present)
+    monkeypatch.setattr(utils_ble, "ble_hold_flag_path", lambda address: os.path.join(DRIVER_DIR, "no-such-hold-flag"))
+    return battery, attempts, asyncio
+
+
+def test_a_strict_pin_makes_no_attempt_while_its_adapter_is_absent(monkeypatch, caplog):
+    """
+    The point of strict is that the named adapter is protecting something, so
+    connecting over a different one is worse than not connecting. A test that
+    only checked the predicate would pass with the loop ignoring it entirely.
+    """
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({PINNED: ["00:1A:7D:DA:71:13"]}, [])
+    monkeypatch.setattr(utils_ble, "BLUETOOTH_ADAPTER_PIN_STRICT", True)
+    battery, attempts, asyncio_mod = _loop_battery(monkeypatch, {"hci9": "00:01:95:00:00:09"})
+    try:
+        with caplog.at_level("WARNING", logger="SerialBattery"):
+            asyncio_mod.run(battery.async_main(PINNED, 0))
+        assert attempts == []
+        # said once, not once per pass
+        assert len([m for m in caplog.messages if "Waiting for one of them" in m]) == 1
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_a_strict_pin_connects_as_soon_as_its_adapter_is_there(monkeypatch):
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({PINNED: ["00:1A:7D:DA:71:13"]}, [])
+    monkeypatch.setattr(utils_ble, "BLUETOOTH_ADAPTER_PIN_STRICT", True)
+    battery, attempts, asyncio_mod = _loop_battery(monkeypatch, {"hci3": "00:1A:7D:DA:71:13"})
+    try:
+        asyncio_mod.run(battery.async_main(PINNED, 0))
+        assert attempts == [PINNED, PINNED]
+    finally:
+        _configure(original_pins, original_pool)
+
+
+def test_without_strict_an_absent_pin_still_attempts(monkeypatch):
+    """The default is unchanged: warn, and connect over whatever is present."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({PINNED: ["00:1A:7D:DA:71:13"]}, [])
+    monkeypatch.setattr(utils_ble, "BLUETOOTH_ADAPTER_PIN_STRICT", False)
+    battery, attempts, asyncio_mod = _loop_battery(monkeypatch, {"hci9": "00:01:95:00:00:09"})
+    try:
+        asyncio_mod.run(battery.async_main(PINNED, 0))
+        assert attempts == [PINNED, PINNED]
+    finally:
+        _configure(original_pins, original_pool)
 
 
 # --------- one line per episode, not three per attempt ---------
@@ -982,19 +1172,38 @@ def test_a_mac_whose_adapter_is_gone_is_dropped():
         _configure(original_pins, original_pool)
 
 
-def test_only_unresolvable_macs_degrade_to_the_default_adapter_not_to_garbage():
+def test_unresolvable_macs_fall_back_to_the_adapters_that_are_present():
     """
-    A MAC is not a name bleak can use. Where an unresolvable hciN list is
-    handed back unfiltered (better to try than to refuse), an unresolvable MAC
-    list must come back empty so the caller falls back to the system default
-    adapter instead of passing a MAC into the connect.
+    A MAC is not a name bleak can use, so an unresolvable MAC list cannot be
+    passed through. It falls back to every adapter that IS present rather
+    than to nothing: an empty list hands the battery to bleak's system
+    default, which is one card chosen by BlueZ for reasons unrelated to this
+    driver and may be one the device is never discovered on.
     """
     original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
     _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99"]}, [])
+    utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
     try:
-        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS) == []
+        chosen = utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=ADAPTERS)
+        assert chosen == ["hci3", "hci4"]
+        # and never the MAC itself, which bleak cannot use
+        assert not any(utils_ble.is_adapter_mac(name) for name in chosen)
     finally:
         _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
+
+
+def test_the_present_fallback_is_ordered_by_adapter_number():
+    """hci9 before hci10: string order puts a ten-adapter box's cards backwards."""
+    original_pins, original_pool = utils_ble.BLUETOOTH_ADAPTER_PINS, utils_ble.BLUETOOTH_ADAPTER_POOL
+    _configure({"C8:47:8C:00:00:00": ["00:1A:7D:DA:71:99"]}, [])
+    utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
+    try:
+        present = {"hci10": "00:01:95:00:00:10", "hci9": "00:01:95:00:00:09", "hci2": "00:01:95:00:00:02"}
+        assert utils_ble.adapters_in_attempt_order("C8:47:8C:00:00:00", present=present) == ["hci2", "hci9", "hci10"]
+    finally:
+        _configure(original_pins, original_pool)
+        utils_ble._unpinned_devices.discard("C8:47:8C:00:00:00")
 
 
 def test_the_pool_accepts_macs_too():
