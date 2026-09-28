@@ -97,6 +97,13 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
     _link_down = None
     _link_down_loop = None
 
+    # Consecutive failed connect attempts, reset by the next success. The
+    # reconnect loop retries indefinitely, so a pack that is simply out of
+    # range writes this line on every attempt for as long as it is away -
+    # 4,400 times across one prod log corpus. The first failure of an episode
+    # is the one worth reading; the rest are the same fact again.
+    _connect_failures = 0
+
     def client_disconnected(self, client):
         """Wake supervision as well as logging it.
 
@@ -153,6 +160,7 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
             )
             self.feed_watchdog()
             self.connected = True
+            self._connect_failures = 0
             # Deliberately NO link-up report here. utils_ble delivers the
             # once-per-life "connected to bluetooth device ... on adapter" line
             # and the "BLE link recovered for" episode terminator through the
@@ -166,7 +174,13 @@ class HumsiENK_Syncron_Ble(Syncron_Ble):
             # because _report_link_up latches (a second call emits nothing) -
             # someone else's internal detail, not a contract to lean on.
         except Exception as e:
-            logger.error(f"Failed when trying to connect: {e}")
+            self._connect_failures += 1
+            # Said once per episode, at a level prod emits, and worded exactly
+            # as before so anything keyed on this string keeps working.
+            if self._connect_failures == 1:
+                logger.info(f"Failed when trying to connect: {e}")
+            else:
+                logger.debug(f"Failed when trying to connect: {e} (attempt {self._connect_failures})")
             return False
         finally:
             self.ble_connection_ready.set()
@@ -214,6 +228,14 @@ class HumsiENK_Ble(Battery):
     # Shortest interval between handshake re-sends while the stream is starved.
     HANDSHAKE_RETRY_SECONDS = 30.0
 
+    # Consecutive re-sends that still count as an ordinary radio mute. The
+    # characterised mutes are 10-15 s and a re-send needs 15 s of silence, so
+    # one is routine. A second means 45 s without data on an open link, which
+    # is a different condition - the pack is there and not answering - and is
+    # said once at INFO rather than on every re-send after it. The 180 s
+    # watchdog covers the case where it never recovers.
+    HANDSHAKE_QUIET_RESENDS = 1
+
     # How long a single request waits for its response.
     REQUEST_TIMEOUT_SECONDS = 3.0
 
@@ -236,6 +258,7 @@ class HumsiENK_Ble(Battery):
         self._last_frame_time = 0.0  # last checksum-verified frame from the radio
         self._last_poll_time = 0.0
         self._last_handshake_time = 0.0
+        self._handshake_resends = 0  # consecutive; reset by the first frame back
         self._deadline = None  # caps a run of requests, see _request()
 
         logger.info("Init of HumsiENK_Ble at " + address)
@@ -326,9 +349,16 @@ class HumsiENK_Ble(Battery):
                     # so the age is only meaningful once one has arrived -
                     # otherwise "stale" would be measured from the epoch.
                     if self._last_frame_time > 0.0:
-                        logger.info(f"HumsiENK: re-sending handshake after {stale_seconds:.0f} s without data")
+                        message = f"HumsiENK: re-sending handshake after {stale_seconds:.0f} s without data"
                     else:
-                        logger.info("HumsiENK: re-sending handshake, no data since connection")
+                        message = "HumsiENK: re-sending handshake, no data since connection"
+                    self._handshake_resends += 1
+                    # said once, on the crossing, so a long starvation does not
+                    # narrate itself a line at a time
+                    if self._handshake_resends == self.HANDSHAKE_QUIET_RESENDS + 1:
+                        logger.info(message + f" ({self._handshake_resends} consecutive)")
+                    else:
+                        logger.debug(message)
                     self._send_command(self.CMD_HANDSHAKE)
                     self._last_handshake_time = now
 
@@ -456,6 +486,7 @@ class HumsiENK_Ble(Battery):
             del self._rx_buffer[:total_length]
             self._parse_and_update(frame)
             self._last_frame_time = time.time()
+            self._handshake_resends = 0
             # Fed only here, so the watchdog proves real data, not just a link
             self.ble_handle.feed_watchdog()
             commands.append(frame[1])

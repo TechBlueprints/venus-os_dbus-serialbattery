@@ -5,7 +5,7 @@ import os
 import signal
 import sys
 from datetime import datetime
-from time import sleep
+from time import sleep, time
 from typing import Union
 
 from dbus.mainloop.glib import DBusGMainLoop
@@ -16,7 +16,6 @@ from dbushelper import DbusHelper
 from fallback_battery import FallbackBattery
 from utils import (
     BATTERY_ADDRESSES,
-    BLUETOOTH_CONNECTION_MANAGER_DIR,
     BMS_TYPE,
     bytearray_to_string,
     DRIVER_VERSION,
@@ -143,6 +142,35 @@ def with_fallback(battery: Union[Battery, None]) -> Union[Battery, None]:
 count_for_loops = 5
 delayed_loop_count = 0
 
+# rate limit for the slow poll warning, since a stalled connection triggers it every cycle
+poll_warning_interval = 60
+poll_warning_last_time = 0
+
+
+def should_log_poll_warning(batteries, current_time: int) -> bool:
+    """
+    Check whether the slow poll warning should be logged now.
+
+    A poll that waits on a battery which is already known to be offline is that outage,
+    not a second fault, and the offline state is reported by the dbushelper. Otherwise the
+    warning is rate limited, since a stalled connection makes every cycle a slow one.
+
+    :param batteries: the battery objects of this process
+    :param current_time: current time in seconds
+    :return: True if the warning should be logged, False if it should be suppressed
+    """
+    global poll_warning_last_time
+
+    # online is None until the first successful poll, so a slow start is still reported
+    if any(battery.online is False for battery in batteries):
+        return False
+
+    if current_time - poll_warning_last_time < poll_warning_interval:
+        return False
+
+    poll_warning_last_time = current_time
+    return True
+
 
 def main():
     global expected_bms_types, supported_bms_types
@@ -218,7 +246,8 @@ def main():
             delayed_loop_count += 1
             if delayed_loop_count > 1:
                 remaining = count_for_loops - delayed_loop_count
-                logger.warning(f"Polling took {runtime:.3f}s (refresh {refresh_runtime:.3f}s). Increase in {remaining} cycles.")
+                if should_log_poll_warning(battery.values(), int(time())):
+                    logger.warning(f"Polling took {runtime:.3f}s (refresh {refresh_runtime:.3f}s). Increase in {remaining} cycles.")
         else:
             delayed_loop_count = 0
 
@@ -436,12 +465,13 @@ def main():
         else:
             ble_address = sys.argv[2]
 
-            # Unconditional: the BLE stack must be importable whether or not the
-            # connection manager is enabled. Sources the shared install from
-            # BLUETOOTH_CONNECTION_MANAGER_DIR when it exists, else the vendored
-            # ext/ble/ copies (no vendored connection manager exists: absent means
-            # plain bleak).
+            # Arrange the BLE stack FIRST: this decides whether the box's
+            # shared connection manager or this repo's ext/ble copies end up
+            # on sys.path. Unconditional and above the option below, because
+            # the driver needs an importable bleak whether or not the
+            # connection manager is enabled or even installed.
             from ble_stack import ensure_ble_stack
+            from utils import BLUETOOTH_CONNECTION_MANAGER_DIR
 
             ensure_ble_stack(BLUETOOTH_CONNECTION_MANAGER_DIR)
 
@@ -455,6 +485,10 @@ def main():
 
             # After the install, never before: utils_ble imports bleak at
             # module scope, and the catcher has to be in place first.
+            # Make the configured adapters durable before anything connects:
+            # a name that resolves to a readable MAC is written back to the
+            # config, because the number can be handed to a different radio
+            # by the next reboot while the name stays put.
             from utils_ble import pin_adapters_by_mac
 
             pin_adapters_by_mac()
@@ -512,22 +546,30 @@ def main():
         else:
             ble_address = sys.argv[2]
 
-            # Unconditional: the BLE stack must be importable whether or not the
-            # connection manager is enabled. Sources the shared install from
-            # BLUETOOTH_CONNECTION_MANAGER_DIR when it exists, else the vendored
-            # ext/ble/ copies (no vendored connection manager exists: absent means
-            # plain bleak).
+            # Arrange the BLE stack FIRST: this decides whether the box's
+            # shared connection manager or this repo's ext/ble copies end up
+            # on sys.path. Unconditional and above the option below, because
+            # the driver needs an importable bleak whether or not the
+            # connection manager is enabled or even installed.
             from ble_stack import ensure_ble_stack
+            from utils import BLUETOOTH_CONNECTION_MANAGER_DIR
 
             ensure_ble_stack(BLUETOOTH_CONNECTION_MANAGER_DIR)
 
             # Before the aiobmsble import chain, for the same reason as above.
+            # aiobmsble is the main beneficiary: its BaseBMS._connect is
+            # @final and owns its clients, so the connection manager is the
+            # only way to route or coordinate its connections.
             from utils_ble_manager import install_ble_connection_manager
 
             install_ble_connection_manager(ble_address)
 
             # After the install, never before: utils_ble imports bleak at
             # module scope, and the catcher has to be in place first.
+            # Make the configured adapters durable before anything connects:
+            # a name that resolves to a readable MAC is written back to the
+            # config, because the number can be handed to a different radio
+            # by the next reboot while the name stays put.
             from utils_ble import pin_adapters_by_mac
 
             pin_adapters_by_mac()
@@ -712,10 +754,11 @@ def main():
         # Calculate the initial values for the battery
         battery[key_address].set_calculated_data()
 
-        # Publish them immediately: setup_vedbus() adds every value path as
-        # None, and without this the service advertises None until the first
-        # poll tick. Consumers that react to value changes sample exactly
-        # that leading edge, so the window is reachable in practice.
+        # Publish them immediately: setup_vedbus() registers the measured
+        # values (/Dc/0/Voltage, /Soc, cell voltages, ...) as None, and
+        # without this any consumer reading the service before the first
+        # poll tick gets None. The charge limits are still decided on that
+        # first tick, so /Info/MaxChargeVoltage reads None until then.
         helper[key_address].publish_dbus()
 
     # get first key from battery dict

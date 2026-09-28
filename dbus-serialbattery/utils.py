@@ -269,15 +269,17 @@ BLUETOOTH_ADAPTERS: List[str] = get_list_from_config("DEFAULT", "BLUETOOTH_ADAPT
 # Refuse to connect at all when none of a battery's configured adapters are
 # present, instead of falling back to whatever is. See config.default.ini.
 BLUETOOTH_ADAPTER_PIN_STRICT: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_ADAPTER_PIN_STRICT")
-BLUETOOTH_ADAPTER_CLAIMS: str = config["DEFAULT"]["BLUETOOTH_ADAPTER_CLAIMS"].strip().lower()
-# Opt-in: route every bleak client in this process through the vendored
-# bleak-connection-manager v2 (claim-aware adapter selection, link slots,
+# Folder holding a shared bleak-connection-manager install (its src/ and
+# ext/ are added to sys.path when present). Empty means never look, which
+# is the default: a box without a shared install runs plain vendored bleak.
+BLUETOOTH_CONNECTION_MANAGER_DIR: str = config["DEFAULT"]["BLUETOOTH_CONNECTION_MANAGER_DIR"].strip()
+# Fleet policy: force bleak's StartNotify path. AcquireNotify is the only path
+# that reaches the BlueZ 5.72 notify_io double-free, so it is never allowed.
+BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY")
+# Opt-in: route every bleak client in this process through the shared
+# bleak-connection-manager (claim-aware adapter selection, link slots,
 # connection parameter tuning), coordinated across processes via /run/bt-claims
 BLUETOOTH_CONNECTION_MANAGER: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER")
-# Folder of the shared bleak-connection-manager install; empty = never look
-BLUETOOTH_CONNECTION_MANAGER_DIR: str = config["DEFAULT"]["BLUETOOTH_CONNECTION_MANAGER_DIR"].strip()
-# StartNotify instead of AcquireNotify for every subscription (BlueZ 5.72 UAF)
-BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY: bool = get_bool_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY")
 # Established-link capacity per adapter, hciX:N entries; only used with
 # BLUETOOTH_CONNECTION_MANAGER = True, and an uncapped adapter is never gated
 BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS: List[str] = get_list_from_config("DEFAULT", "BLUETOOTH_CONNECTION_MANAGER_LINK_CAPS", str)

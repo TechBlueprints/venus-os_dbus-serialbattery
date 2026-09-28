@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dbus-serialbat
 
 import utils  # noqa: E402
 from battery import Battery, Cell  # noqa: E402
+import fallback_battery  # noqa: E402
 from fallback_battery import FallbackBattery  # noqa: E402
 
 
@@ -529,6 +530,32 @@ class TestUnreadFetStates:
         # the limiters are skipped, but their conclusion is not
         assert wrapper.battery.control_charge_current != 0
         assert wrapper.battery.control_discharge_current != 0
+        assert wrapper.get_allow_to_charge() is True
+        assert wrapper.get_allow_to_discharge() is True
+
+    def test_unread_temperatures_alone_still_derive_the_allow_flags(self, monkeypatch):
+        # The limiters are also skipped when temperature limiting is enabled
+        # and no temperature has been read, even with the cells present. The
+        # flags must follow the limits on that trigger as well.
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MIN", 2.70)
+        monkeypatch.setattr(utils, "FALLBACK_SAFE_CELL_VOLTAGE_MAX", 3.55)
+        monkeypatch.setattr(utils, "CCCM_T_ENABLE", True)
+        shunt = {key: value for key, value in _LIVE_SHUNT.items() if key != "Temperature"}
+        wrapper = _make_wrapper(monkeypatch, shunt=shunt, connected=False)
+        wrapper.battery.charge_fet = None
+        wrapper.battery.discharge_fet = None
+        wrapper.battery.temperature_1 = None
+        wrapper.battery.temperature_2 = None
+        assert wrapper.battery.control_allow_charge is None
+        assert wrapper.battery.control_allow_discharge is None
+        _serve(wrapper)
+
+        # the trigger under test, and only that one
+        assert not wrapper._cells_unread()
+        assert wrapper._temperatures_unread()
+
+        wrapper.manage_charge_and_discharge_current()
+
         assert wrapper.get_allow_to_charge() is True
         assert wrapper.get_allow_to_discharge() is True
 
@@ -1532,6 +1559,30 @@ class TestOutageClockSurvivesRestart:
 
         assert wrapper._stall_rebuilds == 0
         assert wrapper.battery.ble_handle.rebuilds == 0
+
+    def test_the_inherited_clock_errs_early_by_at_most_the_stash_interval(self, monkeypatch, tmp_path):
+        # Through the real persistence path, not a hand-set timestamp. The
+        # stash reaches disk at most every STASH_INTERVAL_SECONDS, so what a
+        # restarted process inherits can precede the last BMS contact by up to
+        # that interval - and must never follow it, or the grace would stretch.
+        clock = [1_000_000.0]
+        monkeypatch.setattr(fallback_battery, "time", lambda: clock[0])
+
+        before = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT)
+        before._update_stash(fresh=True)  # first refresh reaches disk
+        written = clock[0]
+        clock[0] += FallbackBattery.STASH_INTERVAL_SECONDS - 10
+        before._update_stash(fresh=True)  # memory only: the interval has not elapsed
+        last_contact = clock[0]
+
+        clock[0] += 60  # the process dies mid-outage and a new one starts
+        after = _make_wrapper(monkeypatch, tmp_path=tmp_path, shunt=_LIVE_SHUNT, connected=False)
+        assert after._last_fresh_time == 0.0
+        started = after._bms_outage_started()
+
+        assert started == written
+        assert started <= last_contact
+        assert last_contact - started <= FallbackBattery.STASH_INTERVAL_SECONDS
 
     def test_the_gui_reports_the_real_outage_after_a_restart(self, monkeypatch):
         wrapper = self._cold_start(monkeypatch, outage_age=3 * 3600)

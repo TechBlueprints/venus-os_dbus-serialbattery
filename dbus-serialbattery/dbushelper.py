@@ -739,42 +739,16 @@ class DbusHelper:
         self._dbusservice.add_path("/ErrorCode", self.battery.error_code, writeable=True)
         self._dbusservice.add_path("/ConnectionInformation", "")
 
-        # Measurement topology declarations
-        #
-        # Any consumer that SUMS battery services (aggregators, DC system
-        # calculators, custom dashboards) has to know whether two services are
-        # two batteries or two views of the SAME battery. Without that, a pack
-        # measured by both its BMS and a SmartShunt on its terminals is counted
-        # twice, which propagates into the DC power/current totals and from
-        # there into the DVCC compensation. These paths state the relationship
-        # explicitly, so consumers do not have to guess it from service names:
-        #
-        #   /Measurement/Kind            "direct"  - this service publishes its
-        #                                own sensor readings. (An aggregator
-        #                                republishing other services would
-        #                                declare "derived".)
-        #   /Measurement/PhysicalDevice  Stable, opaque ID of the physical
-        #                                battery being observed. Two services
-        #                                declaring the same ID observe the same
-        #                                pack and must not be summed.
-        #   /Measurement/PeerServices    Other services observing the same
-        #                                physical device. Declared here because
-        #                                Victron's own driver services (e.g. a
-        #                                SmartShunt) do not declare themselves,
-        #                                so the battery speaks for its shunt.
-        #   /Measurement/LineAuthority   The service that should be treated as
-        #                                the truth for line voltage/current
-        #                                (the shunt, when one is paired).
-        #
-        # Peers/authority are only meaningful when this battery is paired with
-        # another service measuring the same pack. The pairing is looked up
-        # generically, so any future source of a paired sensor service can
-        # supply it; a battery with no pairing simply declares no peers and the
-        # two paths are left off the service entirely (an absent path is the
-        # honest encoding for "nothing to declare" - a path present but empty
-        # would suggest a value still to come; /Measurement/Kind is always
-        # present, so consumers can still tell a battery that speaks this
-        # vocabulary from one that does not).
+        # Measurement topology declarations, so consumers that sum battery
+        # services can tell two batteries from two views of the same pack (e.g.
+        # its BMS and a SmartShunt on its terminals) instead of counting it twice.
+        # Kind "direct": this service publishes its own sensor readings.
+        # PhysicalDevice: stable, opaque ID of the pack; same ID = same pack.
+        # PeerServices/LineAuthority: the paired service measuring the same pack,
+        # declared on its behalf because Victron's services cannot declare
+        # themselves. Without a pairing both are omitted rather than set to None:
+        # the peer set is fixed at registration, and Kind already marks a
+        # service that speaks this vocabulary.
         self._dbusservice.add_path("/Measurement/Kind", "direct")
         self._dbusservice.add_path("/Measurement/PhysicalDevice", "battery:" + self.bms_id)
         paired_service = getattr(self.battery, "get_paired_sensor_device", lambda: None)()
@@ -1227,26 +1201,16 @@ class DbusHelper:
                             )
 
                             if not utils.BLOCK_ON_DISCONNECT:
-                                logger.error(
-                                    "    |- Cell voltages are"
-                                    + ("" if self.cell_voltages_good else " NOT")
-                                    + " in a safe threshold to proceed with charging/discharging without communication to the battery."
-                                )
-                                # same None-safety as above: unread cells must not
-                                # crash the log line that explains the situation
                                 min_cell_voltage = self.battery.get_min_cell_voltage()
                                 max_cell_voltage = self.battery.get_max_cell_voltage()
+                                min_text = "unread" if min_cell_voltage is None else f"{min_cell_voltage:.3f} V"
+                                max_text = "unread" if max_cell_voltage is None else f"{max_cell_voltage:.3f} V"
                                 logger.error(
-                                    "    |- "
-                                    + f"Min cell voltage: {'unread' if min_cell_voltage is None else f'{min_cell_voltage:.3f}'} > "
-                                    + f"Min Threshold: {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN:.3f} --> "
-                                    + ("OK" if min_cell_voltage is not None and min_cell_voltage > utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN else "NOT OK")
-                                )
-                                logger.error(
-                                    "    |- "
-                                    + f"Max cell voltage: {'unread' if max_cell_voltage is None else f'{max_cell_voltage:.3f}'} < "
-                                    + f"Max threshold: {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX:.3f} --> "
-                                    + ("OK" if max_cell_voltage is not None and max_cell_voltage < utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX else "NOT OK")
+                                    # unread cells must not crash the log line (#508 None-safety) in #520's one-line form
+                                    f"    |- Cell voltages are{'' if self.cell_voltages_good else ' NOT'} in a safe threshold to proceed"
+                                    + " without communication to the battery: "
+                                    + f"min {min_text} (> {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN:.3f} V), "
+                                    + f"max {max_text} (< {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX:.3f} V)"
                                 )
 
                             self.battery.init_values()
@@ -1259,20 +1223,19 @@ class DbusHelper:
                         + f"Threshold: {self.battery.get_seconds_to_string(self.disconnect_threshold, 3)}"
                     )
 
-                    # While a healthy fallback is serving, the outage's one voice is
-                    # the wrapper's own BmsCable warning, delayed by
+                    # While fallback coverage exists, the outage's one voice is the
+                    # wrapper's own BmsCable warning, delayed by
                     # FALLBACK_BMS_CABLE_WARN_MINUTES: that config is a promise, and
-                    # this 60 s flapping warning was breaking it - three "BMS cable
-                    # fault" pushes in one night (2026-08-19) for radio blips whose
-                    # total data loss was seconds, each echoed again by
-                    # AggregateBatteries. There is no cable fault while data is
-                    # flowing; when guarding ends, this warning runs as stock.
+                    # this 60 s flapping warning would break it with a push for
+                    # radio blips whose total data loss is seconds. guarding asks
+                    # whether coverage is ENGAGED and gates the fast exit below;
+                    # the warning gates on covering - coverage EXISTS - because
+                    # serving deliberately waits out a freshness window after a
+                    # drop, and a warning evaluated inside that window would leak.
+                    # When coverage ends, both run as stock. Batteries without the
+                    # fallback feature have neither attribute and are untouched.
                     fallback_guarding = getattr(self.battery, "fallback_guarding", None)
                     fallback_guarding = bool(fallback_guarding()) if callable(fallback_guarding) else False
-                    # The warning gate asks the broader question - does coverage
-                    # exist - because guarding is momentarily false in the gap
-                    # between a drop and serving engaging, and two warnings
-                    # leaked through exactly that gap on 2026-08-19.
                     fallback_covering = getattr(self.battery, "fallback_covering", None)
                     fallback_covering = bool(fallback_covering()) if callable(fallback_covering) else fallback_guarding
 

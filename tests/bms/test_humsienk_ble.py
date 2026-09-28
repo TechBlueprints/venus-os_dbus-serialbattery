@@ -12,8 +12,10 @@ imported. The stub is removed again afterwards so no other test module
 inherits it.
 """
 
+import asyncio
 import os
 import sys
+import threading
 import time
 import types
 
@@ -661,80 +663,378 @@ def test_refresh_data_fails_again_once_the_data_has_aged_out():
     assert bms.refresh_data() is False
 
 
-def test_the_driver_carries_no_fallback_machinery():
-    # Structural guard. This driver reports only what the radio delivered:
-    # serving values during an outage belongs to the fallback layer, and an
-    # earlier revision of this driver had grown a stale-data cache, an alarm
-    # escalation ladder and on-disk persistence of its own. Keep it a plain
-    # driver by making a relapse fail here.
-    import inspect
-
-    assert "fallback" not in inspect.getsource(humsienk_ble).lower()
-
-
-# ------------------------------------------------- the link-up report hook
+# ------------------------------------------------- the backend seam
 #
-# Field 2026-09-06, prod RS pack: against the utils_ble that reported link-up
-# from inside the base connect_to_bms, this override (which replaces that
-# method wholesale) inherited the episode OPENER (client_disconnected) but
-# never ran the CLOSER, so episodes opened in the watch and never closed.
-# utils_ble a0e1214 moved the closer to the backend's connected callback,
-# wired at backend construction, so both ends now reach an override without
-# it doing anything - and an explicit call here is dead code (the report
-# latches: two calls, one line - pr-513's measurement, 2026-09-06).
+# The driver overrides connect_to_bms, so it does not inherit whatever the
+# base class does about subscribing. This pins the one thing the override
+# must keep doing: reach the notification characteristic through
+# backend.establish, which is where the late-GATT recovery lives
+# (tests/test_utils_ble.py covers the recovery itself).
 
 
-def _connect_double(report_hook):
-    import asyncio
+class _RecordingBackend:
+    def __init__(self):
+        self.established = []
+        self.released = []
 
-    sync = object.__new__(humsienk_ble.HumsiENK_Syncron_Ble)
+    def create_client(self, address, disconnected_callback):
+        return types.SimpleNamespace(is_connected=True, address=address)
 
-    class Backend:
-        def create_client(self, address, on_disconnect):
-            return "client"
+    async def establish(self, client, address, notify_char, notify_callback):
+        self.established.append((address, notify_char))
+        return client
 
-        async def establish(self, client, address, read_characteristic, callback):
-            return client
+    async def release(self, client):
+        self.released.append(client)
 
-        async def release(self, client):
-            return None
 
-    async def supervise_link():
-        return None
+def _connect_once(backend, address="AA:BB:CC:DD:EE:FF"):
+    """Drive connect_to_bms on an instance built without __init__."""
+    ble = humsienk_ble.HumsiENK_Syncron_Ble.__new__(humsienk_ble.HumsiENK_Syncron_Ble)
+    ble.backend = backend
+    ble.client = None
+    ble.connected = False
+    ble.read_characteristic = "notify-uuid"
+    ble.notify_read_callback = lambda *a: None
+    ble.ble_connection_ready = threading.Event()
+    ble.feed_watchdog = lambda: None
+    # the link is supervised elsewhere; end it immediately so connect returns
 
-    sync.backend = Backend()
-    sync.read_characteristic = "rx"
-    sync.notify_read_callback = lambda *args: None
-    sync.feed_watchdog = lambda: None
-    sync.supervise_link = supervise_link
-    sync.connected = False
-    sync.client = None
-    if report_hook is not None:
-        sync._report_link_up = report_hook
+    async def _no_supervision():
+        return
 
-    async def run():
-        sync.ble_connection_ready = asyncio.Event()
-        return await sync.connect_to_bms("53:20:B7:D7:F9:E7")
+    ble.supervise_link = _no_supervision
+    asyncio.run(ble.connect_to_bms(address))
+    return ble
 
-    asyncio.run(run())
-    return sync
+
+def test_connect_subscribes_through_the_backend_seam():
+    backend = _RecordingBackend()
+
+    _connect_once(backend)
+
+    # one subscribe, on the notification characteristic, via the backend -
+    # not a direct client.start_notify that would bypass GATT recovery
+    assert backend.established == [("AA:BB:CC:DD:EE:FF", "notify-uuid")]
+
+
+def test_a_failed_subscribe_is_reported_rather_than_left_connected():
+    class _FailingBackend(_RecordingBackend):
+        async def establish(self, client, address, notify_char, notify_callback):
+            raise RuntimeError("characteristic missing")
+
+    ble = _connect_once(_FailingBackend())
+
+    assert ble.connected is False
+
+
+# ---------------------------------------------------- handshake re-send volume
+#
+# The pack's radio mutes for 10-15 s several times an hour. A re-send needs
+# 15 s of silence, so one is routine and must not narrate itself at INFO; a
+# second means 45 s on an open link, which is a different condition and is
+# said once. These assert the LEVEL and the count, not that a message exists.
+
+
+def _starve(bms, seconds):
+    """Age the clocks so the next refresh_data() re-sends the handshake."""
+    bms._last_frame_time -= seconds
+    bms._last_handshake_time -= HumsiENK_Ble.HANDSHAKE_RETRY_SECONDS + 1
+
+
+def test_an_ordinary_radio_mute_does_not_log_at_info(caplog):
+    bms = make_bms()
+    bms.ble_handle.push(frame(HumsiENK_Ble.CMD_BATTERY_INFO, battery_info_payload()))
+    bms.refresh_data()
+
+    with caplog.at_level("DEBUG", logger="SerialBattery"):
+        _starve(bms, HumsiENK_Ble.DATA_FRESHNESS_SECONDS + 1)
+        bms.refresh_data()
+
+    resends = [r for r in caplog.records if "re-sending handshake" in r.message]
+    assert len(resends) == 1
+    assert [r.levelname for r in resends] == ["DEBUG"]
+
+
+def test_a_pack_that_is_present_but_not_answering_is_said_once(caplog):
+    bms = make_bms()
+    bms.ble_handle.push(frame(HumsiENK_Ble.CMD_BATTERY_INFO, battery_info_payload()))
+    bms.refresh_data()
+
+    with caplog.at_level("DEBUG", logger="SerialBattery"):
+        for _ in range(4):
+            _starve(bms, HumsiENK_Ble.DATA_FRESHNESS_SECONDS + 1)
+            bms.refresh_data()
+
+    resends = [r for r in caplog.records if "re-sending handshake" in r.message]
+    assert len(resends) == 4
+    # exactly one INFO, on the crossing, and nothing after it
+    assert [r.levelname for r in resends] == ["DEBUG", "INFO", "DEBUG", "DEBUG"]
+    assert "2 consecutive" in resends[1].message
+
+
+def test_data_coming_back_rearms_the_escalation(caplog):
+    """Otherwise the second mute of the day is silent for the rest of it."""
+    bms = make_bms()
+    bms.ble_handle.push(frame(HumsiENK_Ble.CMD_BATTERY_INFO, battery_info_payload()))
+    bms.refresh_data()
+
+    for _ in range(2):
+        _starve(bms, HumsiENK_Ble.DATA_FRESHNESS_SECONDS + 1)
+        bms.refresh_data()
+    assert bms._handshake_resends == 2
+
+    bms.ble_handle.push(frame(HumsiENK_Ble.CMD_BATTERY_INFO, battery_info_payload()))
+    bms.refresh_data()
+    assert bms._handshake_resends == 0
+
+    caplog.clear()  # the first mute's records are not what this asserts on
+    with caplog.at_level("DEBUG", logger="SerialBattery"):
+        for _ in range(2):
+            _starve(bms, HumsiENK_Ble.DATA_FRESHNESS_SECONDS + 1)
+            bms.refresh_data()
+
+    resends = [r for r in caplog.records if "re-sending handshake" in r.message]
+    assert [r.levelname for r in resends] == ["DEBUG", "INFO"]
+
+
+# ------------------------------------------------- connect failure volume
+#
+# The reconnect loop retries for as long as a pack is away, so this line was
+# written on every attempt - 4,400 times in one prod log corpus. One per
+# episode is the readable number. The wording is unchanged on purpose: the
+# fleet's log watch keys on "Failed when trying to connect" as a substring,
+# and prod runs at INFO, so the surviving line has to be INFO and has to
+# still contain that text.
+
+
+def _make_handle():
+    handle = humsienk_ble.HumsiENK_Syncron_Ble.__new__(humsienk_ble.HumsiENK_Syncron_Ble)
+    handle.backend = _RecordingBackend()
+    handle.client = None
+    handle.connected = False
+    handle.read_characteristic = "notify-uuid"
+    handle.notify_read_callback = lambda *a: None
+    handle.ble_connection_ready = threading.Event()
+    handle.feed_watchdog = lambda: None
+
+    async def _no_supervision():
+        return
+
+    handle.supervise_link = _no_supervision
+    return handle
+
+
+class _RefusingBackend(_RecordingBackend):
+    async def establish(self, client, address, notify_char, notify_callback):
+        raise RuntimeError("[org.bluez.Error.InProgress] Operation already in progress")
+
+
+def _attempt(handle, backend=None):
+    if backend is not None:
+        handle.backend = backend
+    asyncio.run(handle.connect_to_bms("AA:BB:CC:DD:EE:FF"))
+
+
+def test_a_pack_that_is_away_reports_its_absence_once(caplog):
+    handle = _make_handle()
+
+    with caplog.at_level("DEBUG", logger="SerialBattery"):
+        for _ in range(5):
+            _attempt(handle, _RefusingBackend())
+
+    failures = [r for r in caplog.records if "Failed when trying to connect" in r.message]
+    assert len(failures) == 5
+    assert [r.levelname for r in failures] == ["INFO", "DEBUG", "DEBUG", "DEBUG", "DEBUG"]
+
+
+def test_the_surviving_line_is_still_the_string_the_watch_greps_for(caplog):
+    handle = _make_handle()
+
+    with caplog.at_level("INFO", logger="SerialBattery"):
+        _attempt(handle, _RefusingBackend())
+
+    emitted = [r for r in caplog.records if r.levelno >= 20]
+    assert any(r.message.startswith("Failed when trying to connect: ") for r in emitted)
+
+
+def test_coming_back_rearms_the_absence_report(caplog):
+    handle = _make_handle()
+    _attempt(handle, _RefusingBackend())
+    _attempt(handle, _RefusingBackend())
+    assert handle._connect_failures == 2
+
+    _attempt(handle, _RecordingBackend())
+    assert handle._connect_failures == 0
+
+    caplog.clear()
+    with caplog.at_level("DEBUG", logger="SerialBattery"):
+        _attempt(handle, _RefusingBackend())
+
+    failures = [r for r in caplog.records if "Failed when trying to connect" in r.message]
+    assert [r.levelname for r in failures] == ["INFO"]
+
+
+# ------------------------------------------- reporting the link up to utils_ble
+#
+# utils_ble delivers both ends of an episode through the backend's connected
+# callback, wired when the base class builds the backend - not from inside
+# connect_to_bms. So this override gets the link-up line for free and must
+# not report it as well. A call here would not actually double the log -
+# _report_link_up latches and a second call emits nothing - which is the
+# reason to pin this with a test rather than trust it to be noticed: the
+# damage is dead code leaning on someone else's internal detail, and dead
+# code that stays quiet is exactly what survives review. An earlier utils_ble
+# reported from inside the base connect_to_bms and did need a call here.
 
 
 def test_the_override_does_not_report_the_link_up_itself():
-    """utils_ble (feat/ble-connection-layer a0e1214) delivers link-up through the
-    backend's connected callback, wired by the base class at backend construction.
-    An override that ALSO calls _report_link_up is dead code: it stays quiet only
-    because the report latches (measured: two calls, one line, in both the
-    first-life and recovery paths), an internal detail of someone else's file.
-    So: the hook must exist on the instance and must NOT be called by
-    connect_to_bms."""
-    calls = []
-    sync = _connect_double(lambda: calls.append("up"))
-    assert calls == [], "connect_to_bms must leave link-up reporting to the backend seam"
-    assert sync.connected is False, "teardown still runs after supervision ends"
+    handle = _make_handle()
+    reported = []
+    handle._report_link_up = lambda: reported.append("up")
+
+    _attempt(handle, _RecordingBackend())
+
+    assert reported == []
 
 
 def test_an_older_utils_ble_without_the_hook_still_connects():
-    sync = _connect_double(None)
-    assert not hasattr(sync, "_report_link_up")
-    assert sync.connected is False
+    handle = _make_handle()
+    assert not hasattr(handle, "_report_link_up")
+
+    _attempt(handle, _RecordingBackend())
+
+    # establish() alone is not enough: an unguarded call raises AFTER it and
+    # the except swallows it, so the counter is what proves the connect path
+    # ran to the end rather than failing on the way out.
+    assert handle.backend.established == [("AA:BB:CC:DD:EE:FF", "notify-uuid")]
+    assert handle._connect_failures == 0
+
+
+def test_a_failed_connect_does_not_report_a_link_that_never_came_up():
+    handle = _make_handle()
+    reported = []
+    handle._report_link_up = lambda: reported.append("up")
+
+    _attempt(handle, _RefusingBackend())
+
+    assert reported == []
+
+
+# ------------------------------------------------------- link supervision
+#
+# supervise_link replaced a 0.1 s spin with a wait that sleeps until something
+# ends the link. Four things may end it, and each is pinned here: a disconnect
+# callback, which wakes the wait through an event from another thread; the
+# data watchdog, which wakes it when due rather than at the next recheck; the
+# main thread going away; and a disconnect whose callback never fired. The
+# recheck is set long wherever an early finish is what proves the mechanism.
+
+
+class _SyncronBleBase:
+    """Stands in for utils_ble.Syncron_Ble, which this module stubs to object.
+
+    Placed after the driver's class in the MRO, it is what the override's
+    super().client_disconnected() reaches, and it records that it was reached.
+    """
+
+    def client_disconnected(self, client):
+        self.base_disconnects.append(client)
+
+
+class _Supervisable(humsienk_ble.HumsiENK_Syncron_Ble, _SyncronBleBase):
+    pass
+
+
+def _supervised(fed_ago=0.0, main_alive=True, client_connected=True, recheck=30.0):
+    ble = _Supervisable.__new__(_Supervisable)
+    ble.connected = True
+    ble._watchdog_last_fed = time.time() - fed_ago
+    ble.main_thread = types.SimpleNamespace(is_alive=lambda: main_alive)
+    ble.client = types.SimpleNamespace(is_connected=client_connected)
+    ble.SUPERVISION_RECHECK = recheck
+    ble.base_disconnects = []
+    return ble
+
+
+def _supervise(ble, within, while_waiting=None):
+    """Run supervise_link, failing unless it ends within `within` seconds.
+
+    With `while_waiting`, supervision must first be seen still waiting, and
+    the callable then runs - so ending afterwards is caused by it.
+    """
+
+    async def run():
+        ble._link_down = asyncio.Event()
+        ble._link_down_loop = asyncio.get_running_loop()
+        task = asyncio.ensure_future(ble.supervise_link())
+        if while_waiting is not None:
+            await asyncio.sleep(0.2)
+            assert not task.done(), "supervision ended before anything ended the link"
+            while_waiting()
+        await asyncio.wait_for(task, timeout=within)
+
+    started = time.monotonic()
+    asyncio.run(run())
+    return time.monotonic() - started
+
+
+def test_a_disconnect_wakes_supervision_from_another_thread():
+    ble = _supervised(recheck=30.0)
+
+    def disconnect():
+        threading.Thread(target=ble.client_disconnected, args=(ble.client,)).start()
+
+    # a 30 s recheck cannot be what ends this inside 2 s: the event did
+    _supervise(ble, within=2.0, while_waiting=disconnect)
+
+    # and the override still let the base class handle the disconnect
+    assert ble.base_disconnects == [ble.client]
+
+
+def test_an_expired_data_watchdog_drops_the_link(caplog):
+    ble = _supervised(fed_ago=humsienk_ble.HumsiENK_Syncron_Ble.WATCHDOG_TIMEOUT + 1)
+
+    with caplog.at_level("ERROR", logger="SerialBattery"):
+        _supervise(ble, within=1.0)
+
+    assert [r.message for r in caplog.records] == ["HumsiENK: no data for 180 s on an open link, dropping it to reconnect"]
+
+
+def test_the_data_watchdog_wakes_when_it_is_due_not_at_the_next_recheck(caplog):
+    watchdog = humsienk_ble.HumsiENK_Syncron_Ble.WATCHDOG_TIMEOUT
+    ble = _supervised(fed_ago=watchdog - 0.3, recheck=30.0)
+
+    with caplog.at_level("ERROR", logger="SerialBattery"):
+        _supervise(ble, within=2.0)
+
+    assert [r.message for r in caplog.records] == ["HumsiENK: no data for 180 s on an open link, dropping it to reconnect"]
+
+
+def test_supervision_ends_when_the_main_thread_has_gone():
+    ble = _supervised(main_alive=False, recheck=0.05)
+
+    _supervise(ble, within=1.0)
+
+
+def test_a_disconnect_whose_callback_never_fired_still_ends_supervision():
+    ble = _supervised(client_connected=False, recheck=0.05)
+
+    _supervise(ble, within=1.0)
+
+
+# ---------------------------------------------- a pack that never answered
+
+
+def test_a_pack_that_never_answered_is_not_given_an_age_from_the_epoch(caplog):
+    # _last_frame_time stays 0.0 until the first verified frame, so an age
+    # computed from it is the time since 1970 - once logged as "re-sending
+    # handshake after 1786848637 s without data".
+    bms = make_bms()
+    assert bms._last_frame_time == 0.0
+
+    with caplog.at_level("DEBUG", logger="SerialBattery"):
+        bms.refresh_data()
+
+    resends = [r.message for r in caplog.records if "re-sending handshake" in r.message]
+    assert resends == ["HumsiENK: re-sending handshake, no data since connection"]

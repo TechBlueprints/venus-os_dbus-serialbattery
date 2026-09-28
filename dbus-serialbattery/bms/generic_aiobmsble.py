@@ -29,6 +29,19 @@ from bleak.exc import BleakError  # noqa: E402
 from aiobmsble import BMSInfo, BMSSample, TempSensor  # noqa: E402
 
 
+# Reconnect pacing for a device the adapter cannot reach.
+#
+# refresh_data polls once a second, and every poll that finds no client runs a
+# full establish_connection, which makes its own four BlueZ attempts before it
+# raises. For a device that is powered off, removed or out of range, retrying
+# on every poll cannot succeed and only costs load.
+#
+# The ladder is deliberately flat at the start: a genuinely transient miss -
+# a pack that slept through one advertising window - must still recover in
+# seconds, so only a sustained run of failures earns a long wait.
+RECONNECT_BACKOFF_SECONDS = (0, 0, 5, 15, 30, 60)
+
+
 class Generic_AioBmsBle(Battery):
     def __init__(self, port, baud, address):
         super(Generic_AioBmsBle, self).__init__(port, baud, address)
@@ -83,6 +96,15 @@ class Generic_AioBmsBle(Battery):
         # staleness tracking
         self._last_successful_update: float | None = None
         self._max_data_age: int = 5  # seconds before stale cached data causes failure
+        # the stale-data warning would fire on every poll while the BMS is away;
+        # log it when a stale spell starts, then at most this often
+        self._stale_warning_interval: int = 60
+        self._stale_warned_at: float = 0.0
+        # reconnect pacing: consecutive failed connects, when the next attempt
+        # is allowed, and whether the sustained-failure warning has been logged
+        self._connect_failures: int = 0
+        self._reconnect_hold_until: float = 0.0
+        self._reconnect_warned: bool = False
 
     BATTERYTYPE = "Generic aiobmsble BMS"
 
@@ -128,14 +150,46 @@ class Generic_AioBmsBle(Battery):
             await aexit(None, None, None)
             logger.debug("aiobmsble: disconnected via context manager")
 
+    def _reconnect_on_hold(self) -> bool:
+        """True while the next connect attempt is still being paced out."""
+        return time.monotonic() < self._reconnect_hold_until
+
+    def _note_connect_failure(self, reason: str) -> None:
+        """Record a failed connect and pace the next attempt.
+
+        Emits exactly ONE warning per outage, when the ladder reaches its
+        longest step, so a long outage cannot flood the log.
+        """
+        self._connect_failures += 1
+        delay = RECONNECT_BACKOFF_SECONDS[min(self._connect_failures, len(RECONNECT_BACKOFF_SECONDS) - 1)]
+        self._reconnect_hold_until = time.monotonic() + delay
+        if delay == RECONNECT_BACKOFF_SECONDS[-1] and not self._reconnect_warned:
+            self._reconnect_warned = True
+            logger.warning(
+                "aiobmsble: %s unreachable after %d attempts (%s); retrying every %ds until it returns",
+                self.address,
+                self._connect_failures,
+                reason,
+                delay,
+            )
+        else:
+            logger.debug("aiobmsble: connect failed for %s (%s), next attempt in %ds", self.address, reason, delay)
+
+    def _note_connect_success(self) -> None:
+        """Clear the pacing state so the next outage starts from the top."""
+        if self._reconnect_warned:
+            logger.warning("aiobmsble: %s reachable again after %d failed attempts", self.address, self._connect_failures)
+        self._connect_failures = 0
+        self._reconnect_hold_until = 0.0
+        self._reconnect_warned = False
+
     async def _resolve_device(self) -> BLEDevice | None:
         """BLEDevice for this address from the BlueZ cache, scanning as fallback.
 
         A sleeping BMS can advertise too sparsely for an active scan window
         to catch, while a connect to its cached device object still works -
         BlueZ's create-connection waits for the next connectable
-        advertisement instead of needing a scan report. Same cache-first
-        contract as utils_ble's BleakRetryBackend; the scan remains the
+        advertisement instead of needing a scan report. The scan remains the
         fallback for a device BlueZ has never seen.
         """
         try:
@@ -198,10 +252,8 @@ class Generic_AioBmsBle(Battery):
         which is also the thread that answers D-Bus, so blocking here for a
         coroutine timeout stops the driver serving anything at all - the
         battery's own service stops answering /Soc, /Connected and
-        /Mgmt/Connection while remaining registered, and the fallback it is
-        supposed to hand over to never gets a turn. Field failure on
-        dev-cerbo 2026-08-23, where an unreachable pack blocked the main
-        thread for 10 s out of every 10 s.
+        /Mgmt/Connection while remaining registered. An unreachable pack
+        blocked the main thread for the whole coroutine timeout on every poll.
 
         Returns True only when an update completed successfully since the
         last poll; the caller's staleness logic decides what to serve.
@@ -575,6 +627,12 @@ class Generic_AioBmsBle(Battery):
         async def _update_async():
             # ensure we have a client, try to find device and connect if not
             if self._aiobmsble is None:
+                # Pace an unreachable device rather than hammering it: every
+                # attempt below costs a full establish_connection, which makes
+                # four BlueZ attempts of its own, and for a device that is not
+                # there none of them can win.
+                if self._reconnect_on_hold():
+                    return False
                 # Cache-first, like test_connection: a bare
                 # find_device_by_address here starts a fresh BlueZ discovery on
                 # EVERY poll of a battery whose client was lost, which on a GX
@@ -584,12 +642,19 @@ class Generic_AioBmsBle(Battery):
                 # the BlueZ cache costs no scan at all in the common case.
                 device: BLEDevice | None = await self._resolve_device()
                 if device is None:
+                    self._note_connect_failure("device not found")
                     logger.debug(f"Could not find device {self.address} for refresh")
                     return False
                 self._ensure_aiobmsble(device)
                 if self._aiobmsble is None:
+                    self._note_connect_failure("no aiobmsble client")
                     return False
-                await self._aiobmsble_connect(self._aiobmsble)
+                try:
+                    await self._aiobmsble_connect(self._aiobmsble)
+                except Exception as ex:
+                    self._note_connect_failure(repr(ex))
+                    raise
+                self._note_connect_success()
 
             update = getattr(self._aiobmsble, "async_update", None)
             if callable(update):
@@ -613,11 +678,17 @@ class Generic_AioBmsBle(Battery):
             elif self._last_successful_update is not None:
                 data_age = time.monotonic() - self._last_successful_update
                 if data_age > self._max_data_age:
-                    logger.warning(
-                        "aiobmsble: cached data is %ds old, treating as failure (addr=%s)",
-                        int(data_age),
-                        self.address,
-                    )
+                    # Warn when a stale spell starts - no warning since the last
+                    # good data - and then once a minute; the growing age in the
+                    # message shows the spell continuing.
+                    now = time.monotonic()
+                    if self._stale_warned_at < self._last_successful_update or now - self._stale_warned_at >= self._stale_warning_interval:
+                        self._stale_warned_at = now
+                        logger.warning(
+                            "aiobmsble: cached data is %ds old, treating as failure (addr=%s)",
+                            int(data_age),
+                            self.address,
+                        )
                     return False
                 logger.debug("aiobmsble: using cached data (%.1fs old) (addr=%s)", data_age, self.address)
             elif not isinstance(self.aiobmsble_data, dict):

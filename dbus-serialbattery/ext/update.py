@@ -128,10 +128,8 @@ def update_module(name, repo_url, extract, subdir=""):
             tar.extractall(path=temp_dir, members=members)
 
     # Module destination directory
-    # The BLE stack lives under ext/ble so that it never shadows the shared
-    # install's own bleak / bleak-retry-connector, which ble_stack.py puts
-    # ahead of it (a flat ext/bleak would silently win: dbus-serialbattery.py
-    # inserts ext/ for the other packages). Everything else stays flat.
+    # BLE stack lives under ext/ble so it never shadows a box-installed
+    # bleak/brc supplied on PYTHONPATH; everything else stays flat in ext/.
     directory_name = f"{root_dir}/{subdir}/{name}" if subdir else f"{root_dir}/{name}"
 
     # Clean the directory if it exists
