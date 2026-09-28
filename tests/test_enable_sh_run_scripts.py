@@ -124,7 +124,9 @@ def test_ble_run_script_keeps_the_disconnect_preamble():
     rendered = _render("/service/dbus-blebattery.$1/run")
 
     lines = rendered.splitlines()
-    disconnect = next(i for i, line in enumerate(lines) if line.startswith("bluetoothctl disconnect"))
+    # #511 replaced `bluetoothctl disconnect` with a dbus-send Device1.Disconnect loop
+    # (bluetoothctl can segfault on some GX hardware); either form is the preamble.
+    disconnect = next(i for i, line in enumerate(lines) if line.startswith("bluetoothctl disconnect") or "org.bluez.Device1.Disconnect" in line)
     python = next(i for i, line in enumerate(lines) if "dbus-serialbattery.py" in line)
     assert disconnect < python
 
