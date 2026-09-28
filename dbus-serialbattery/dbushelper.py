@@ -1203,12 +1203,14 @@ class DbusHelper:
                             if not utils.BLOCK_ON_DISCONNECT:
                                 min_cell_voltage = self.battery.get_min_cell_voltage()
                                 max_cell_voltage = self.battery.get_max_cell_voltage()
+                                min_text = 'unread' if min_cell_voltage is None else f'{min_cell_voltage:.3f} V'
+                                max_text = 'unread' if max_cell_voltage is None else f'{max_cell_voltage:.3f} V'
                                 logger.error(
                                     # unread cells must not crash the log line (#508 None-safety) in #520's one-line form
                                     f"    |- Cell voltages are{'' if self.cell_voltages_good else ' NOT'} in a safe threshold to proceed"
                                     + " without communication to the battery: "
-                                    + f"min {'unread' if min_cell_voltage is None else f'{min_cell_voltage:.3f} V'} (> {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN:.3f} V), "
-                                    + f"max {'unread' if max_cell_voltage is None else f'{max_cell_voltage:.3f} V'} (< {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX:.3f} V)"
+                                    + f"min {min_text} (> {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MIN:.3f} V), "
+                                    + f"max {max_text} (< {utils.BLOCK_ON_DISCONNECT_VOLTAGE_MAX:.3f} V)"
                                 )
 
                             self.battery.init_values()
