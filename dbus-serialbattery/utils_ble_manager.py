@@ -123,6 +123,23 @@ def install_ble_connection_manager(address):
                 "StartNotify policy passed through the legacy BCM_FORCE_START_NOTIFY environment"
             )
 
+        # Pin strictness (BLUETOOTH_ADAPTER_PIN_STRICT, #511): same signature
+        # check and the same reason, with one difference - there is no legacy
+        # environment for this one. An older install simply does not know it,
+        # and that is the safe direction: utils_ble enforces the setting on the
+        # driver's own side either way, so a stale catcher costs the catcher's
+        # half of the behaviour, never the driver's. Only worth a line when
+        # strict is ON, because with it off the driver's own pin-loss warning
+        # still tells the operator the pin stopped being honoured.
+        if _accepts_kwarg(install_bleak_catcher, "pin_strict"):
+            kwargs["pin_strict"] = utils.BLUETOOTH_ADAPTER_PIN_STRICT
+        elif utils.BLUETOOTH_ADAPTER_PIN_STRICT:
+            logger.warning(
+                f"BLE coordination: shared install at {shared_dir} predates the pin_strict parameter; "
+                "the driver still makes no attempt over an unpinned adapter, but the connection manager "
+                "will place one there if it sees the device first"
+            )
+
         install_bleak_catcher(f"dbus-serialbattery.{str(address).strip().lower().replace(':', '')}", **kwargs)
 
         # The PACKAGE directory, not the configured folder: it proves which
@@ -137,7 +154,7 @@ def install_ble_connection_manager(address):
         pinned = sum(1 for a in adapters if "@" in a)
         logger.info(
             f"BLE coordination: catcher installed (force_start_notify={utils.BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY}, "
-            f"adapters={len(adapters)} configured, {pinned} pinned)"
+            f"pin_strict={utils.BLUETOOTH_ADAPTER_PIN_STRICT}, adapters={len(adapters)} configured, {pinned} pinned)"
         )
         return True
     except ImportError:

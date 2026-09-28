@@ -77,6 +77,7 @@ class TestInstallBleConnectionManager:
 
         monkeypatch.setattr(ble_stack, "shared_failure", None, raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_DIR", "/data/bcm", raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_ADAPTER_PIN_STRICT", False, raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY", True, raising=False)
 
         validators = types.ModuleType("bleak_connection_manager.validators")
@@ -164,6 +165,7 @@ class TestCoordinationReport:
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_DIR", "/data/bcm", raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER", True, raising=False)
         monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_FORCE_START_NOTIFY", True, raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_ADAPTER_PIN_STRICT", False, raising=False)
         # None in sys.modules makes `import bleak_connection_manager` raise
         # ImportError deterministically - the absent path, whatever sys.path holds
         monkeypatch.setitem(sys.modules, "bleak_connection_manager", None)
@@ -191,7 +193,7 @@ class TestCoordinationReport:
         monkeypatch.setattr(utils, "BLUETOOTH_ADAPTERS", ["C8:47:8C:00:00:00@00:1A:7D:DA:71:13", "hci1"], raising=False)
         with caplog.at_level("INFO"):
             assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is True
-        line = "BLE coordination: catcher installed (force_start_notify=True, adapters=2 configured, 1 pinned)"
+        line = "BLE coordination: catcher installed (force_start_notify=True, pin_strict=False, adapters=2 configured, 1 pinned)"
         assert caplog.text.count(line) == 1, caplog.text
         assert caplog.text.index("loaded from") < caplog.text.index("catcher installed"), "loaded first, then the policy"
 
@@ -280,6 +282,62 @@ class TestCoordinationReport:
         assert calls == [True]
         assert "BCM_FORCE_START_NOTIFY" not in os.environ
         assert "predates the force_start_notify parameter" not in caplog.text
+
+    def test_a_current_install_receives_the_pin_strictness_as_a_kwarg(self, _stack, monkeypatch, caplog):
+        """One key, both layers (#511 + BCM 56bf8a3): what the driver enforces on its own
+        side must also reach the catcher, or a box could refuse in one layer and place in
+        the other."""
+        calls = []
+        module = types.ModuleType("bleak_connection_manager")
+        module.__file__ = "/data/bcm/src/bleak_connection_manager/__init__.py"
+        module.install_bleak_catcher = lambda owner, pin_strict=None, **kw: calls.append(pin_strict)
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_VALIDATION", False, raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_ADAPTER_PIN_STRICT", True, raising=False)
+        with caplog.at_level("DEBUG"):
+            assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is True
+        assert calls == [True]
+        assert "predates the pin_strict parameter" not in caplog.text
+
+    def test_an_older_install_keeps_the_catcher_and_the_driver_still_enforces_strictness(self, _stack, monkeypatch, caplog):
+        """Prod's checkout predates the kwarg. Losing the catcher over it would be the worst
+        outcome; the driver enforces BLUETOOTH_ADAPTER_PIN_STRICT on its own side either way,
+        so the stale install costs only the catcher's half - and that is said once."""
+        calls = []
+        module = types.ModuleType("bleak_connection_manager")
+        module.__file__ = "/data/bcm/src/bleak_connection_manager/__init__.py"
+
+        def install_bleak_catcher(owner, adapters, link_caps, wrap_scanner, validate_connection, force_start_notify=None):
+            calls.append(owner)  # signature deliberately lacks pin_strict and **kwargs
+
+        module.install_bleak_catcher = install_bleak_catcher
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_VALIDATION", False, raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_ADAPTER_PIN_STRICT", True, raising=False)
+        with caplog.at_level("DEBUG"):
+            assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is True
+        assert len(calls) == 1, "the catcher must still install"
+        assert "BLE coordination: shared install at /data/bcm predates the pin_strict parameter" in caplog.text
+
+    def test_pin_strictness_off_against_an_older_install_says_nothing(self, _stack, monkeypatch, caplog):
+        """With strict off the driver's own pin-loss warning already tells the operator the
+        pin stopped being honoured, so a stale catcher is not worth a second line."""
+        module = types.ModuleType("bleak_connection_manager")
+        module.__file__ = "/data/bcm/src/bleak_connection_manager/__init__.py"
+
+        def install_bleak_catcher(owner, adapters, link_caps, wrap_scanner, validate_connection, force_start_notify=None):
+            pass
+
+        module.install_bleak_catcher = install_bleak_catcher
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
+        monkeypatch.setattr(utils, "BLUETOOTH_CONNECTION_MANAGER_VALIDATION", False, raising=False)
+        monkeypatch.setattr(utils, "BLUETOOTH_ADAPTER_PIN_STRICT", False, raising=False)
+        with caplog.at_level("DEBUG"):
+            assert utils_ble_manager.install_ble_connection_manager("C8:47:8C:00:00:00") is True
+        # the install line always states the effective policy; what must NOT appear is the
+        # stale-catcher warning, which only matters when strict is on
+        assert "predates the pin_strict parameter" not in caplog.text
+        assert "pin_strict=False" in caplog.text
 
     def test_an_older_install_keeps_the_catcher_and_gets_the_policy_by_environment(self, _stack, monkeypatch, caplog):
         """A shared install is whatever is on the box; an unknown kwarg must not cost the catcher."""
