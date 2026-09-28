@@ -42,6 +42,7 @@
 * Added: Prevent GUI modification installations by setting `GUI_INSTALL_CUSTOMIZATIONS` to `False` by @mr-manuel
 * Added: Set SOC manually via GUI if SOC_CALCULATION is enabled by @mr-manuel
 * Added: Temperature sensor compensation, see config.default.ini for info by @mike-s123
+* Added: Bulk voltage ramp: raise the CVL above `MAX_CELL_VOLTAGE * cell count` while in bulk and lower it linearly to the absorption voltage as the SoC rises. See `BULK_VOLTAGE_RAMP_ENABLE` in `config.default.ini` by @cgoudie
 * Added: Venus OS 3.7x GUIv2 support by @mr-manuel
 * Added: XDZN/WattCycle BLE BMS - Added new BMS driver for XDZN_001 and WT-prefixed devices (e.g. WattCycle 314Ah LiFePO4) communicating over Bluetooth by @synergiaenergia
 * Changed: Added integer conversion for Daly Can BMS Set SOC GUI method by @lex2k0

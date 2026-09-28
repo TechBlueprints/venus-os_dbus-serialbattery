@@ -688,6 +688,35 @@ class Battery(ABC):
         else:
             self.max_battery_voltage = round(utils.MAX_CELL_VOLTAGE * self.cell_count, 2)
 
+    def get_bulk_ramp_voltage(self) -> Union[float, None]:
+        """
+        Calculates the elevated bulk charge voltage for the whole battery based on the SoC.
+
+        While the battery is in bulk, the CVL can be raised above `MAX_CELL_VOLTAGE * cell count`
+        to overcome cable voltage drop and internal resistance at high charge currents.
+        The voltage decreases linearly from `BULK_CELL_VOLTAGE_MAX` at `BULK_VOLTAGE_RAMP_SOC_START`
+        to `BULK_CELL_VOLTAGE_MIN` at `BULK_VOLTAGE_RAMP_SOC_END`.
+
+        :return: The bulk voltage for the whole battery, or None if the ramp is disabled or the SoC is unknown
+        """
+        if not utils.BULK_VOLTAGE_RAMP_ENABLE or self.cell_count is None or self.soc_calc is None:
+            return None
+
+        soc_start = utils.BULK_VOLTAGE_RAMP_SOC_START
+        soc_end = utils.BULK_VOLTAGE_RAMP_SOC_END
+
+        # misconfigured (reported at startup), fall back to a step at the end SoC
+        if soc_start >= soc_end:
+            cell_voltage = utils.BULK_CELL_VOLTAGE_MAX if self.soc_calc < soc_end else utils.BULK_CELL_VOLTAGE_MIN
+        else:
+            cell_voltage = utils.calc_linear_relationship(
+                self.soc_calc,
+                [soc_start, soc_end],
+                [utils.BULK_CELL_VOLTAGE_MAX, utils.BULK_CELL_VOLTAGE_MIN],
+            )
+
+        return round(cell_voltage * self.cell_count, 3)
+
     def manage_charge_voltage_limit(self) -> None:
         """
         Manages the charge voltage by setting `self.control_voltage`.
@@ -696,6 +725,10 @@ class Battery(ABC):
         """
         time_diff = 0
         control_voltage = self.max_battery_voltage
+        # Voltage the CVL may reach in this cycle. Equal to the max battery voltage,
+        # except in bulk with the bulk voltage ramp enabled (see get_bulk_ramp_voltage())
+        target_voltage = self.max_battery_voltage
+        bulk_ramp_active = False
         current_time = int(time())
         # How fast the voltage should be increased/decreased per second
         # Used in cell over voltage protection and float transition
@@ -774,6 +807,15 @@ class Battery(ABC):
                 # Get maximum allowed cell voltage
                 cell_voltage_max_allowed = utils.SOC_RESET_CELL_VOLTAGE if self.soc_reset_requested else utils.MAX_CELL_VOLTAGE
 
+                # In bulk the target voltage can be raised above the max battery voltage (BULK_VOLTAGE_RAMP_ENABLE).
+                # Absorption always targets the max battery voltage.
+                # A cell exceeding cell_voltage_max_allowed is still limited by the controllers below.
+                if self.max_voltage_start_time is None:
+                    bulk_ramp_voltage = self.get_bulk_ramp_voltage()
+                    if bulk_ramp_voltage is not None and bulk_ramp_voltage > self.max_battery_voltage:
+                        target_voltage = bulk_ramp_voltage
+                        bulk_ramp_active = True
+
                 # use P-Controller
                 if utils.CVL_CONTROLLER_MODE == 1:
                     found_high_cell_voltage = False
@@ -799,7 +841,7 @@ class Battery(ABC):
                             self.max_battery_voltage,
                         )
                     else:
-                        control_voltage = self.max_battery_voltage
+                        control_voltage = target_voltage
 
                 # use I-Controller
                 elif utils.CVL_CONTROLLER_MODE == 2:
@@ -808,11 +850,11 @@ class Battery(ABC):
                             (self.get_max_cell_voltage() - cell_voltage_max_allowed - utils.SWITCH_TO_FLOAT_CELL_VOLTAGE_DIFF) * utils.CVL_ICONTROLLER_FACTOR
                         )
                     else:
-                        control_voltage = self.max_battery_voltage
+                        control_voltage = target_voltage
 
                     control_voltage = min(
                         max(control_voltage, self.min_battery_voltage),
-                        self.max_battery_voltage,
+                        target_voltage,
                     )
 
                 # use clipped sum controller
@@ -835,18 +877,21 @@ class Battery(ABC):
                         # add little voltage to keep charging
                         control_voltage = clipped_coltage + 0.010
                     else:
-                        control_voltage = self.max_battery_voltage
+                        control_voltage = target_voltage
 
                 # use no controller
                 else:
-                    control_voltage = self.max_battery_voltage
+                    control_voltage = target_voltage
 
                 self.charge_mode = "Bulk" if self.max_voltage_start_time is None else "Absorption"
 
+                if bulk_ramp_active:
+                    self.charge_mode += " (Ramp)"
+
                 # Recover slowly the voltage, if needed
                 # Set control voltage immediately, if not reduced by the controller
-                if control_voltage >= self.max_battery_voltage and self.control_voltage_last_limit_time is None:
-                    self.control_voltage = round(self.max_battery_voltage, 6)
+                if control_voltage >= target_voltage and self.control_voltage_last_limit_time is None:
+                    self.control_voltage = round(target_voltage, 6)
                     self.control_voltage_ramp_base = None
 
                 # Set control voltage immediately, if control voltage is lower than previous control voltage
@@ -875,16 +920,16 @@ class Battery(ABC):
                         if self.control_voltage_ramp_base is None:
                             self.control_voltage_ramp_base = self.control_voltage
                         if utils.CVL_RECOVERY_RATE_V_PER_SEC <= 0:
-                            allowed_voltage = min(control_voltage, self.max_battery_voltage)
+                            allowed_voltage = min(control_voltage, target_voltage)
                         else:
                             allowed_voltage = min(
                                 self.control_voltage_ramp_base + utils.CVL_RECOVERY_RATE_V_PER_SEC * (seconds_since_limit - utils.CVL_RECOVERY_HOLD_SEC),
-                                self.max_battery_voltage,
+                                target_voltage,
                             )
                         self.charge_mode += " (Cell OVP*)"  # Cell over voltage protection
 
-                    # If control voltage reached max battery voltage, reset timers
-                    if allowed_voltage == self.max_battery_voltage:
+                    # If control voltage reached the target voltage, reset timers
+                    if allowed_voltage == target_voltage:
                         self.control_voltage_last_limit_time = None
                         self.control_voltage_ramp_base = None
 
@@ -990,6 +1035,7 @@ class Battery(ABC):
                     + f"{safe_number_format(utils.VOLTAGE_DROP, '{:.2f}')} V (VOLTAGE_DROP) = "
                     + f"{safe_number_format((self.control_voltage + utils.VOLTAGE_DROP), '{:.2f}')} V\n"
                     + f"control_voltage: {safe_number_format(control_voltage, '{:.2f}')} V • "
+                    + f"target_voltage: {safe_number_format(target_voltage, '{:.2f}')} V • "
                     + "seconds_since_limit: "
                     + f"{current_time - self.control_voltage_last_limit_time if self.control_voltage_last_limit_time is not None else 0} s\n"
                     + f"voltage_sum: {safe_number_format(voltage_sum, '{:.2f}')} V • "

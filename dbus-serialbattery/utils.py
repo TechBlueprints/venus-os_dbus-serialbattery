@@ -351,6 +351,48 @@ CVL_CONTROLLER_MODE: int = get_int_from_config("DEFAULT", "CVL_CONTROLLER_MODE")
 CVL_ICONTROLLER_FACTOR: float = get_float_from_config("DEFAULT", "CVL_ICONTROLLER_FACTOR")
 
 
+# --------- Bulk Voltage Ramp (affecting CVL) ---------
+BULK_VOLTAGE_RAMP_ENABLE: bool = get_bool_from_config("DEFAULT", "BULK_VOLTAGE_RAMP_ENABLE")
+"""
+Raise the CVL above MAX_CELL_VOLTAGE * cell count while in bulk and lower it linearly as the SoC rises.
+"""
+BULK_CELL_VOLTAGE_MAX: float = get_float_from_config("DEFAULT", "BULK_CELL_VOLTAGE_MAX", MAX_CELL_VOLTAGE)
+BULK_CELL_VOLTAGE_MIN: float = get_float_from_config("DEFAULT", "BULK_CELL_VOLTAGE_MIN", MAX_CELL_VOLTAGE)
+BULK_VOLTAGE_RAMP_SOC_START: float = get_float_from_config("DEFAULT", "BULK_VOLTAGE_RAMP_SOC_START", 60)
+BULK_VOLTAGE_RAMP_SOC_END: float = get_float_from_config("DEFAULT", "BULK_VOLTAGE_RAMP_SOC_END", 95)
+
+# make some checks for most common misconfigurations
+if BULK_VOLTAGE_RAMP_ENABLE:
+    check_config_issue(
+        BULK_CELL_VOLTAGE_MIN < MAX_CELL_VOLTAGE,
+        f"BULK_CELL_VOLTAGE_MIN ({BULK_CELL_VOLTAGE_MIN} V) is less than MAX_CELL_VOLTAGE ({MAX_CELL_VOLTAGE} V). "
+        "The bulk voltage ramp never lowers the CVL below MAX_CELL_VOLTAGE * cell count. Please check the configuration.",
+    )
+    check_config_issue(
+        BULK_CELL_VOLTAGE_MAX < BULK_CELL_VOLTAGE_MIN,
+        f"BULK_CELL_VOLTAGE_MAX ({BULK_CELL_VOLTAGE_MAX} V) is less than BULK_CELL_VOLTAGE_MIN ({BULK_CELL_VOLTAGE_MIN} V). Please check the configuration.",
+    )
+    check_config_issue(
+        BULK_VOLTAGE_RAMP_SOC_START >= BULK_VOLTAGE_RAMP_SOC_END,
+        f"BULK_VOLTAGE_RAMP_SOC_START ({BULK_VOLTAGE_RAMP_SOC_START} %) must be less than "
+        f"BULK_VOLTAGE_RAMP_SOC_END ({BULK_VOLTAGE_RAMP_SOC_END} %). Please check the configuration.",
+    )
+    check_config_issue(
+        CVL_CONTROLLER_MODE == 0,
+        "BULK_VOLTAGE_RAMP_ENABLE is enabled while CVL_CONTROLLER_MODE is 0 (disabled). Without the cell voltage limitation "
+        "a single cell can exceed MAX_CELL_VOLTAGE during bulk. Please set CVL_CONTROLLER_MODE to 1, 2 or 3.",
+    )
+    # SOC_RESET_CELL_VOLTAGE is documented as the BMS OVP threshold minus a margin, so it is the highest
+    # cell voltage the configuration knows to be safe. The cell voltage limitation only reacts once a cell
+    # is already high, therefore the bulk target itself must stay below the OVP threshold.
+    check_config_issue(
+        BULK_CELL_VOLTAGE_MAX > SOC_RESET_CELL_VOLTAGE,
+        f"BULK_CELL_VOLTAGE_MAX ({BULK_CELL_VOLTAGE_MAX} V) is higher than SOC_RESET_CELL_VOLTAGE ({SOC_RESET_CELL_VOLTAGE} V), "
+        "which should be the BMS Over Voltage Protection (OVP) threshold minus a margin. A bulk target above the OVP threshold "
+        "can trip the BMS protection before the cell voltage limitation reacts. Please lower BULK_CELL_VOLTAGE_MAX.",
+    )
+
+
 # --------- Cell Voltage Current Limitation (affecting CCL/DCL) ---------
 CCCM_CV_ENABLE: bool = get_bool_from_config("DEFAULT", "CCCM_CV_ENABLE")
 """
