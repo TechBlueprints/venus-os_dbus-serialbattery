@@ -739,6 +739,23 @@ class DbusHelper:
         self._dbusservice.add_path("/ErrorCode", self.battery.error_code, writeable=True)
         self._dbusservice.add_path("/ConnectionInformation", "")
 
+        # Measurement topology declarations, so consumers that sum battery
+        # services can tell two batteries from two views of the same pack (e.g.
+        # its BMS and a SmartShunt on its terminals) instead of counting it twice.
+        # Kind "direct": this service publishes its own sensor readings.
+        # PhysicalDevice: stable, opaque ID of the pack; same ID = same pack.
+        # PeerServices/LineAuthority: the paired service measuring the same pack,
+        # declared on its behalf because Victron's services cannot declare
+        # themselves. Without a pairing both are omitted rather than set to None:
+        # the peer set is fixed at registration, and Kind already marks a
+        # service that speaks this vocabulary.
+        self._dbusservice.add_path("/Measurement/Kind", "direct")
+        self._dbusservice.add_path("/Measurement/PhysicalDevice", "battery:" + self.bms_id)
+        paired_service = getattr(self.battery, "get_paired_sensor_device", lambda: None)()
+        if paired_service is not None:
+            self._dbusservice.add_path("/Measurement/PeerServices", paired_service)
+            self._dbusservice.add_path("/Measurement/LineAuthority", paired_service)
+
         # Create static battery info
         self._dbusservice.add_path(
             "/Info/BatteryLowVoltage",
