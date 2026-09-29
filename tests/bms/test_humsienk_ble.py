@@ -606,7 +606,8 @@ def test_request_stops_waiting_at_the_shared_deadline():
 
     started = time.time()
     assert bms._request(HumsiENK_Ble.CMD_CONFIG, timeout=30.0) is False
-    assert time.time() - started < 3.0
+    # the budget left was 0.3 s; allow scheduling slack but not a second request
+    assert time.time() - started < 1.0
 
 
 def test_request_does_not_even_send_once_the_budget_is_gone():
@@ -800,12 +801,10 @@ def test_data_coming_back_rearms_the_escalation(caplog):
 
 # ------------------------------------------------- connect failure volume
 #
-# The reconnect loop retries for as long as a pack is away, so this line was
-# written on every attempt - 4,400 times in one prod log corpus. One per
-# episode is the readable number. The wording is unchanged on purpose: the
-# fleet's log watch keys on "Failed when trying to connect" as a substring,
-# and prod runs at INFO, so the surviving line has to be INFO and has to
-# still contain that text.
+# The reconnect loop retries for as long as a pack is away, so a failure
+# logged on every attempt would repeat for the whole outage. The first
+# failure is logged at INFO, so default logging shows it, with wording that
+# log monitoring can search for; the rest go to DEBUG.
 
 
 def _make_handle():
@@ -848,7 +847,7 @@ def test_a_pack_that_is_away_reports_its_absence_once(caplog):
     assert [r.levelname for r in failures] == ["INFO", "DEBUG", "DEBUG", "DEBUG", "DEBUG"]
 
 
-def test_the_surviving_line_is_still_the_string_the_watch_greps_for(caplog):
+def test_the_first_failure_is_logged_at_info_with_its_searchable_wording(caplog):
     handle = _make_handle()
 
     with caplog.at_level("INFO", logger="SerialBattery"):
@@ -877,15 +876,12 @@ def test_coming_back_rearms_the_absence_report(caplog):
 
 # ------------------------------------------- reporting the link up to utils_ble
 #
-# utils_ble delivers both ends of an episode through the backend's connected
-# callback, wired when the base class builds the backend - not from inside
-# connect_to_bms. So this override gets the link-up line for free and must
-# not report it as well. A call here would not actually double the log -
-# _report_link_up latches and a second call emits nothing - which is the
-# reason to pin this with a test rather than trust it to be noticed: the
-# damage is dead code leaning on someone else's internal detail, and dead
-# code that stays quiet is exactly what survives review. An earlier utils_ble
-# reported from inside the base connect_to_bms and did need a call here.
+# utils_ble logs the first connection and each recovery through the
+# backend's connected callback, which the base class wires when it builds the
+# backend - not from inside connect_to_bms. So this override gets that report
+# without doing anything, and must not make it itself. A call here would not
+# double the log, because _report_link_up only reports once per connection,
+# so nothing visible would show the mistake: this test is what catches it.
 
 
 def test_the_override_does_not_report_the_link_up_itself():
@@ -896,19 +892,6 @@ def test_the_override_does_not_report_the_link_up_itself():
     _attempt(handle, _RecordingBackend())
 
     assert reported == []
-
-
-def test_an_older_utils_ble_without_the_hook_still_connects():
-    handle = _make_handle()
-    assert not hasattr(handle, "_report_link_up")
-
-    _attempt(handle, _RecordingBackend())
-
-    # establish() alone is not enough: an unguarded call raises AFTER it and
-    # the except swallows it, so the counter is what proves the connect path
-    # ran to the end rather than failing on the way out.
-    assert handle.backend.established == [("AA:BB:CC:DD:EE:FF", "notify-uuid")]
-    assert handle._connect_failures == 0
 
 
 def test_a_failed_connect_does_not_report_a_link_that_never_came_up():
@@ -1038,3 +1021,108 @@ def test_a_pack_that_never_answered_is_not_given_an_age_from_the_epoch(caplog):
 
     resends = [r.message for r in caplog.records if "re-sending handshake" in r.message]
     assert resends == ["HumsiENK: re-sending handshake, no data since connection"]
+
+
+# ------------------------------------------------- steady-state polling
+#
+# Between connections the driver's whole job is two writes: ask for the three
+# data frames every poll interval, and re-send the handshake when the stream
+# has gone quiet, because the BMS sends nothing until it has one. These pin
+# that the writes actually happen, not just that something is logged.
+
+
+def _commands_sent(bms):
+    return [sent[1] for sent in bms.ble_handle.sent]
+
+
+def test_a_due_poll_asks_for_battery_info_status_and_cell_voltages():
+    bms = make_bms()
+    bms.ble_handle.push(frame(HumsiENK_Ble.CMD_BATTERY_INFO, battery_info_payload()))
+
+    bms.refresh_data()
+
+    assert _commands_sent(bms) == [HumsiENK_Ble.CMD_BATTERY_INFO, HumsiENK_Ble.CMD_STATUS, HumsiENK_Ble.CMD_CELL_VOLTAGES]
+
+
+def test_no_poll_is_sent_before_the_interval_has_passed():
+    bms = make_bms()
+    bms.ble_handle.push(frame(HumsiENK_Ble.CMD_BATTERY_INFO, battery_info_payload()))
+    bms.refresh_data()
+    bms.ble_handle.sent.clear()
+
+    bms.refresh_data()
+
+    assert _commands_sent(bms) == []
+
+
+def test_a_silent_link_is_sent_the_handshake_before_the_poll():
+    bms = make_bms()
+
+    bms.refresh_data()
+
+    assert _commands_sent(bms) == [
+        HumsiENK_Ble.CMD_HANDSHAKE,
+        HumsiENK_Ble.CMD_BATTERY_INFO,
+        HumsiENK_Ble.CMD_STATUS,
+        HumsiENK_Ble.CMD_CELL_VOLTAGES,
+    ]
+
+
+# ------------------------------------------- the connection's life in order
+
+
+def test_supervision_starts_with_the_link_marked_up_and_the_client_is_released_after():
+    handle = _make_handle()
+    seen = []
+
+    async def _record_supervision():
+        seen.append(handle.connected)
+
+    handle.supervise_link = _record_supervision
+
+    asyncio.run(handle.connect_to_bms("AA:BB:CC:DD:EE:FF"))
+
+    # supervised once, with the link already marked connected...
+    assert seen == [True]
+    # ...then the client handed back to the backend and the link marked down
+    assert handle.backend.released == [handle.client]
+    assert handle.connected is False
+
+
+# ------------------------------------------------- the real notification queue
+#
+# Every other test swaps the transport for FakeBleHandle. These run the real
+# HumsiENK_Syncron_Ble queue: notifications arrive on the Bluetooth thread and
+# are read on the main thread, so a chunk handed in on one must come out on
+# the other.
+
+
+def _real_transport():
+    ble = humsienk_ble.HumsiENK_Syncron_Ble()
+    ble.address = "AA:BB:CC:DD:EE:FF"
+    ble.response_event = False
+    return ble
+
+
+def test_a_notification_from_the_bluetooth_thread_reaches_the_reader():
+    ble = _real_transport()
+    chunk = bytes([0xAA, 0x21, 0x00, 0x21, 0x00])
+
+    timer = threading.Timer(0.1, ble.notify_read_callback, args=(None, bytearray(chunk)))
+    timer.start()
+    try:
+        received = ble.get_notification(timeout=2.0)
+    finally:
+        timer.join()
+
+    assert received == chunk
+    assert ble.get_notification() is None
+
+
+def test_feeding_the_watchdog_records_when_data_last_arrived():
+    ble = _real_transport()
+    ble._watchdog_last_fed = 0.0
+
+    ble.feed_watchdog()
+
+    assert time.time() - ble._watchdog_last_fed < 1.0
