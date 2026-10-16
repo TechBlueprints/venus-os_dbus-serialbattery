@@ -655,13 +655,25 @@ def test_refresh_data_succeeds_on_a_frame_that_just_arrived():
     assert bms.refresh_data() is True
 
 
-def test_refresh_data_fails_again_once_the_data_has_aged_out():
+def test_held_values_do_not_make_an_unanswered_poll_fresh_once_the_data_has_aged_out():
+    # The fallback layer reads True with voltage, current and SoC present as
+    # "the BMS delivered". Values parsed earlier stay held on the object, so
+    # they must not be what makes a poll True: once the newest frame is older
+    # than DATA_FRESHNESS_SECONDS, a poll that gets no reply is stale however
+    # much is held. Otherwise a half-connected link would serve old values
+    # indefinitely.
     bms = make_bms()
     bms.ble_handle.push(frame(HumsiENK_Ble.CMD_BATTERY_INFO, battery_info_payload()))
     assert bms.refresh_data() is True
 
     bms._last_frame_time -= HumsiENK_Ble.DATA_FRESHNESS_SECONDS + 1
+    held = (bms.voltage, bms.current, bms.soc)
+    assert None not in held
+
+    # nothing answers this poll
     assert bms.refresh_data() is False
+    # and the values were not cleared to get there
+    assert (bms.voltage, bms.current, bms.soc) == held
 
 
 # ------------------------------------------------- the backend seam
