@@ -2118,10 +2118,10 @@ class _FakeSocItem:
 
 class TestShuntSocSync:
     """
-    Drift-gated continuous alignment: the shunt is programmed with the BMS
-    SoC only when the BMS is truth, the drift crosses the threshold, the
-    rate limit allows it, and the shunt is not near full where its own
-    charged-voltage sync owns the value.
+    Drift-gated, downward-only alignment: the shunt is programmed with the
+    BMS SoC only when it reads above the BMS by more than the margin and the
+    rate limit allows it. A shunt below the BMS is never raised, so a BMS
+    that reports too high is not copied into the bank's independent count.
     """
 
     def _sync_wrapper(self, monkeypatch, bms_soc=90.0, shunt_soc=93.0):
@@ -2138,8 +2138,8 @@ class TestShuntSocSync:
         assert item.writes == [90.0]
 
     def test_a_disagreeing_shunt_is_corrected(self, monkeypatch):
-        """If the shunt says something different than the BMS, the shunt is wrong."""
-        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=91.0)
+        """A shunt reading above the BMS by more than the margin is corrected down."""
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=92.0)
         wrapper._sync_shunt_soc()
         assert item.writes == [90.0]
 
@@ -2164,6 +2164,34 @@ class TestShuntSocSync:
         wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=97.0, shunt_soc=100.0)
         wrapper._sync_shunt_soc()
         assert item.writes == [97.0]
+
+    def test_the_bms_never_raises_the_shunt(self, monkeypatch):
+        # Field case, prod 2026-10-17: the BMS's own counter stepped to 100 %
+        # while each pack still took about 45 A at 3.37 V per cell. Copying
+        # that into the shunt erased the only independent count on the bank.
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=100.0, shunt_soc=93.0)
+        wrapper._sync_shunt_soc()
+        assert item.writes == []
+
+    def test_a_shunt_below_the_bms_is_left_for_its_own_full_detection(self, monkeypatch):
+        # Not only at 100 %: any upward copy would spread a BMS that reads high.
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=80.0)
+        wrapper._sync_shunt_soc()
+        assert item.writes == []
+
+    def test_whole_percent_bms_steps_do_not_chatter_at_the_default_margin(self, monkeypatch):
+        # A BMS that reports whole percent can sit up to 1 % from an accurate
+        # shunt by rounding alone. The shipped default must stay above that,
+        # or every BMS step re-programs the shunt.
+        assert utils.FALLBACK_SHUNT_SOC_SYNC_MARGIN == 1.5
+        wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=87.0, shunt_soc=87.9)
+        wrapper._sync_shunt_soc()
+        assert item.writes == []
+        # past the margin, the downward correction still happens
+        object.__setattr__(wrapper, "_soc_sync_check_time", 0.0)
+        item.value = 88.6
+        wrapper._sync_shunt_soc()
+        assert item.writes == [87.0]
 
     def test_the_rate_limit_holds_between_checks(self, monkeypatch):
         wrapper, item = self._sync_wrapper(monkeypatch, bms_soc=90.0, shunt_soc=93.0)
