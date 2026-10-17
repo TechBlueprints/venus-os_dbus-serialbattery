@@ -582,19 +582,30 @@ class FallbackBattery:
 
     def _sync_shunt_soc(self) -> None:
         """
-        Keep the shunt's absolute SoC equal to the BMS's while it is truth.
+        Correct the shunt's SoC down to the BMS's, never up.
 
-        The BMS is the authority on state of charge; the shunt is not. If the
-        shunt says something different than the BMS, the shunt is wrong - so
-        when their values differ, the BMS value is programmed into it and its
-        coulomb counting continues from there. The margin below which nothing
-        is written (FALLBACK_SHUNT_SOC_SYNC_MARGIN) is indifference to
-        measurement noise, not tolerance of drift: a shunt at 12.0000006
-        against a BMS at 12.0 is not wrong in any sense worth a write.
-        The shunt is then truth-aligned at any disconnect, in VRM as well as
-        in the served values, and the anchor formula has nothing left to
-        correct. There is no carve-out near full either: a shunt that snapped
-        itself to 100 while the BMS reads lower is exactly what gets fixed.
+        While the BMS is delivering, a shunt that reads more than
+        FALLBACK_SHUNT_SOC_SYNC_MARGIN above the BMS is programmed with the
+        BMS value and its coulomb counting continues from there - including a
+        shunt that snapped itself to 100 while the BMS reads lower.
+
+        A shunt that reads BELOW the BMS is left alone. Raising it would copy
+        a BMS that reports too high into the one independent count on the
+        bank: a BMS whose own counter stepped to 100 % while the pack was
+        still taking charge would erase the evidence that it is wrong. Too
+        high is also the dangerous direction - it holds the charge logic in
+        float and delays low-SoC protection - while a shunt left low errs on
+        the cautious side. Upward correction belongs to the shunt's own full
+        detection (charged voltage plus tail current on a SmartShunt), which
+        is built for exactly that.
+
+        The margin is indifference to measurement noise, and for a BMS that
+        reports whole percent the noise includes rounding: an accurate shunt
+        can sit up to 1 % away with no drift at all. A margin at or below that
+        step re-programs the shunt on nearly every BMS step.
+
+        The served SoC during an outage does not depend on this: it is the BMS
+        reading at engagement moved by the shunt's own travel (get_soc).
 
         Rate-limited to one check a minute as write hygiene, and every sync is
         logged with the difference it corrected - the correction rate is the
@@ -619,8 +630,10 @@ class FallbackBattery:
             return
         target = round(float(bms_soc), 1)
         drift = float(shunt_soc) - float(bms_soc)
-        margin = max(0.0, getattr(utils, "FALLBACK_SHUNT_SOC_SYNC_MARGIN", 0.5))
-        if abs(drift) <= margin:
+        margin = max(0.0, getattr(utils, "FALLBACK_SHUNT_SOC_SYNC_MARGIN", 1.5))
+        # Positive drift means the shunt reads above the BMS. Only that
+        # direction is corrected; see the docstring for why upward is not.
+        if drift <= margin:
             return
         try:
             item.set_value(target)
