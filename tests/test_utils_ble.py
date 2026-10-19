@@ -1083,7 +1083,146 @@ def test_the_retry_backend_closes_stale_links_and_asks_for_its_adapter(monkeypat
     monkeypatch.setattr(utils_ble, "retry_establish_connection", fake_establish)
     aio.run(backend._establish(None, PINNED, "char", "callback"))
     assert closed == [device]
-    assert passed.get("adapter") == "hci3"
+    assert passed.get("bluez") == {"adapter": "hci3"}
+    assert "adapter" not in passed
+
+
+# --------- asking bleak for an adapter ---------
+#
+# bleak 3.0 copies the deprecated top-level adapter= into a bluez= default dict
+# shared by every call, so the first adapter= in a process wins over every
+# later one. A battery moving to its next adapter kept discovering on the
+# first, where every connect failed, for 19 hours. Every call that names an
+# adapter has to pass its own bluez dict instead.
+
+
+def test_a_call_without_an_adapter_gets_a_fresh_empty_bluez_dict():
+    """bleak's shared default may already hold another caller's adapter."""
+    first, second = utils_ble.bluez_adapter_args(None), utils_ble.bluez_adapter_args(None)
+
+    assert first == second == {"bluez": {}}
+    assert first["bluez"] is not second["bluez"]
+
+
+_ATTEMPT_ADAPTERS = ["hci8", "hci0", None]
+
+
+def _scan_arguments(monkeypatch):
+    """What the retry backend hands BleakScanner on a cache miss, per attempt."""
+    import asyncio as aio
+
+    calls = []
+
+    async def cache_miss(address, adapter=None):
+        return None
+
+    async def fake_find(address, timeout, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(utils_ble, "get_device_by_adapter", cache_miss)
+    monkeypatch.setattr(utils_ble, "get_device", cache_miss)
+    monkeypatch.setattr(utils_ble, "BleakScanner", types.SimpleNamespace(find_device_by_address=fake_find))
+    backend = utils_ble.get_ble_backend("BleakRetryBackend")
+    for adapter in _ATTEMPT_ADAPTERS:
+        backend.current_adapter = adapter
+        aio.run(backend._resolve_device(PINNED))
+    return calls
+
+
+def _retry_client_arguments(monkeypatch):
+    """What the retry backend hands the connector for its BleakClient, per attempt."""
+    import asyncio as aio
+
+    calls = []
+
+    async def found(address):
+        return object()
+
+    async def no_stale_links(device):
+        pass
+
+    async def fake_establish(client_class, device, address, **kwargs):
+        kwargs.pop("disconnected_callback")
+        calls.append(kwargs)
+        return _GattClient()
+
+    monkeypatch.setattr(utils_ble, "close_stale_connections", no_stale_links)
+    monkeypatch.setattr(utils_ble, "retry_establish_connection", fake_establish)
+    backend = utils_ble.get_ble_backend("BleakRetryBackend")
+    backend._resolve_device = found
+    for adapter in _ATTEMPT_ADAPTERS:
+        backend.current_adapter = adapter
+        aio.run(backend._establish(None, PINNED, "char", "callback"))
+    return calls
+
+
+def _plain_client_arguments(monkeypatch):
+    """What the plain backend hands BleakClient, per attempt."""
+    calls = []
+    monkeypatch.setattr(utils_ble, "BleakClient", lambda address, disconnected_callback, **kwargs: calls.append(kwargs))
+    backend = utils_ble.get_ble_backend("BleakBackend")
+    for adapter in _ATTEMPT_ADAPTERS:
+        monkeypatch.setattr(utils_ble, "adapters_in_attempt_order", lambda address, present=None, a=adapter: [a] if a else [])
+        backend.create_client(PINNED, None)
+    return calls
+
+
+# Replays the driver's arguments through the real bleak in ext/, in a child
+# process because this suite stubs bleak. Only bleak's own constructor runs;
+# the platform backend is a recorder, so no radio or D-Bus is needed.
+_REPLAY_THROUGH_BUNDLED_BLEAK = """
+import json, sys, warnings
+sys.path.insert(0, sys.argv[1])
+from bleak import BleakClient, BleakScanner
+
+kind, foreign_caller_first, calls = sys.argv[2], sys.argv[3] == "1", json.loads(sys.argv[4])
+landed = []
+
+class Recorder:
+    def __init__(self, *args, bluez, **kwargs):
+        landed.append(bluez.get("adapter"))
+
+def make(**kwargs):
+    if kind == "scanner":
+        BleakScanner(backend=Recorder, **kwargs)
+    else:
+        BleakClient("C8:47:8C:00:00:00", backend=Recorder, **kwargs)
+
+warnings.simplefilter("ignore", DeprecationWarning)
+if foreign_caller_first:
+    make(adapter="hci9")
+    landed.clear()
+for kwargs in calls:
+    make(**kwargs)
+print(json.dumps(landed))
+"""
+
+
+@pytest.mark.parametrize("foreign_caller_first", [False, True], ids=["driver alone", "after another caller"])
+@pytest.mark.parametrize(
+    "kind, driver_calls",
+    [("scanner", _scan_arguments), ("client", _retry_client_arguments), ("client", _plain_client_arguments)],
+    ids=["retry scan", "retry client", "plain client"],
+)
+def test_each_attempt_reaches_the_adapter_it_asked_for_in_the_bundled_bleak(monkeypatch, kind, driver_calls, foreign_caller_first):
+    """
+    Three attempts in one process - hci8, then hci0, then no adapter - must
+    each land where they asked, both when the driver is bleak's only caller
+    and when something else in the process used adapter= first.
+    """
+    import json
+    import subprocess
+
+    calls = driver_calls(monkeypatch)
+    result = subprocess.run(
+        [sys.executable, "-c", _REPLAY_THROUGH_BUNDLED_BLEAK, os.path.join(DRIVER_DIR, "ext"), kind, "1" if foreign_caller_first else "0", json.dumps(calls)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _ATTEMPT_ADAPTERS
 
 
 def test_send_data_runs_the_command_on_the_ble_thread_s_own_loop():
