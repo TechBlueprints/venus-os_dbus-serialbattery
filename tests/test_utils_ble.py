@@ -1215,7 +1215,7 @@ def test_each_attempt_reaches_the_adapter_it_asked_for_in_the_bundled_bleak(monk
 
     calls = driver_calls(monkeypatch)
     result = subprocess.run(
-        [sys.executable, "-c", _REPLAY_THROUGH_BUNDLED_BLEAK, os.path.join(DRIVER_DIR, "ext"), kind, "1" if foreign_caller_first else "0", json.dumps(calls)],
+        [sys.executable, "-c", _REPLAY_THROUGH_BUNDLED_BLEAK, os.path.join(DRIVER_DIR, "ext", "ble"), kind, "1" if foreign_caller_first else "0", json.dumps(calls)],
         capture_output=True,
         text=True,
         timeout=60,
