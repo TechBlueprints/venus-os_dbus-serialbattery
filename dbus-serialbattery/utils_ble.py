@@ -689,6 +689,20 @@ def landed_adapter(client):
     return None
 
 
+def bluez_adapter_args(adapter):
+    """
+    Keyword arguments that ask bleak for an adapter, or for none.
+
+    bleak 3.0 deprecated the top-level adapter= argument and now copies it into
+    its bluez= argument, whose default is a single dict shared by every call.
+    The first adapter= in a process is written into that dict and then wins
+    over every later one, so a battery moving to its next adapter keeps
+    scanning and connecting on the first, and a call that asks for no adapter
+    inherits it too. A fresh bluez dict on every call avoids both.
+    """
+    return {"bluez": {"adapter": adapter} if adapter else {}}
+
+
 class BleConnectionBackend:
     """
     Interface for establishing and releasing BLE connections.
@@ -785,11 +799,8 @@ class BleakBackend(BleConnectionBackend):
         return adapters[self.adapter_index % len(adapters)]
 
     def create_client(self, address, disconnected_callback):
-        kwargs = {}
         self.current_adapter = self._select_adapter(address)
-        if self.current_adapter:
-            kwargs["adapter"] = self.current_adapter
-        return BleakClient(address, disconnected_callback=disconnected_callback, **kwargs)
+        return BleakClient(address, disconnected_callback=disconnected_callback, **bluez_adapter_args(self.current_adapter))
 
     async def establish(self, client, address, notify_char, notify_callback):
         try:
@@ -861,8 +872,9 @@ class BleakRetryBackend(BleConnectionBackend):
         if device is None:
             raise BleakError(f"bluetooth device {address} not found" + (f" on adapter {self.current_adapter}" if self.current_adapter else ""))
         await close_stale_connections(device)
-        kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
-        client = await retry_establish_connection(BleakClient, device, address, disconnected_callback=self.disconnected_callback, **kwargs)
+        client = await retry_establish_connection(
+            BleakClient, device, address, disconnected_callback=self.disconnected_callback, **bluez_adapter_args(self.current_adapter)
+        )
         self._record_landed(client)
         await start_notify_when_resolved(client, notify_char, notify_callback)
         return client
@@ -881,8 +893,7 @@ class BleakRetryBackend(BleConnectionBackend):
         if device is None:
             self.scans += 1
             logger.debug(f"bluetooth device {address} not in BlueZ cache, scanning")
-            kwargs = {"adapter": self.current_adapter} if self.current_adapter else {}
-            device = await BleakScanner.find_device_by_address(address, timeout=10.0, **kwargs)
+            device = await BleakScanner.find_device_by_address(address, timeout=10.0, **bluez_adapter_args(self.current_adapter))
         return device
 
     async def release(self, client):
