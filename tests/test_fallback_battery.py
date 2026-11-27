@@ -1738,6 +1738,8 @@ class TestPublishCycleThroughDbusHelper:
         helper.history_calculated_last_time = int(_now())
         helper.settings_saved_last_time = int(_now())
         helper.last_seen_saved_last_time = int(_now())
+        helper.time_since_last_full_charge_published_last_time = 0
+        helper.time_since_last_full_charge_published_timestamp = None
         helper.telemetry_upload = lambda: None
         return helper
 
